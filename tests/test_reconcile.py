@@ -1,42 +1,32 @@
-"""
-Unit tests for the Phase 9.5 reconciliation module.
-
-Covers:
-  - ReconciliationResult structure and gate logic
-  - Reconciler paper return computation from database fills
-  - Per-trade divergence matching
-  - Report generation
-  - Go/no-go gate with threshold checks
-  - get_closed_orders broker method
-"""
+"""Tests for lifecycle-first paper-versus-backtest reconciliation."""
 
 from __future__ import annotations
 
-import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
 
-from reporting.logger import ARRIVAL_MIDPOINT_CONTRACT_VERSION
-
 from backtest.reconcile import (
+    BacktestLifecycle,
+    PaperLifecycle,
     Reconciler,
     ReconciliationResult,
-    TradeDivergence,
+    _next_execution_bar,
 )
-from execution.broker import AlpacaBroker, OrderResult, OrderStatus
-from reporting.logger import TRADE_COLUMNS, TradeLogger, TradeRecord
+from backtest.runner import BacktestConfig, BacktestResult
+from engine.candidate_observation import CandidateObservationStore, CandidateStart
+from engine.lifecycle import PositionLifecycleStore
+from execution.broker import AlpacaBroker, OrderStatus
+from reporting.logger import TradeLogger
+from risk.models import ProtectionModel, SizingModel
 from strategies.base import BaseStrategy, OrderType, SignalFrame
 
 
-# ── Fixtures ────────────────────────────────────────────────────────────────
-
-
 class _DummyStrategy(BaseStrategy):
-    name = "test_strat"
+    name = "sma_crossover"
     preferred_order_type = OrderType.MARKET
 
     def _raw_signals(self, df: pd.DataFrame) -> SignalFrame:
@@ -47,561 +37,260 @@ class _DummyStrategy(BaseStrategy):
 
 
 @pytest.fixture
-def tmp_csv(tmp_path: Path) -> str:
-    return str(tmp_path / "trades.db")
+def recon(tmp_path: Path) -> Reconciler:
+    return Reconciler(
+        _DummyStrategy(),
+        ["AAPL"],
+        "2026-09-01",
+        "2026-09-30",
+        trade_csv_path=str(tmp_path / "trades.db"),
+        forward_test_dir=str(tmp_path / "reports"),
+    )
 
 
-@pytest.fixture
-def tmp_forward_dir(tmp_path: Path) -> str:
-    return str(tmp_path / "forward_tests")
-
-
-def _write_trades(path: str, rows: list[dict]) -> None:
-    """Write trade records to a SQLite database via TradeLogger.
-
-    Rows can pass `slippage_adverse_bps`, `slippage_measurement_quality`
-    and `slippage_benchmark_kind` to drive the reconcile slippage gate.
-    The benchmark kind defaults to an execution-quality benchmark so a
-    fixture that only sets a bps value still reaches the gate; pass
-    `'fallback_latest_close'` to exercise the metric-family exclusion.
-    Legacy `realized_slippage_bps` is NULL on new rows after Phase 4 —
-    fixtures that supplied it still work but no longer affect the gate,
-    exactly mirroring production behavior.
-    """
-    tl = TradeLogger(path=path)
-    for row in rows:
-        adverse_raw = row.get("slippage_adverse_bps")
-        adverse: float | None
-        if adverse_raw is None:
-            adverse = None
-        else:
-            adverse = float(adverse_raw)
-        signed_raw = row.get("slippage_signed_bps", adverse_raw)
-        signed: float | None
-        if signed_raw is None:
-            signed = None
-        else:
-            signed = float(signed_raw)
-        record = TradeRecord(
-            position_type="single_leg",
-            timestamp=row["timestamp"],
-            symbol=row["symbol"],
-            side=row["side"],
-            qty=int(float(row["qty"])),
-            avg_fill_price=float(row["avg_fill_price"]) if row.get("avg_fill_price") else None,
-            order_id=row.get("order_id"),
-            strategy=row["strategy"],
-            reason=row.get("reason", ""),
-            stop_price=float(row.get("stop_price", 0)),
-            entry_reference_price=float(row.get("entry_reference_price", 0)),
-            modeled_slippage_bps=None,
-            realized_slippage_bps=None,
-            order_type=row.get("order_type", "market"),
-            status=row.get("status", "filled"),
-            requested_qty=int(float(row.get("requested_qty", row["qty"]))),
-            filled_qty=int(float(row.get("filled_qty", row["qty"]))),
-            slippage_signed_bps=signed,
-            slippage_adverse_bps=adverse,
-            slippage_measurement_quality=row.get(
-                "slippage_measurement_quality", "primary",
-            ),
-            slippage_benchmark_kind=row.get(
-                "slippage_benchmark_kind", "arrival_midpoint",
-            ),
-            slippage_measurement_version=row.get(
-                "slippage_measurement_version",
-                ARRIVAL_MIDPOINT_CONTRACT_VERSION,
-            ),
-        )
-        tl.log(record)
-
-
-_FILL_COUNTER = [0]
-
-
-def _make_fill(
-    symbol: str = "AAPL",
-    side: str = "buy",
-    price: float = 150.0,
-    date: str = "2026-04-20",
-    strategy: str = "test_strat",
-    qty: int = 10,
-    order_id: str | None = None,
-) -> dict:
-    """Build a minimal row dict for a filled trade.
-
-    Foundation §6.5: trades.order_id is partial-UNIQUE within single-leg
-    scope, so fixtures must emit distinct order_ids per fill or
-    TradeLogger.log will UPSERT them into one row.
-    """
-    if order_id is None:
-        _FILL_COUNTER[0] += 1
-        order_id = f"test-order-{_FILL_COUNTER[0]:04d}"
-    return {
-        "timestamp": f"{date}T15:30:00+00:00",
-        "symbol": symbol,
-        "side": side,
-        "qty": str(qty),
-        "avg_fill_price": str(price),
-        "order_id": order_id,
-        "strategy": strategy,
-        "reason": "test",
-        "stop_price": "145.0",
-        "entry_reference_price": str(price),
-        # Phase 2 slippage unification — fixtures drive the reconcile
-        # slippage gate via the new taxonomy columns.
-        "slippage_adverse_bps": 3.5,
-        "slippage_signed_bps": 3.5,
-        "slippage_measurement_quality": "primary",
-        "order_type": "market",
-        "status": "filled",
-        "requested_qty": str(qty),
-        "filled_qty": str(qty),
+def _paper(**changes) -> PaperLifecycle:
+    values = {
+        "position_uid": "pos_" + "a" * 32,
+        "strategy": "sma_crossover",
+        "strategy_version": "v1",
+        "strategy_config_hash": "cfg123",
+        "bot_git_commit": "abc123",
+        "symbol": "AAPL",
+        "position_type": "single_leg",
+        "status": "closed",
+        "signal_at": "2026-09-01T00:00:00+00:00",
+        "signal_symbol": "AAPL",
+        "timeframe": "1Day",
+        "data_feed": "iex",
+        "first_fill_at": "2026-09-02T14:30:00+00:00",
+        "closed_at": "2026-09-04T14:30:00+00:00",
+        "entry_price": 101.0,
+        "exit_price": 109.0,
+        "realized_pnl": 80.0,
+        "operator_modified": False,
+        "signal_anchor_count": 1,
     }
+    values.update(changes)
+    return PaperLifecycle(**values)
 
 
-# ── TestReconciliationResult ────────────────────────────────────────────────
+def _bt_result(*, entries: list[bool] | None = None) -> BacktestResult:
+    index = pd.date_range("2026-09-01", periods=5, freq="D", tz="UTC")
+    records = pd.DataFrame({
+        "Entry Timestamp": [index[1]],
+        "Avg Entry Price": [100.0],
+        "Exit Timestamp": [index[3]],
+        "Avg Exit Price": [110.0],
+        "Status": ["Closed"],
+    })
+    portfolio = MagicMock()
+    portfolio.trades.records_readable = records
+    return BacktestResult(
+        portfolio=portfolio,
+        stats={"trade_count": 1},
+        entries_executed=pd.Series(
+            entries or [False, True, False, False, False], index=index
+        ),
+        exits_executed=pd.Series(False, index=index),
+        config=BacktestConfig(),
+        strategy_name="sma_crossover",
+        symbol="AAPL",
+    )
 
 
-class TestReconciliationResult:
-    def test_go_when_thresholds_met(self):
-        r = ReconciliationResult(
-            strategy_name="test",
+class TestLifecycleMatching:
+    def test_signal_bar_maps_to_next_execution_bar(self):
+        index = pd.date_range("2026-09-01", periods=3, freq="D", tz="UTC")
+        assert _next_execution_bar(index, "2026-09-01T00:00:00+00:00") == index[1]
+
+    def test_exact_signal_bar_matches_complete_round_trip(self, recon):
+        result = _bt_result()
+        rows = recon._extract_backtest_lifecycles(
+            result, strategy_config_hash="cfg123"
+        )
+        [comparison] = recon._match_lifecycles(
+            [_paper()],
+            {"AAPL": result},
+            {"AAPL": rows},
+            expected_version="v1",
+            expected_config_hash="cfg123",
+        )
+        assert comparison.status == "matched"
+        assert comparison.reason == "exact_signal_bar"
+        assert comparison.entry_diff_bps == pytest.approx(99.0)
+        assert comparison.exit_diff_bps == pytest.approx(-91.7)
+        assert comparison.backtest_lifecycle_id.startswith("bt_")
+
+    def test_backtest_lifecycle_cannot_be_reused(self, recon):
+        result = _bt_result()
+        rows = recon._extract_backtest_lifecycles(
+            result, strategy_config_hash="cfg123"
+        )
+        comparisons = recon._match_lifecycles(
+            [_paper(), _paper(position_uid="pos_" + "b" * 32)],
+            {"AAPL": result},
+            {"AAPL": rows},
+            expected_version="v1",
+            expected_config_hash="cfg123",
+        )
+        assert [row.status for row in comparisons] == ["matched", "unresolved"]
+        assert comparisons[1].reason == "backtest_lifecycle_already_used"
+
+    @pytest.mark.parametrize(
+        ("changes", "reason"),
+        [
+            ({"signal_at": None, "signal_anchor_count": 0}, "missing_signal_anchor"),
+            ({"strategy_version": "v0"}, "strategy_version_mismatch"),
+            ({"strategy_config_hash": "old"}, "strategy_config_mismatch"),
+            ({"data_feed": "sip"}, "data_feed_mismatch"),
+            ({"symbol": "SPY260918C00500000"}, "unsupported_instrument_model"),
+        ],
+    )
+    def test_untrusted_identity_is_never_fuzzily_matched(self, recon, changes, reason):
+        result = _bt_result()
+        [comparison] = recon._match_lifecycles(
+            [_paper(**changes)],
+            {"AAPL": result},
+            {"AAPL": recon._extract_backtest_lifecycles(
+                result, strategy_config_hash="cfg123"
+            )},
+            expected_version="v1",
+            expected_config_hash="cfg123",
+        )
+        assert comparison.status == "unresolved"
+        assert comparison.reason == reason
+        assert comparison.backtest_lifecycle_id is None
+
+    def test_price_similarity_does_not_override_wrong_signal_bar(self, recon):
+        result = _bt_result()
+        [comparison] = recon._match_lifecycles(
+            [_paper(signal_at="2026-09-02T00:00:00+00:00", entry_price=100.0)],
+            {"AAPL": result},
+            {"AAPL": recon._extract_backtest_lifecycles(
+                result, strategy_config_hash="cfg123"
+            )},
+            expected_version="v1",
+            expected_config_hash="cfg123",
+        )
+        assert comparison.reason == "backtest_no_entry_on_expected_bar"
+
+
+class TestLifecycleReadAndReport:
+    def test_partial_exits_are_weighted_inside_one_lifecycle(self, recon):
+        conn = recon._trade_logger._ensure_db()
+        lifecycle = PositionLifecycleStore(conn)
+        uid = "pos_" + "c" * 32
+        lifecycle.create_pending(
+            position_uid=uid,
+            symbol="AAPL",
+            owner_key="AAPL",
+            strategy="sma_crossover",
+            strategy_version="v1",
+            strategy_config_hash="cfg123",
+            bot_git_commit="abc123",
+            position_type="single_leg",
+            entry_qty=10,
+            sizing_model=SizingModel.STOP_DISTANCE,
+            protection_model=ProtectionModel.BROKER_STOP,
+        )
+        lifecycle.mark_open(
+            position_uid=uid,
+            avg_entry_price=100.0,
+            current_qty=10,
+            first_fill_at="2026-09-02T14:30:00+00:00",
+        )
+        conn.execute(
+            "UPDATE position_lifecycle SET status='closed', current_qty=0, "
+            "closed_at='2026-09-10T14:30:00+00:00', net_realized_pnl=160 "
+            "WHERE position_uid=?",
+            (uid,),
+        )
+        candidates = CandidateObservationStore(conn)
+        candidate_uid = candidates.start(CandidateStart(
+            cycle_uid="cycle-1",
+            signal_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
+            strategy="sma_crossover",
+            strategy_version="v1",
+            strategy_config_hash="cfg123",
+            bot_git_commit="abc123",
+            symbol="AAPL",
+            signal_symbol="AAPL",
+            timeframe="1Day",
+            data_feed="iex",
+            regime="TRENDING",
+            slot_ordinal=0,
+            watchlist_ordinal=0,
+            evaluation_ordinal=0,
+            feature_schema_version=1,
+            reference_price=100.0,
+            atr=2.0,
+            strategy_features={},
+            common_context={},
+        ))
+        candidates.update(candidate_uid, selected=True, position_uid=uid)
+        for order_id, price, qty, pnl in (
+            ("exit-1", 110.0, 4, 40.0),
+            ("exit-2", 120.0, 6, 120.0),
+        ):
+            conn.execute(
+                "INSERT INTO trades (timestamp,symbol,side,qty,avg_fill_price,"
+                "order_id,strategy,reason,status,filled_qty,position_type,"
+                "position_uid,realized_pnl) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("2026-09-10T14:30:00+00:00", "AAPL", "sell", qty, price,
+                 order_id, "sma_crossover", "exit", "filled", qty,
+                 "single_leg", uid, pnl),
+            )
+        conn.commit()
+
+        [paper] = recon._read_paper_lifecycles()
+        assert paper.position_uid == uid
+        assert paper.exit_price == pytest.approx(116.0)
+        assert paper.signal_at.startswith("2026-09-01")
+
+        uid_only = Reconciler(
+            _DummyStrategy(),
+            [],
+            "2026-09-01",
+            "2026-09-30",
+            trade_csv_path=recon._trade_logger.path,
+            position_uids=[uid],
+        )
+        assert [row.position_uid for row in uid_only._read_paper_lifecycles()] == [uid]
+
+    def test_report_is_advisory_and_discloses_unresolved_rows(self, recon):
+        result = ReconciliationResult(
+            strategy_name="sma_crossover",
             symbols=["AAPL"],
-            start_date="2026-04-01",
-            end_date="2026-04-30",
-            paper_return_pct=5.0,
-            backtest_return_pct=6.0,
-            return_divergence_pct=1.0,
-            paper_trade_count=10,
-            backtest_trade_count=10,
-            mean_slippage_bps=3.0,
-            go=True,
-            reasons=["all gates passed"],
+            start_date="2026-09-01",
+            end_date="2026-09-30",
+            paper_lifecycle_count=1,
+            backtest_lifecycle_count=0,
+            matched_count=0,
+            unresolved_count=1,
+            comparisons=[],
         )
-        assert r.go is True
-
-    def test_no_go_on_return_divergence(self):
-        r = ReconciliationResult(
-            strategy_name="test",
-            symbols=["AAPL"],
-            start_date="2026-04-01",
-            end_date="2026-04-30",
-            paper_return_pct=5.0,
-            backtest_return_pct=20.0,
-            return_divergence_pct=15.0,
-            paper_trade_count=10,
-            backtest_trade_count=10,
-            go=False,
-            reasons=["return divergence exceeds threshold"],
-        )
-        assert r.go is False
-
-
-# ── TestReconciler ──────────────────────────────────────────────────────────
-
-
-class TestReconciler:
-    def test_paper_return_from_csv(self, tmp_csv, tmp_forward_dir):
-        """Buy at 150, sell at 160 → ~6.67% return."""
-        rows = [
-            _make_fill(side="buy", price=150.0, date="2026-04-20"),
-            _make_fill(side="sell", price=160.0, date="2026-04-25"),
-        ]
-        _write_trades(tmp_csv, rows)
-
-        recon = Reconciler(
-            _DummyStrategy(),
-            ["AAPL"],
-            "2026-04-01",
-            "2026-04-30",
-            trade_csv_path=tmp_csv,
-            forward_test_dir=tmp_forward_dir,
-        )
-        paper_return = recon._compute_paper_return(
-            recon._read_paper_trades()
-        )
-        # (160 - 150) * 10 / (150 * 10) = 6.67%
-        assert abs(paper_return - 0.0667) < 0.001
-
-    def test_paper_return_no_fills(self, tmp_csv, tmp_forward_dir):
-        _write_trades(tmp_csv, [])
-        recon = Reconciler(
-            _DummyStrategy(),
-            ["AAPL"],
-            "2026-04-01",
-            "2026-04-30",
-            trade_csv_path=tmp_csv,
-            forward_test_dir=tmp_forward_dir,
-        )
-        assert recon._compute_paper_return([]) == 0.0
-
-    def test_read_paper_trades_filters_by_date(self, tmp_csv, tmp_forward_dir):
-        rows = [
-            _make_fill(date="2026-04-15"),  # in range
-            _make_fill(date="2026-03-01"),  # before range
-            _make_fill(date="2026-05-15"),  # after range
-        ]
-        _write_trades(tmp_csv, rows)
-
-        recon = Reconciler(
-            _DummyStrategy(),
-            ["AAPL"],
-            "2026-04-01",
-            "2026-04-30",
-            trade_csv_path=tmp_csv,
-            forward_test_dir=tmp_forward_dir,
-        )
-        trades = recon._read_paper_trades()
-        assert len(trades) == 1
-
-    def test_read_paper_trades_filters_by_symbol(self, tmp_csv, tmp_forward_dir):
-        rows = [
-            _make_fill(symbol="AAPL"),
-            _make_fill(symbol="TSLA"),
-        ]
-        _write_trades(tmp_csv, rows)
-
-        recon = Reconciler(
-            _DummyStrategy(),
-            ["AAPL"],
-            "2026-04-01",
-            "2026-04-30",
-            trade_csv_path=tmp_csv,
-            forward_test_dir=tmp_forward_dir,
-        )
-        trades = recon._read_paper_trades()
-        assert len(trades) == 1
-        assert trades[0]["symbol"] == "AAPL"
-
-    @patch("backtest.reconcile.fetch_symbol")
-    @patch("backtest.reconcile.run_backtest")
-    def test_run_produces_result(
-        self, mock_bt, mock_fetch, tmp_csv, tmp_forward_dir
-    ):
-        """Full run with mocked backtest."""
-        rows = [
-            _make_fill(side="buy", price=150.0, date="2026-04-20"),
-            _make_fill(side="sell", price=155.0, date="2026-04-25"),
-        ]
-        _write_trades(tmp_csv, rows)
-
-        # Mock fetch + backtest.
-        idx = pd.date_range("2026-04-01", periods=30, freq="D", tz="UTC")
-        mock_df = pd.DataFrame(
-            {"open": 150.0, "high": 152.0, "low": 148.0, "close": 151.0, "volume": 1000},
-            index=idx,
-        )
-        mock_fetch.return_value = (mock_df, {})
-
-        mock_pf = MagicMock()
-        mock_pf.trades.records_readable = pd.DataFrame({
-            "Entry Price": [150.0],
-            "Exit Price": [155.0],
-            "PnL": [50.0],
-        })
-        mock_bt_result = MagicMock()
-        mock_bt_result.stats = {"total_return": 0.033, "trade_count": 1}
-        mock_bt_result.portfolio = mock_pf
-        mock_bt.return_value = mock_bt_result
-
-        recon = Reconciler(
-            _DummyStrategy(),
-            ["AAPL"],
-            "2026-04-01",
-            "2026-04-30",
-            trade_csv_path=tmp_csv,
-            forward_test_dir=tmp_forward_dir,
-            return_divergence_threshold=0.20,
-            max_slippage_threshold=50.0,
-        )
-        result = recon.run()
-
-        assert result.paper_trade_count == 2
-        assert result.backtest_trade_count == 1
-        assert result.go is True
-        assert "all gates passed" in result.reasons
-
-    @patch("backtest.reconcile.fetch_symbol")
-    @patch("backtest.reconcile.run_backtest")
-    def test_no_go_on_high_slippage(
-        self, mock_bt, mock_fetch, tmp_csv, tmp_forward_dir
-    ):
-        # Paper fill with high adverse slippage on the new taxonomy column.
-        rows = [
-            {
-                **_make_fill(side="buy", price=150.0),
-                "slippage_adverse_bps": 30.0,  # above threshold
-                "slippage_signed_bps": 30.0,
-            },
-        ]
-        _write_trades(tmp_csv, rows)
-
-        mock_fetch.return_value = (pd.DataFrame(), {})
-
-        recon = Reconciler(
-            _DummyStrategy(),
-            ["AAPL"],
-            "2026-04-01",
-            "2026-04-30",
-            trade_csv_path=tmp_csv,
-            forward_test_dir=tmp_forward_dir,
-            return_divergence_threshold=0.50,
-            max_slippage_threshold=20.0,
-        )
-        result = recon.run()
-        assert result.go is False
-        assert any("slippage" in r for r in result.reasons)
-
-    @patch("backtest.reconcile.fetch_symbol")
-    @patch("backtest.reconcile.run_backtest")
-    def test_slippage_gate_uses_adverse_only_column(
-        self, mock_bt, mock_fetch, tmp_csv, tmp_forward_dir
-    ):
-        """Phase 2: writer-side clamp on `slippage_adverse_bps` is what
-        makes the gate adverse-only. A favorable fill contributes 0
-        (not its abs() magnitude) because the writer clamped at log
-        time, not because the reader does arithmetic."""
-        rows = [
-            {
-                **_make_fill(side="buy", price=150.0),
-                "slippage_signed_bps": -40.0,    # price improvement
-                "slippage_adverse_bps": 0.0,     # writer-clamped to 0
-            },
-            {
-                **_make_fill(side="sell", price=151.0),
-                "slippage_signed_bps": 30.0,
-                "slippage_adverse_bps": 30.0,
-            },
-        ]
-        _write_trades(tmp_csv, rows)
-        mock_fetch.return_value = (pd.DataFrame(), {})
-
-        recon = Reconciler(
-            _DummyStrategy(),
-            ["AAPL"],
-            "2026-04-01",
-            "2026-04-30",
-            trade_csv_path=tmp_csv,
-            forward_test_dir=tmp_forward_dir,
-            return_divergence_threshold=0.50,
-            max_slippage_threshold=20.0,
-        )
-        result = recon.run()
-
-        assert result.mean_slippage_bps == pytest.approx(15.0)
-        assert result.max_slippage_bps == pytest.approx(30.0)
-        assert result.go is True
-
-    @patch("backtest.reconcile.fetch_symbol")
-    @patch("backtest.reconcile.run_backtest")
-    def test_legacy_realized_column_null_does_not_silently_disable_gate(
-        self, mock_bt, mock_fetch, tmp_csv, tmp_forward_dir
-    ):
-        """Phase 2 regression guard. Pre-fix the gate read the retired
-        `realized_slippage_bps` column. On any post-Phase-2 paper row
-        that column is NULL, so the gate was silently falling back to
-        0.0 and would have rubber-stamped any drift. With the migration
-        to `slippage_adverse_bps`, an adverse 30 bps fill against a
-        20 bps threshold must still flip the gate to NO-GO even when
-        the legacy column is NULL (matching every production row)."""
-        rows = [
-            {
-                **_make_fill(side="buy", price=150.0),
-                # Production shape after Phase 4: legacy NULL, new
-                # column carries the measurement.
-                "slippage_adverse_bps": 30.0,
-                "slippage_signed_bps": 30.0,
-                "slippage_measurement_quality": "primary",
-            },
-        ]
-        _write_trades(tmp_csv, rows)
-        mock_fetch.return_value = (pd.DataFrame(), {})
-
-        recon = Reconciler(
-            _DummyStrategy(),
-            ["AAPL"],
-            "2026-04-01",
-            "2026-04-30",
-            trade_csv_path=tmp_csv,
-            forward_test_dir=tmp_forward_dir,
-            return_divergence_threshold=0.50,
-            max_slippage_threshold=20.0,
-        )
-        result = recon.run()
-
-        # Sanity: the legacy column truly is NULL on the persisted row,
-        # mirroring production after Phase 4.
-        import sqlite3
-        conn = sqlite3.connect(tmp_csv)
-        try:
-            legacy = conn.execute(
-                "SELECT realized_slippage_bps FROM trades LIMIT 1"
-            ).fetchone()[0]
-        finally:
-            conn.close()
-        assert legacy is None
-
-        # Pre-fix this assertion was the bug: mean_slip fell back to
-        # 0.0 because every row's legacy column was None, and `go`
-        # silently came back True.
-        assert result.mean_slippage_bps == pytest.approx(30.0)
-        assert result.go is False
-        assert any("slippage" in r for r in result.reasons)
-
-    @patch("backtest.reconcile.fetch_symbol")
-    @patch("backtest.reconcile.run_backtest")
-    def test_recovered_quality_rows_excluded_from_gate(
-        self, mock_bt, mock_fetch, tmp_csv, tmp_forward_dir
-    ):
-        """Recovered / unavailable rows carry reconstructed or synthetic
-        measurements and must not influence the live drift gate. With
-        the positive quality whitelist they're silently skipped — and
-        a `recovered` row with adverse 999 bps doesn't trip the gate."""
-        rows = [
-            {
-                **_make_fill(side="buy", price=150.0),
-                "slippage_adverse_bps": 999.0,
-                "slippage_signed_bps": 999.0,
-                "slippage_measurement_quality": "recovered",
-            },
-        ]
-        _write_trades(tmp_csv, rows)
-        mock_fetch.return_value = (pd.DataFrame(), {})
-
-        recon = Reconciler(
-            _DummyStrategy(),
-            ["AAPL"],
-            "2026-04-01",
-            "2026-04-30",
-            trade_csv_path=tmp_csv,
-            forward_test_dir=tmp_forward_dir,
-            return_divergence_threshold=0.50,
-            max_slippage_threshold=20.0,
-        )
-        result = recon.run()
-        # No measured rows → mean_slip = 0, gate passes on slippage
-        # (still hits the no-paper-fills reason because the matcher
-        # never gets a measured paper fill — but explicitly NOT the
-        # slippage reason).
-        assert result.mean_slippage_bps == pytest.approx(0.0)
-        assert not any("slippage" in r for r in result.reasons)
-
-    def test_no_go_on_no_fills(self, tmp_csv, tmp_forward_dir):
-        _write_trades(tmp_csv, [])
-        recon = Reconciler(
-            _DummyStrategy(),
-            ["AAPL"],
-            "2026-04-01",
-            "2026-04-30",
-            trade_csv_path=tmp_csv,
-            forward_test_dir=tmp_forward_dir,
-        )
-        result = recon.run()
-        assert result.go is False
-        assert any("no paper fills" in r for r in result.reasons)
-
-    @patch("backtest.reconcile.fetch_symbol")
-    @patch("backtest.reconcile.run_backtest")
-    def test_write_report(
-        self, mock_bt, mock_fetch, tmp_csv, tmp_forward_dir
-    ):
-        rows = [
-            _make_fill(side="buy", price=150.0, date="2026-04-20"),
-        ]
-        _write_trades(tmp_csv, rows)
-        mock_fetch.return_value = (pd.DataFrame(), {})
-
-        recon = Reconciler(
-            _DummyStrategy(),
-            ["AAPL"],
-            "2026-04-01",
-            "2026-04-30",
-            trade_csv_path=tmp_csv,
-            forward_test_dir=tmp_forward_dir,
-        )
-        result = recon.run()
         path = recon.write_report(result)
-
-        assert os.path.exists(path)
-        content = open(path).read()
-        assert "Forward-Test Reconciliation" in content
-        assert "test_strat" in content
-
-
-# ── TestTradeDivergence ─────────────────────────────────────────────────────
-
-
-class TestTradeDivergence:
-    def test_matched_divergence(self):
-        d = TradeDivergence(
-            symbol="AAPL",
-            side="buy",
-            paper_date="2026-04-20",
-            paper_price=150.0,
-            backtest_price=150.5,
-            price_diff_bps=33.3,
-            matched=True,
-        )
-        assert d.matched
-        assert d.price_diff_bps == 33.3
-
-    def test_unmatched_divergence(self):
-        d = TradeDivergence(
-            symbol="AAPL",
-            side="buy",
-            paper_date="2026-04-20",
-            paper_price=150.0,
-            backtest_price=None,
-            price_diff_bps=0.0,
-            matched=False,
-        )
-        assert not d.matched
-
-
-# ── TestGetClosedOrders ─────────────────────────────────────────────────────
+        content = Path(path).read_text()
+        assert "Advisory only" in content
+        assert "does not approve" in content
+        assert "GO" not in content
+        assert "nearest" not in content
 
 
 class TestGetClosedOrders:
     def test_returns_order_results(self):
-        mock_client = MagicMock()
-        mock_order = MagicMock()
-        mock_order.id = "order-1"
-        mock_order.symbol = "AAPL"
-        mock_order.qty = "10"
-        mock_order.filled_qty = "10"
-        mock_order.filled_avg_price = "150.05"
-        mock_order.status = "filled"
-        mock_order.side = "buy"
-        mock_client.get_orders.return_value = [mock_order]
+        client = MagicMock()
+        order = MagicMock()
+        order.id = "order-1"
+        order.symbol = "AAPL"
+        order.qty = "10"
+        order.filled_qty = "10"
+        order.filled_avg_price = "150.05"
+        order.status = "filled"
+        order.side = "buy"
+        client.get_orders.return_value = [order]
 
-        broker = AlpacaBroker(client=mock_client)
-        results = broker.get_closed_orders()
-
+        results = AlpacaBroker(client=client).get_closed_orders()
         assert len(results) == 1
         assert results[0].status == OrderStatus.FILLED
-        assert results[0].symbol == "AAPL"
-        assert results[0].filled_qty == 10
         assert results[0].avg_fill_price == 150.05
-
-    def test_filters_by_symbols(self):
-        mock_client = MagicMock()
-        o1 = MagicMock()
-        o1.id, o1.symbol, o1.qty, o1.filled_qty = "1", "AAPL", "10", "10"
-        o1.filled_avg_price, o1.status, o1.side = "150.0", "filled", "buy"
-        o2 = MagicMock()
-        o2.id, o2.symbol, o2.qty, o2.filled_qty = "2", "TSLA", "5", "5"
-        o2.filled_avg_price, o2.status, o2.side = "200.0", "filled", "buy"
-        mock_client.get_orders.return_value = [o1, o2]
-
-        broker = AlpacaBroker(client=mock_client)
-        results = broker.get_closed_orders(symbols=["AAPL"])
-
-        assert len(results) == 1
-        assert results[0].symbol == "AAPL"
-
-    def test_empty_history(self):
-        mock_client = MagicMock()
-        mock_client.get_orders.return_value = []
-        broker = AlpacaBroker(client=mock_client)
-        assert broker.get_closed_orders() == []

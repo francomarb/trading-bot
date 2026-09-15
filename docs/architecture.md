@@ -709,6 +709,20 @@ fills. Actual fill P&L already contains execution slippage, so the fee model
 does not charge modeled slippage a second time. MLEG net-after-costs stays
 unavailable when individual sell-leg principal is absent.
 
+**Paper/backtest reconciliation:** `backtest/reconcile.py` is a separate
+investigation tool, not a graduation gate. It groups paper fills, reductions,
+and exits by durable `position_uid`, uses the selected candidate's recorded
+signal bar to match at most one deterministic backtest round trip, and reports
+entry/exit price differences. It never substitutes the nearest price or reuses
+a backtest trade. Rows without a durable signal anchor, strategy-version or
+configuration parity, or a supported replay model remain explicitly
+unresolved. The current exact-match scope is SMA MARKET and Donchian DAY
+STOP_LIMIT replay. RSI's resting GTC LIMIT, OCC options, MLEG spreads, and
+leveraged signal/trading-asset pairs require their own execution models before
+they can be added honestly. Investigations may be scoped by inclusive signal
+dates, symbols, and exact `position_uid` values; selecting a lifecycle never
+orphans its later exit from the comparison.
+
 **Pre-flight checklist (`scripts/preflight.py`):**
 Must exit 0 before any live capital is committed. Validates: credentials point to the live endpoint, buying power meets minimum, `SLIPPAGE_DRIFT_ENABLED=True`, dry-run cycle passes, and the operator has explicitly set `STRATEGY_GRADUATION_APPROVED=yes`. The lifecycle-first graduation report now produces advisory evidence, but preflight remains a manual operator assertion until a later reviewed change binds an approved strategy, cohort, and report digest.
 

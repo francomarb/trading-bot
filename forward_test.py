@@ -24,7 +24,7 @@ Reconcile after the run:
     )
     result = r.run()
     r.write_report(result)
-    print('GO' if result.go else 'NO-GO', result.reasons)
+    print(f'matched={result.matched_count} unresolved={result.unresolved_count}')
     "
 """
 

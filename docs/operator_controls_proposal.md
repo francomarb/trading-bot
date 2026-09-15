@@ -824,7 +824,7 @@ These subsystems read `position_uid` for clarity but don't drive lifecycle state
 - **Strategy Health & Edge Monitor.** Lifecycle ID makes "trade count" unambiguous and removes the partial-exit accounting concern raised in §10. Per-lifecycle realized R becomes a direct query rather than a symbol+time-window heuristic.
 - **Sleeve allocator.** Reserve/release keyed by `(strategy, position_uid)` makes reopened symbols within the same strategy provably distinct from positions that were never closed.
 - **PnL and R-multiple reporting.** Per-lifecycle final R, win/loss attribution, and reopened-symbol distinction all become single-query operations.
-- **Backtest ↔ forward-test reconciliation.** `backtest/reconcile.py` matching becomes a join rather than a fuzzy match if backtest-side lifecycles synthesize equivalent IDs.
+- **Backtest ↔ forward-test reconciliation.** Shipped: `backtest/reconcile.py` groups paper activity by `position_uid`, then joins each anchored paper position one-to-one to a deterministic backtest lifecycle through its recorded signal bar. Random paper UUIDs are not fabricated by the backtest. Missing anchors and unsupported instrument models remain unresolved.
 - **Engine state snapshot.** Restart can distinguish "same lifecycle the bot was tracking" from "broker still holds this symbol but the prior lifecycle ended overnight via a stop fill." Foundation's substrate-driven reconciliation already covers this for new state machines; the snapshot itself remains a separate exposure layer.
 - **Alerts.** Fill/exit alerts can include `position_uid`, making the alert stream actionable — the operator can copy-paste the ID straight into `show-position`.
 
