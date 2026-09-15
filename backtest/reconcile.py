@@ -131,6 +131,7 @@ class Reconciler:
         start_date: str,
         end_date: str,
         *,
+        allowed_regimes: frozenset[Any] | None,
         trade_csv_path: str | None = None,
         forward_test_dir: str | None = None,
         backtest_config: BacktestConfig | None = None,
@@ -144,6 +145,7 @@ class Reconciler:
         self.symbols = list(symbols)
         self.start_date = start_date
         self.end_date = end_date
+        self._allowed_regimes = allowed_regimes
         self._trade_logger = TradeLogger(path=trade_csv_path)
         self._forward_test_dir = forward_test_dir or settings.FORWARD_TEST_DIR
         self._bt_config = backtest_config or BacktestConfig()
@@ -156,6 +158,7 @@ class Reconciler:
         papers = self._read_paper_lifecycles()
         identity = resolve_strategy_identity(
             self.strategy,
+            allowed_regimes=self._allowed_regimes,
             data_feed=settings.ALPACA_DATA_FEED,
             timeframe=self._timeframe,
         )
@@ -219,7 +222,7 @@ class Reconciler:
             f"- Symbols: {', '.join(result.symbols)}",
             f"- Paper lifecycles: {result.paper_lifecycle_count}",
             f"- Backtest lifecycles: {result.backtest_lifecycle_count}",
-            f"- Exact matches: {result.matched_count}",
+            f"- Identity-exact matches: {result.matched_count}",
             f"- Unresolved or unsupported: {result.unresolved_count}",
             "",
             "## Lifecycle comparisons",

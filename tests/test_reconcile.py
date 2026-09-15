@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
@@ -17,12 +17,21 @@ from backtest.reconcile import (
     _next_execution_bar,
 )
 from backtest.runner import BacktestConfig, BacktestResult
+from config import settings
 from engine.candidate_observation import CandidateObservationStore, CandidateStart
 from engine.lifecycle import PositionLifecycleStore
 from execution.broker import AlpacaBroker, OrderStatus
 from reporting.logger import TradeLogger
+from regime.detector import MarketRegime
 from risk.models import ProtectionModel, SizingModel
+from sector.gauge import SectorMomentumGauge
+from sector.resolver import SectorResolver
 from strategies.base import BaseStrategy, OrderType, SignalFrame
+from strategies.filters.common import CompositeEdgeFilter
+from strategies.filters.sector_momentum import SectorMomentumFilter
+from strategies.filters.sma_crossover import SMAEdgeFilter
+from strategies.identity import resolve_strategy_identity
+from strategies.sma_crossover import SMACrossover
 
 
 class _DummyStrategy(BaseStrategy):
@@ -43,6 +52,7 @@ def recon(tmp_path: Path) -> Reconciler:
         ["AAPL"],
         "2026-09-01",
         "2026-09-30",
+        allowed_regimes=frozenset(),
         trade_csv_path=str(tmp_path / "trades.db"),
         forward_test_dir=str(tmp_path / "reports"),
     )
@@ -98,7 +108,106 @@ def _bt_result(*, entries: list[bool] | None = None) -> BacktestResult:
     )
 
 
+def _production_sma() -> SMACrossover:
+    """Mirror the behavior-affecting SMA construction in forward_test.py."""
+    return SMACrossover(
+        fast=20,
+        slow=50,
+        edge_filter=CompositeEdgeFilter([
+            SMAEdgeFilter(),
+            SectorMomentumFilter(
+                gauge=SectorMomentumGauge(sector_etfs=settings.SECTOR_ETFS),
+                resolver=SectorResolver(valid_sectors=set(settings.SECTOR_ETFS)),
+                sector_entry_policy="warn",
+            ),
+        ]),
+    )
+
+
 class TestLifecycleMatching:
+    def test_run_uses_engine_allowed_regimes_for_identity(self, tmp_path):
+        strategy = _production_sma()
+        allowed = frozenset({MarketRegime.TRENDING, MarketRegime.RANGING})
+        identity = resolve_strategy_identity(
+            strategy,
+            allowed_regimes=allowed,
+            data_feed=settings.ALPACA_DATA_FEED,
+            timeframe="1Day",
+        )
+        fallback_identity = resolve_strategy_identity(
+            strategy,
+            data_feed=settings.ALPACA_DATA_FEED,
+            timeframe="1Day",
+        )
+        assert identity.strategy_config_hash != fallback_identity.strategy_config_hash
+
+        reconciler = Reconciler(
+            strategy,
+            ["AAPL"],
+            "2026-09-01",
+            "2026-09-30",
+            allowed_regimes=allowed,
+            trade_csv_path=str(tmp_path / "trades.db"),
+        )
+        conn = reconciler._trade_logger._ensure_db()
+        uid = "pos_" + "d" * 32
+        lifecycle = PositionLifecycleStore(conn)
+        lifecycle.create_pending(
+            position_uid=uid,
+            symbol="AAPL",
+            owner_key="AAPL",
+            strategy="sma_crossover",
+            strategy_version=identity.strategy_version,
+            strategy_config_hash=identity.strategy_config_hash,
+            bot_git_commit=identity.bot_git_commit,
+            position_type="single_leg",
+            entry_qty=10,
+            sizing_model=SizingModel.STOP_DISTANCE,
+            protection_model=ProtectionModel.BROKER_STOP,
+        )
+        lifecycle.mark_open(
+            position_uid=uid,
+            avg_entry_price=101.0,
+            current_qty=10,
+            first_fill_at="2026-09-02T14:30:00+00:00",
+        )
+        candidates = CandidateObservationStore(conn)
+        candidate_uid = candidates.start(CandidateStart(
+            cycle_uid="identity-cycle",
+            signal_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
+            strategy="sma_crossover",
+            strategy_version=identity.strategy_version,
+            strategy_config_hash=identity.strategy_config_hash,
+            bot_git_commit=identity.bot_git_commit,
+            symbol="AAPL",
+            signal_symbol="AAPL",
+            timeframe="1Day",
+            data_feed=settings.ALPACA_DATA_FEED,
+            regime="trending",
+            slot_ordinal=0,
+            watchlist_ordinal=0,
+            evaluation_ordinal=0,
+            feature_schema_version=1,
+            reference_price=100.0,
+            atr=2.0,
+            strategy_features={},
+            common_context={},
+        ))
+        candidates.update(
+            candidate_uid,
+            selected=True,
+            position_uid=uid,
+        )
+        backtest = _bt_result()
+        with patch.object(
+            reconciler, "_run_backtest_for_symbol", return_value=backtest
+        ):
+            result = reconciler.run()
+
+        assert result.matched_count == 1
+        assert result.unresolved_count == 0
+        assert result.comparisons[0].reason == "exact_signal_bar"
+
     def test_signal_bar_maps_to_next_execution_bar(self):
         index = pd.date_range("2026-09-01", periods=3, freq="D", tz="UTC")
         assert _next_execution_bar(index, "2026-09-01T00:00:00+00:00") == index[1]
@@ -252,6 +361,7 @@ class TestLifecycleReadAndReport:
             [],
             "2026-09-01",
             "2026-09-30",
+            allowed_regimes=frozenset(),
             trade_csv_path=recon._trade_logger.path,
             position_uids=[uid],
         )

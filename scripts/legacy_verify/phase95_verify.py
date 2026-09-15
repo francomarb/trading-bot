@@ -37,6 +37,7 @@ from execution.broker import AlpacaBroker
 from reporting.alerts import AlertDispatcher
 from reporting.logger import TradeLogger, install_json_sink
 from reporting.pnl import PnLTracker
+from regime.detector import MarketRegime
 from risk.manager import RiskManager
 from strategies.base import BaseStrategy, OrderType, SignalFrame
 from strategies.sma_crossover import SMACrossover
@@ -122,6 +123,10 @@ def test_reconciler(broker: AlpacaBroker) -> None:
         ["AAPL"],
         week_ago,
         today,
+        allowed_regimes=frozenset(
+            MarketRegime[name]
+            for name in settings.STRATEGY_ALLOWED_REGIMES["sma_crossover"]
+        ),
         forward_test_dir=tmp_forward_dir,
     )
 

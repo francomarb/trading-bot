@@ -716,10 +716,12 @@ signal bar to match at most one deterministic backtest round trip, and reports
 entry/exit price differences. It never substitutes the nearest price or reuses
 a backtest trade. Rows without a durable signal anchor, strategy-version or
 configuration parity, or a supported replay model remain explicitly
-unresolved. The current exact-match scope is SMA MARKET and Donchian DAY
-STOP_LIMIT replay. RSI's resting GTC LIMIT, OCC options, MLEG spreads, and
-leveraged signal/trading-asset pairs require their own execution models before
-they can be added honestly. Investigations may be scoped by inclusive signal
+unresolved. The current identity-exact scope is SMA MARKET and Donchian DAY
+STOP_LIMIT replay. Entry and exit prices remain comparisons with the existing
+daily-bar model, not claims of broker-execution parity. RSI's resting GTC
+LIMIT, OCC options, MLEG spreads, and leveraged signal/trading-asset pairs
+require their own execution models before they can be added honestly.
+Investigations may be scoped by inclusive signal
 dates, symbols, and exact `position_uid` values; selecting a lifecycle never
 orphans its later exit from the comparison.
 
