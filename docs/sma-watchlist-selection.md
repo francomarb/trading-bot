@@ -115,7 +115,7 @@ Required guardrails:
 - do not remove a symbol with an open position unless ownership and exit rules
   are explicit
 - do not change the active watchlist mid-paper-run when the run is being used
-  for reconciliation or GO/NO-GO analysis
+  for lifecycle reconciliation or a controlled strategy analysis
 - cache every generated watchlist with timestamp, rule version, data timestamp,
   and selected symbols
 - log rejection counts for every hard filter

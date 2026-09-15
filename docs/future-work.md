@@ -19,7 +19,7 @@ The bot already has strong architectural foundations:
 
 - pluggable strategies
 - a shared engine loop
-- a go/no-go / risk gate
+- lifecycle-first advisory reconciliation and independent risk controls
 - broker/execution separation
 - reporting/logging
 

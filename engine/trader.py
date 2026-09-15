@@ -12,7 +12,7 @@ Design principles (CLAUDE.md / PLAN.md):
 
   1. **Broker is the source of truth.** Every cycle starts with
      `broker.sync_with_broker()`. Local cached state is never trusted across
-     cycles for go/no-go decisions.
+     cycles for ownership and order-admission decisions.
 
   2. **Restart-safe.** On startup the engine takes a broker snapshot before
      anything else. If the bot was killed mid-trade, the next startup sees

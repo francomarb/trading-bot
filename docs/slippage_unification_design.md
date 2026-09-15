@@ -1002,7 +1002,9 @@ state.
 - forward-test reconciliation (`backtest/reconcile.py`) slippage
   go/no-go gate migrated to the new column + whitelist (review
   follow-up — pre-fix it read the retired legacy column and silently
-  fell back to zero on every post-Phase-2 row)
+  fell back to zero on every post-Phase-2 row). This describes the Phase 2
+  implementation history; the gate was later retired when reconciliation
+  became an advisory lifecycle-matching tool
 - legacy `modeled_slippage_bps` / `realized_slippage_bps` writes
   removed across `build_record`, `build_close_record`,
   `log_stop_fill`, `log_spread_fill`. New rows write NULL on both

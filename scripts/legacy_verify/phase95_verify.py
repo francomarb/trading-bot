@@ -4,9 +4,9 @@ Phase 9.5 — Forward-Test Infrastructure — integration verification.
 Verifies that the forward-test tooling works end-to-end:
 
   1. **get_closed_orders** — retrieves historical orders from Alpaca paper.
-  2. **Reconciler** — runs against current trade CSV (may be empty) and
-     produces a ReconciliationResult with the gate decision.
-  3. **Report generation** — writes the go/no-go markdown report.
+  2. **Reconciler** — runs against lifecycle records (which may be empty)
+     and produces an advisory ReconciliationResult.
+  3. **Report generation** — writes the lifecycle comparison report.
   4. **Engine launch** — runs 3 cycles with forward_test config to verify
      the launcher wiring.
 
@@ -37,6 +37,7 @@ from execution.broker import AlpacaBroker
 from reporting.alerts import AlertDispatcher
 from reporting.logger import TradeLogger, install_json_sink
 from reporting.pnl import PnLTracker
+from regime.detector import MarketRegime
 from risk.manager import RiskManager
 from strategies.base import BaseStrategy, OrderType, SignalFrame
 from strategies.sma_crossover import SMACrossover
@@ -122,9 +123,11 @@ def test_reconciler(broker: AlpacaBroker) -> None:
         ["AAPL"],
         week_ago,
         today,
+        allowed_regimes=frozenset(
+            MarketRegime[name]
+            for name in settings.STRATEGY_ALLOWED_REGIMES["sma_crossover"]
+        ),
         forward_test_dir=tmp_forward_dir,
-        return_divergence_threshold=0.50,  # generous for verify
-        max_slippage_threshold=100.0,      # generous for verify
     )
 
     result = recon.run()
@@ -142,19 +145,21 @@ def test_reconciler(broker: AlpacaBroker) -> None:
         result.start_date == week_ago and result.end_date == today,
     )
     check(
-        "backtest_return_pct is a number",
-        isinstance(result.backtest_return_pct, (int, float)),
-        f"{result.backtest_return_pct:.2f}%",
+        "lifecycle counts are numbers",
+        isinstance(result.paper_lifecycle_count, int)
+        and isinstance(result.backtest_lifecycle_count, int),
+        f"paper={result.paper_lifecycle_count}, backtest={result.backtest_lifecycle_count}",
     )
     check(
-        "gate decision is boolean",
-        isinstance(result.go, bool),
-        f"go={result.go}",
+        "match counts are numbers",
+        isinstance(result.matched_count, int)
+        and isinstance(result.unresolved_count, int),
+        f"matched={result.matched_count}, unresolved={result.unresolved_count}",
     )
     check(
-        "reasons populated",
-        len(result.reasons) > 0,
-        "; ".join(result.reasons),
+        "counts reconcile",
+        result.matched_count + result.unresolved_count
+        == result.paper_lifecycle_count,
     )
 
     return result, recon
@@ -163,14 +168,14 @@ def test_reconciler(broker: AlpacaBroker) -> None:
 def test_report_generation(
     result: ReconciliationResult, recon: Reconciler
 ) -> None:
-    section("Report generation — go/no-go markdown")
+    section("Report generation — lifecycle comparison markdown")
     path = recon.write_report(result)
     check("report file exists", os.path.exists(path), path)
     if os.path.exists(path):
         content = open(path).read()
-        check("report contains verdict", "GO" in content)
+        check("report is advisory", "Advisory only" in content)
         check("report contains strategy name", "sma_crossover" in content)
-        check("report contains return data", "Paper return" in content)
+        check("report contains lifecycle data", "Paper lifecycles" in content)
 
 
 def test_engine_with_forward_test_config(broker: AlpacaBroker) -> None:
@@ -214,18 +219,6 @@ def test_forward_test_settings() -> None:
         "FORWARD_TEST_DIR configured",
         hasattr(settings, "FORWARD_TEST_DIR")
         and settings.FORWARD_TEST_DIR != "",
-    )
-    check(
-        "FORWARD_TEST_RETURN_DIVERGENCE_PCT configured",
-        hasattr(settings, "FORWARD_TEST_RETURN_DIVERGENCE_PCT")
-        and settings.FORWARD_TEST_RETURN_DIVERGENCE_PCT > 0,
-        f"{settings.FORWARD_TEST_RETURN_DIVERGENCE_PCT:.0%}",
-    )
-    check(
-        "FORWARD_TEST_MAX_SLIPPAGE_BPS configured",
-        hasattr(settings, "FORWARD_TEST_MAX_SLIPPAGE_BPS")
-        and settings.FORWARD_TEST_MAX_SLIPPAGE_BPS > 0,
-        f"{settings.FORWARD_TEST_MAX_SLIPPAGE_BPS} bps",
     )
 
 

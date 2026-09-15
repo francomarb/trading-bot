@@ -10,22 +10,22 @@ The bot runs continuously until SIGINT (Ctrl+C). On shutdown it writes
 a daily P&L report for the session. After the multi-week run, use
 `backtest/reconcile.py` to compare paper fills against backtest predictions.
 
-Reconcile after the run:
+Reconcile from code holding the exact configured ``StrategySlot`` used by the
+engine. Do not construct a bare strategy: its filters and regime policy are
+part of the recorded configuration identity.
 
-    python -c "
     from backtest.reconcile import Reconciler
-    from config import settings
-    from strategies.sma_crossover import SMACrossover
     r = Reconciler(
-        SMACrossover(20, 50),
-        list(settings.SMA_WATCHLIST),
+        slot.strategy,
+        slot.active_symbols(),
         'YYYY-MM-DD',
         'YYYY-MM-DD',
+        allowed_regimes=slot.allowed_regimes,
+        timeframe=slot.timeframe,
     )
     result = r.run()
     r.write_report(result)
-    print('GO' if result.go else 'NO-GO', result.reasons)
-    "
+    print(f'matched={result.matched_count} unresolved={result.unresolved_count}')
 """
 
 from __future__ import annotations
