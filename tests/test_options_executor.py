@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -341,6 +341,82 @@ class TestBuildMlegRequest:
 
 
 class TestSpreadExecutionWorker:
+    def test_first_submit_uses_durable_substrate_client_order_id(self):
+        api = MagicMock()
+        api.submit_order.return_value = _mleg_submitted("combo-1")
+        api.get_order_by_id.return_value = _mleg_filled("combo-1")
+        stream = MagicMock()
+        stream_event = MagicMock()
+        stream_event.wait.return_value = True
+        stream.watch.return_value = stream_event
+
+        worker = SpreadExecutionWorker(
+            legs=_open_legs(), qty=1, limit_price=-1.45,
+            strategy_name="credit_spread", api=api,
+            stream_manager=stream, on_fill=MagicMock(),
+            substrate_cloid="spr-entry-durable-1",
+        )
+        worker.run()
+
+        request = api.submit_order.call_args.args[0]
+        assert request.client_order_id == "spr-entry-durable-1"
+        stream.watch.assert_called_once_with("spr-entry-durable-1")
+
+    def test_partial_fill_cancels_remainder_before_reporting(self):
+        api = MagicMock()
+        api.submit_order.return_value = _mleg_submitted("combo-1")
+        partial = SimpleNamespace(
+            id="combo-1", status=SimpleNamespace(value="partially_filled"),
+            filled_qty="1", filled_avg_price="1.50", symbol=None, legs=[],
+        )
+        canceled = SimpleNamespace(
+            id="combo-1", status=SimpleNamespace(value="canceled"),
+            filled_qty="1", filled_avg_price="1.50", symbol=None, legs=[],
+        )
+        api.get_order_by_id.side_effect = [partial, canceled]
+        stream = MagicMock()
+        stream_event = MagicMock()
+        stream_event.wait.return_value = False
+        stream.watch.return_value = stream_event
+        on_fill = MagicMock()
+        worker = SpreadExecutionWorker(
+            legs=_open_legs(), qty=2, limit_price=-1.45,
+            strategy_name="credit_spread", api=api,
+            stream_manager=stream, on_fill=on_fill,
+        )
+
+        with patch("execution.options_executor.time.sleep"):
+            worker.run()
+
+        api.cancel_order_by_id.assert_called_once_with("combo-1")
+        on_fill.assert_called_once_with(
+            "partially_filled", 1.0, 1.50, "combo-1"
+        )
+
+    def test_unconfirmed_partial_remainder_reports_unknown(self):
+        api = MagicMock()
+        api.submit_order.return_value = _mleg_submitted("combo-1")
+        partial = SimpleNamespace(
+            id="combo-1", status=SimpleNamespace(value="partially_filled"),
+            filled_qty="1", filled_avg_price="1.50", symbol=None, legs=[],
+        )
+        api.get_order_by_id.return_value = partial
+        api.cancel_order_by_id.side_effect = RuntimeError("cancel unavailable")
+        stream = MagicMock()
+        stream_event = MagicMock()
+        stream_event.wait.return_value = False
+        stream.watch.return_value = stream_event
+        on_fill = MagicMock()
+        worker = SpreadExecutionWorker(
+            legs=_open_legs(), qty=2, limit_price=-1.45,
+            strategy_name="credit_spread", api=api,
+            stream_manager=stream, on_fill=on_fill,
+        )
+
+        worker.run()
+
+        on_fill.assert_called_once_with("unknown", 1.0, 1.50, "combo-1")
+
     def test_halt_after_dispatch_blocks_sdk_submit(self):
         api = MagicMock()
         stream = MagicMock()

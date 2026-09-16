@@ -1072,13 +1072,14 @@ class PositionLifecycleOrdersStore:
         """Advance a per-order row from ``pending`` to a terminal status
         in one call, attaching the broker order_id along the way.
 
-        Designed for the spread close path (§10.7): the substrate row is
+        Designed for asynchronous spread worker drains (§10.7): the row is
         inserted ``pending`` before ``dispatch_spread_order(closing=True)``
         and the broker order_id is only observed via the drain. This
         method does the attach + status update without invoking the
-        single-leg-scoped ``apply_order_event`` pipeline (no trades
-        UPSERT, no position rollup, no position-status CTE — none of
-        those apply to spreads).
+        full ``apply_order_event`` pipeline. Close-side spread rows remain on
+        their dedicated reconciler; entry rows can also advance through the
+        ordinary stream/cycle/startup pipeline now that role-directed
+        quantity rollup supports SELL-to-open spreads.
 
         ``status`` must be one of ``filled / canceled / rejected /
         partially_filled / working / unknown``. Terminal states stamp
@@ -1282,6 +1283,10 @@ class PositionLifecycleOrdersStore:
         sql = (
             _SELECT_LIFECYCLE_ORDER_COLUMNS
             + f" WHERE order_id IS NOT NULL AND status IN ({placeholders}) "
+            "AND NOT (role IN ('exit', 'partial_close') "
+            "         AND position_uid IN ("
+            "             SELECT position_uid FROM position_lifecycle "
+            "             WHERE position_type = 'spread')) "
             "ORDER BY id ASC"
         )
         params: tuple = active_statuses
@@ -1374,10 +1379,9 @@ class PositionLifecycleOrdersStore:
 
         Used by the spread close reconciler (cycle + startup) to walk
         rows whose state may have advanced at the broker without the
-        WebSocket noticing. ``apply_order_event`` is single-leg-scoped;
-        spreads use ``mark_terminal_after_dispatch`` instead, so they
-        need a dedicated walk that doesn't intermix with the
-        single-leg reconciler.
+        WebSocket noticing. Close rows use ``mark_terminal_after_dispatch``
+        and are excluded from the ordinary reconciler; spread entry rows use
+        the ordinary state machine.
 
         Returns rows in id-ascending order (insertion order).
         Includes rows with order_id IS NULL (e.g. the partial_close
@@ -1427,14 +1431,14 @@ class PositionLifecycleOrdersStore:
         min_age_seconds: int,
         limit: int | None = None,
     ) -> list[PositionLifecycleOrderRow]:
-        """Single-leg pending rows where the broker order_id was never
-        attached (orphan candidates for the NULL-order_id REST sweep).
+        """Recoverable pending rows where the broker order_id was never
+        attached (orphan candidates for the NULL-order-id REST sweep).
 
         Returns rows matching ALL of:
 
-          - ``position_lifecycle.position_type = 'single_leg'`` — spreads
-            have their own crash-durable close path (PR #72 §10.7) and
-            must not be touched by this sweep.
+          - all single-leg rows, plus spread ``entry_primary`` rows. Spread
+            closes retain their dedicated crash-durable path and the
+            intentional NULL-id partial-close placeholder remains excluded.
           - ``status = 'pending'`` — once a row reaches
             working/partially_filled/filled the broker order_id is
             already known by definition; this query targets rows the
@@ -1448,7 +1452,8 @@ class PositionLifecycleOrdersStore:
           - The only intentional ``order_id IS NULL`` shape is the
             spread ``partial_close`` residual placeholder from PR #72
             §10.7. That row sits on a ``position_type='spread'``
-            parent and is excluded by the JOIN above. Single-leg
+            parent with a close-side role and is excluded by the role gate
+            above. Single-leg
             ``partial_close`` rows (operator ``reduce-position``,
             execution/broker.py:_lifecycle_orders_record_exit with
             ``partial_qty``) ARE valid sweep targets — they go
@@ -1517,7 +1522,9 @@ class PositionLifecycleOrdersStore:
             "FROM position_lifecycle_orders plo "
             "JOIN position_lifecycle pl "
             "  ON pl.position_uid = plo.position_uid "
-            "WHERE pl.position_type = 'single_leg' "
+            "WHERE (pl.position_type = 'single_leg' "
+            "       OR (pl.position_type = 'spread' "
+            "           AND plo.role = 'entry_primary')) "
             "  AND plo.status = 'pending' "
             "  AND plo.order_id IS NULL "
             "  AND plo.client_order_id IS NOT NULL "
@@ -1802,15 +1809,22 @@ DO UPDATE SET
 """
 
 
-# Position rollup SQL — discovery doc §6.6 (R3-P1b side-signed sum) +
+# Position rollup SQL — discovery doc §6.6 (role-directed quantity) +
 # R13-G2 (net_realized_pnl from trades).
 _POSITION_ROLLUP_SQL = """
 WITH signed_qty AS (
     SELECT COALESCE(SUM(
-        CASE side
-            WHEN 'buy'  THEN  filled_qty
-            WHEN 'sell' THEN -filled_qty
-            ELSE              0
+        CASE
+            -- Quantity direction follows order intent, not cash side.
+            -- A credit spread is SELL-to-open / BUY-to-close, the exact
+            -- opposite of a long single-leg position.  Roles remain
+            -- stable across both shapes: entries add contracts and every
+            -- close/protection role removes them.
+            WHEN role IN ('entry_primary', 'entry_residual') THEN filled_qty
+            WHEN role IN ('exit', 'partial_close',
+                          'protective_stop', 'replacement_stop')
+                THEN -filled_qty
+            ELSE 0
         END
     ), 0.0) AS net_qty
     FROM position_lifecycle_orders
@@ -1845,7 +1859,15 @@ SET
               AND role IN ('entry_primary', 'entry_residual')
         ) THEN avg_entry_price
         ELSE (
-            SELECT SUM(filled_qty * avg_fill_price) / NULLIF(SUM(filled_qty), 0)
+            SELECT SUM(
+                       filled_qty * CASE
+                           WHEN (SELECT position_type
+                                 FROM position_lifecycle
+                                 WHERE position_uid = :position_uid) = 'spread'
+                           THEN ABS(avg_fill_price)
+                           ELSE avg_fill_price
+                       END
+                   ) / NULLIF(SUM(filled_qty), 0)
             FROM position_lifecycle_orders
             WHERE position_uid = :position_uid
               AND role IN ('entry_primary', 'entry_residual')
@@ -1876,11 +1898,8 @@ WITH computed AS (
         --
         -- Without this, the clauses below read "no entry order is live"
         -- as "the entry was cancelled", when the truth is "the entry was
-        -- never recorded here". Spreads hit this on every close: they
-        -- write no entry_primary row (PR #72 deferred it), so an exit
-        -- order going `working` computed 'canceled' for a LIVE position,
-        -- and an exit that FILLED computed 'open' for a closed one.
-        -- Both reproduced in tests/test_apply_order_event.py.
+        -- never recorded here". Historical PR #72-era spreads have this
+        -- shape; new spreads write entry_primary before dispatch.
         --
         -- Production was never wrong because the spread path stamps
         -- status directly via mark_open / mark_closed and those writes

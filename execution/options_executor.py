@@ -312,6 +312,45 @@ class _BaseExecutionWorker(threading.Thread):
         except Exception as e:
             logger.error(f"[{self.name}] on_fill callback raised: {e}")
 
+    def _settle_partial_if_required(
+        self, *, order_id: str, order,
+    ) -> tuple[str, object]:
+        """Cancel a spread order's unfilled remainder before reporting it.
+
+        ``partially_filled`` is not terminal at Alpaca.  A spread worker must
+        not hand control back to the engine while the remainder can still
+        fill and make the durable/in-memory quantity stale.  Single-leg
+        workers retain their existing behavior; spread workers opt in via
+        ``_settle_partial_fills``.
+        """
+        if not getattr(self, "_settle_partial_fills", False):
+            return "partially_filled", order
+        try:
+            self.api.cancel_order_by_id(order_id)
+        except Exception as exc:
+            logger.critical(
+                f"[{self.name}] could not cancel partially-filled MLEG "
+                f"remainder for {order_id}: {exc}"
+            )
+            return "unknown", order
+        latest = order
+        for _ in range(5):
+            time.sleep(0.2)
+            try:
+                latest = self.api.get_order_by_id(order_id)
+            except Exception:
+                continue
+            outcome = _terminal_outcome(order=latest, stream_update=None)
+            raw = getattr(latest, "status", None)
+            raw_value = raw.value if hasattr(raw, "value") else str(raw)
+            if raw_value in {"canceled", "cancelled", "filled", "rejected", "expired"}:
+                return outcome, latest
+        logger.critical(
+            f"[{self.name}] MLEG partial remainder cancellation was not "
+            f"confirmed for {order_id}; leaving the attempt unresolved"
+        )
+        return "unknown", latest
+
     def _watch_to_terminal(
         self,
         *,
@@ -365,6 +404,10 @@ class _BaseExecutionWorker(threading.Thread):
                     else str(latest.status)
                 )
                 if status in ("filled", "partially_filled", "canceled", "rejected"):
+                    if status == "partially_filled":
+                        status, latest = self._settle_partial_if_required(
+                            order_id=order_id, order=latest,
+                        )
                     logger.info(
                         f"[{self.name}] order resolved during stream gap: {status}"
                     )
@@ -394,6 +437,10 @@ class _BaseExecutionWorker(threading.Thread):
                     else str(latest.status)
                 )
                 if status in ("filled", "partially_filled", "canceled", "rejected"):
+                    if status == "partially_filled":
+                        status, latest = self._settle_partial_if_required(
+                            order_id=order_id, order=latest,
+                        )
                     logger.info(
                         f"[{self.name}] order reached terminal state: {status}"
                     )
@@ -608,8 +655,10 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
         self._on_walk_step = on_walk_step
         self._on_submitted = on_submitted
         self._substrate_cloid = substrate_cloid
+        self._substrate_cloid_used = False
         self._substrate_db_path = substrate_db_path
         self._entry_walk = entry_walk
+        self._settle_partial_fills = True
         if close_scheduler is not None and entry_walk is not None:
             raise ValueError(
                 "SpreadExecutionWorker: close_scheduler and entry_walk are "
@@ -658,6 +707,18 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
             logger.error(
                 f"[{self.name}] on_submitted callback raised: {exc}"
             )
+
+    def _broker_client_order_id(self, generated: str) -> str:
+        """Use the durable row's client ID for the first broker submit.
+
+        This lets the startup NULL-order-id sweep resolve a crash before the
+        worker's eager order-id attachment.  Walk rungs after the first need
+        fresh IDs because Alpaca treats client IDs as idempotency keys.
+        """
+        if self._substrate_cloid is not None and not self._substrate_cloid_used:
+            self._substrate_cloid_used = True
+            return self._substrate_cloid
+        return generated
 
     def _durably_attach_order_id_to_substrate(
         self, broker_order_id: str,
@@ -750,7 +811,9 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
             f"[{', '.join(leg.occ_symbol for leg in self.legs)}] "
             f"@ net {self.limit_price:.2f}"
         )
-        client_order_id = f"spr-{self.strategy_name}-{uuid.uuid4().hex[:8]}"
+        client_order_id = self._broker_client_order_id(
+            f"spr-{self.strategy_name}-{uuid.uuid4().hex[:8]}"
+        )
         try:
             req = build_mleg_request(
                 legs=self.legs,
@@ -816,7 +879,7 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
         ``latest_order`` is the most recent Alpaca order object for
         telemetry, or None if the submit itself failed.
         """
-        client_order_id = (
+        client_order_id = self._broker_client_order_id(
             f"spr-{self.strategy_name}-walk{step.step_number:02d}-"
             f"{uuid.uuid4().hex[:6]}"
         )

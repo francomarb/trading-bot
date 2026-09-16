@@ -21,7 +21,14 @@ from execution.broker import BrokerSnapshot, OrderResult, OrderStatus
 from regime.detector import MarketRegime
 from reporting.logger import TradeLogger
 from risk.manager import AccountState, RiskManager
-from strategies.credit_spread import CreditSpread, CreditSpreadConfig, OpenSpread
+from strategies.credit_spread import (
+    CreditSpread,
+    CreditSpreadConfig,
+    OpenSpread,
+    SpreadExecutionPlan,
+)
+from execution.options_executor import SpreadLeg
+from risk.manager import Side
 from utils.iv_proxy import IVProxyResolver
 from utils.options_lookup import SpreadPick
 from utils.options_ranker import Quote
@@ -268,6 +275,55 @@ class TestEnterCreditSpread:
         assert kw["position_id"] in engine._spread_owner_strategy
         assert kw["position_id"] in engine._pending_spread_plans
 
+        # The durable parent and entry order both exist before the worker can
+        # submit, and the worker receives the keys needed for immediate
+        # broker-ID attachment.
+        from engine.positions import spread_substrate_uid
+        uid = spread_substrate_uid(kw["position_id"])
+        parent = engine.lifecycle_store.get_by_position_uid(uid)
+        rows = engine.lifecycle_orders_store.get_all_for_position(uid)
+        assert parent is not None and parent.status == "pending"
+        assert len(rows) == 1
+        entry = rows[0]
+        assert entry.role == "entry_primary"
+        assert entry.order_class == "mleg"
+        assert entry.side == "sell"
+        assert entry.intended_limit_price == pytest.approx(-1.45)
+        assert entry.sizing_model == "defined_max_loss"
+        assert kw["entry_substrate_cloid"] == entry.client_order_id
+        assert kw["entry_substrate_db_path"] == engine.trade_logger.path
+
+    def test_entry_row_exists_before_worker_dispatch(self, tmp_path):
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+
+        def _assert_durable_before_dispatch(**kwargs):
+            from engine.positions import spread_substrate_uid
+            uid = spread_substrate_uid(kwargs["position_id"])
+            assert engine.lifecycle_store.get_by_position_uid(uid) is not None
+            rows = engine.lifecycle_orders_store.get_all_for_position(uid)
+            assert [row.role for row in rows] == ["entry_primary"]
+            return OrderResult(
+                status=OrderStatus.ACCEPTED,
+                order_id="spread-worker-1",
+                symbol="SPY",
+                requested_qty=1,
+                filled_qty=0.0,
+                avg_fill_price=0.0,
+                raw_status="accepted",
+                message="",
+            )
+
+        broker.dispatch_spread_order.side_effect = _assert_durable_before_dispatch
+        with patch("strategies.credit_spread.find_best_put_spread", return_value=_pick()):
+            engine._enter_multi_leg(
+                strategy=strategy, symbol="SPY", underlying_close=745.0,
+                notional_cap=2_000.0, signal_key=_SIGNAL_KEY,
+                signal_bar=_SIGNAL_BAR, strategy_statuses={},
+                strategy_reasons={},
+            )
+        broker.dispatch_spread_order.assert_called_once()
+
     def test_rejected_entry_does_not_dispatch_or_register(self, tmp_path):
         strategy = _strategy()
         engine, broker = _engine(tmp_path, strategy)
@@ -402,6 +458,79 @@ class TestDrainSpreadFills:
         assert "p1" not in engine._positions
         assert "p1" not in engine._spread_owner_strategy
         assert strategy.open_spreads == []
+
+    def test_unsettled_partial_keeps_conservative_ownership(self, tmp_path):
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        self._pre_register(engine, strategy, "p-unsettled")
+        engine.alerts = MagicMock()
+        broker.drain_spread_fills.return_value = [
+            ("p-unsettled", "credit_spread", False, "unknown", 0.5,
+             -1.50, "combo-unknown", -1.45),
+        ]
+
+        engine._drain_spread_fills()
+
+        assert "p-unsettled" in engine._positions
+        assert "p-unsettled" in engine._pending_spread_plans
+        assert strategy.get_open_spread("p-unsettled") is not None
+        engine.alerts.broker_error.assert_called_once()
+
+    def test_partial_open_keeps_only_filled_contracts_and_terminal_order(self, tmp_path):
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        from engine.positions import make_spread, PositionLeg, spread_substrate_uid
+        position_id = "partial-entry"
+        plan = SpreadExecutionPlan(
+            legs=[
+                SpreadLeg(_pick().short_occ, Side.SELL, opening=True),
+                SpreadLeg(_pick().long_occ, Side.BUY, opening=True),
+            ],
+            qty=2, limit_price=-1.45,
+            short_occ=_pick().short_occ, long_occ=_pick().long_occ,
+            short_strike=568.0, long_strike=558.0,
+            expiration_date=_EXP, net_credit=1.45,
+            max_loss=855.0, width=10.0,
+        )
+        engine._positions[position_id] = make_spread(
+            strategy_name="credit_spread", position_id=position_id,
+            legs=[
+                PositionLeg(plan.short_occ, -2.0, side="SELL"),
+                PositionLeg(plan.long_occ, 2.0, side="BUY"),
+            ],
+        )
+        engine._spread_owner_strategy[position_id] = strategy
+        engine._pending_spread_plans[position_id] = plan
+        strategy.register_spread(plan.to_open_spread(position_id=position_id))
+        engine._lifecycle_begin_spread(
+            position_id=position_id, strategy_name="credit_spread",
+            symbol=plan.short_occ, qty=2,
+        )
+        engine._lifecycle_orders_insert_spread_entry(
+            position_id=position_id, client_order_id="partial-entry-cloid",
+            qty=2.0, intended_limit_price=-1.45,
+            approved_risk_dollars=1710.0,
+        )
+        assert strategy.get_open_spread(position_id).qty == 2
+        broker.drain_spread_fills.return_value = [
+            (position_id, "credit_spread", False, "partially_filled", 1.0,
+             -1.50, "combo-partial", -1.45),
+        ]
+
+        engine._drain_spread_fills()
+
+        assert strategy.get_open_spread(position_id).qty == 1
+        assert abs(engine._positions[position_id].primary_leg.qty) == pytest.approx(1.0)
+        rows = engine.lifecycle_orders_store.get_all_for_position(
+            spread_substrate_uid(position_id)
+        )
+        assert rows[0].status == "canceled"
+        assert rows[0].filled_qty == pytest.approx(1.0)
+        parent = engine.lifecycle_store.get_by_position_uid(
+            spread_substrate_uid(position_id)
+        )
+        assert parent.status == "open"
+        assert parent.current_qty == pytest.approx(1.0)
 
     def test_close_filled_drops_position_and_logs(self, tmp_path):
         strategy = _strategy()

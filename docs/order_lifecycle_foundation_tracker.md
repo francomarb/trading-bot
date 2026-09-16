@@ -144,6 +144,18 @@ Each row from the discovery doc's §10 maps to one or more commits above.
 | 10.7 | MLEG partial-close `_spreads_pending_close` | substrate `uniq_one_active_close_per_position` on spread close rows | shipped on `feat/mleg-partial-close-residual` (PR #72, merged 2026-06-20, 7 feature/review-fix commits + 1 whitespace fix): C1 (parent `position_lifecycle` row for spreads + startup backfill), C2 (per-order close substrate writes via new `mark_terminal_after_dispatch`; partial-fill R6 analog inserts a `partial_close` placeholder row), C3 (cycle + startup reconciler `_reconcile_substrate_spread_closes` using a new `get_non_terminal_spread_close_rows` query), C4 (full retire of `_spreads_pending_close`; all reads via `_spread_has_pending_close` / substrate-derived), C5 (docs). **Review fix R1** (`a5f8352`): eager per-submit attach via `SpreadExecutionWorker.on_submitted` callback queued to `AlpacaBroker._pending_lifecycle_close_attaches` and drained every cycle into `attach_or_update_order_id_for_walk_step` (walk-step overwrite semantics); `sqlite_errorname` discriminator replaces locale-dependent FK error-text match; defensive cumulative-fill double-release guard in `_drain_spread_fills` keyed on terminal-row order_id match. **Review fix R2** (`991d5dc`): the in-memory queue alone left a one-cycle-interval crash window; the worker now writes the broker order_id durably to the substrate row via its own sqlite3 connection BEFORE the queue callback fires (`SpreadExecutionWorker._durably_attach_order_id_to_substrate`, `TradeLogger.path` threaded through `dispatch_spread_order(close_substrate_db_path=...)`). Acceptance test opens a fresh sqlite connection to confirm the write hits disk without any engine drain. Worker-side `_watch_to_terminal` partial behavior kept as WAIT (status quo) per evidence: zero historical spread partial-fill events in the paper trade log — cancel-and-retry adds dispatch-loop / retry-budget complexity for an unobserved condition. Will be revisited if a partial actually fires (CRITICAL alert via `alerts.broker_error` makes it operator-visible immediately). Two follow-ups deferred to PR #72 follow-up rows in PLAN P2: (a) spread `entry_primary` per-order substrate writes (would let the position-status CTE roll up `current_qty` from order rows rather than the direct `mark_open` stamp the spread path uses today); (b) operator command to clear a stuck `partial_close` placeholder (today operator-resolved via manual SQL). | ✅ |
 | 10.8 | PR #58 disposition | (rebuild, do not cherry-pick) | PR #62 — minimal-scope rewrite on the substrate (`feat/donchian-stop-limit-v2`); PR #58 closed | ✅ |
 
+**10.7 entry follow-up (2026-09-16):** New MLEG entries now create the
+spread parent and `entry_primary` row before worker dispatch. The worker
+durably attaches the currently resting Alpaca order ID (including entry-walk
+rungs), and NULL-ID plus ordinary startup reconciliation cover interrupted
+submissions. Quantity rollups now follow role—entry adds contracts and
+close/protection removes them—so SELL-to-open / BUY-to-close spreads use the
+same state machine safely. If an entry partially fills, the worker cancels
+the remainder before the engine retains only the filled contracts. Historical
+spread rows are not fabricated; the no-entry guard remains for those rows.
+The two-leg trade ledger remains the ownership-reconstruction source because
+one combo-order row intentionally does not duplicate both OCC legs.
+
 ---
 
 ## §12.1 Regression test matrix progress

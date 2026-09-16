@@ -324,6 +324,22 @@ that is the operator-visible signal that the queue is the only
 remaining attach path and a crash before the next cycle drain
 re-opens the restart gap.
 
+**Entry-order durability (2026-09-16 follow-up):**
+
+Every new MLEG entry creates its spread lifecycle parent and one
+`role='entry_primary'` order row before the execution worker starts. The first
+broker submission uses that row's `client_order_id`; every accepted entry-walk
+rung durably replaces the row's current broker `order_id`, matching the close
+walk's one-logical-attempt model. A startup NULL-ID sweep can therefore resolve
+a crash before attachment, while normal stream/cycle/startup reconciliation
+advances working, filled, canceled, and rejected states. Quantity rollup uses
+role rather than BUY/SELL cash direction because credit spreads are
+SELL-to-open and BUY-to-close. If an entry partially fills, the worker cancels
+the remainder before the engine resizes both ownership views to the contracts
+actually filled. The spread trade ledger still stores the two OCC legs and
+remains the ownership-reconstruction source; the combo lifecycle row does not
+duplicate leg-level accounting.
+
 **Operator runbook — clearing a stuck `partial_close` placeholder:**
 
 Until [PLAN P2 row "PR #72 follow-up: operator command to clear

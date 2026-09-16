@@ -43,6 +43,7 @@ from engine.lifecycle_orders import (
 from execution.broker import BrokerSnapshot, OpenOrder
 from reporting.logger import TradeLogger
 from risk.manager import Side
+from risk.models import ProtectionModel, SizingModel
 
 
 # ── Fixtures ────────────────────────────────────────────────────────────────
@@ -4486,6 +4487,59 @@ class TestStatusCteRequiresEntryRows:
             f"derivation broke for a normal single-leg entry: {row.status!r}"
         )
         assert row.current_qty == pytest.approx(10.0)
+
+    def test_spread_sell_entry_and_buy_exit_roll_up_by_role(self, tmp_path):
+        """Credit-spread cash sides are opposite long equity cash sides.
+
+        The lifecycle quantity is contracts owned, so SELL-to-open adds and
+        BUY-to-close subtracts.  Side-based math would mark the open as an
+        error and the close as a larger positive holding.
+        """
+        from reporting.logger import TradeLogger
+        from engine.lifecycle import PositionLifecycleStore, new_position_uid
+        from engine.lifecycle_orders import PositionLifecycleOrdersStore
+        tl = TradeLogger(path=str(tmp_path / "spread-role.db"))
+        conn = tl._ensure_db()
+        pos = PositionLifecycleStore(conn)
+        orders = PositionLifecycleOrdersStore(conn)
+        uid = new_position_uid()
+        pos.create_pending(
+            position_uid=uid, symbol="SPY260918P00679000",
+            owner_key="spread-role", strategy="credit_spread",
+            position_type="spread", entry_qty=2.0,
+        )
+        orders.insert_pending(
+            position_uid=uid, role="entry_primary", client_order_id="entry",
+            order_type="limit", order_class="mleg", time_in_force="day",
+            side="sell", intended_qty=2.0,
+            sizing_model=SizingModel.DEFINED_MAX_LOSS,
+            protection_model=ProtectionModel.SIGNAL_EXIT_ONLY,
+        )
+        orders.attach_broker_order_id(client_order_id="entry", order_id="open-1")
+        apply_order_event(conn, OrderEvent(
+            order_id="open-1", status="filled", filled_qty=2.0,
+            avg_fill_price=-1.45,
+            broker_updated_at="2026-09-16T14:00:00+00:00",
+        ), reason="test")
+        opened = pos.get_by_position_uid(uid)
+        assert opened.status == "open"
+        assert opened.current_qty == pytest.approx(2.0)
+        assert opened.avg_entry_price == pytest.approx(1.45)
+
+        orders.insert_pending(
+            position_uid=uid, role="exit", client_order_id="exit",
+            order_type="limit", order_class="mleg", time_in_force="day",
+            side="buy", intended_qty=2.0,
+        )
+        orders.attach_broker_order_id(client_order_id="exit", order_id="close-1")
+        apply_order_event(conn, OrderEvent(
+            order_id="close-1", status="filled", filled_qty=2.0,
+            avg_fill_price=0.60,
+            broker_updated_at="2026-09-16T14:05:00+00:00",
+        ), reason="test")
+        closed = pos.get_by_position_uid(uid)
+        assert closed.status == "closed"
+        assert closed.current_qty == pytest.approx(0.0)
 
     def test_entry_cancelled_before_any_fill_still_derives_canceled(
         self, tmp_path
