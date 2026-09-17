@@ -335,10 +335,15 @@ a crash before attachment, while normal stream/cycle/startup reconciliation
 advances working, filled, canceled, and rejected states. Quantity rollup uses
 role rather than BUY/SELL cash direction because credit spreads are
 SELL-to-open and BUY-to-close. If an entry partially fills, the worker cancels
-the remainder before the engine resizes both ownership views to the contracts
-actually filled. The spread trade ledger still stores the two OCC legs and
-remains the ownership-reconstruction source; the combo lifecycle row does not
-duplicate leg-level accounting.
+the remainder and confirms terminality before the engine resizes both ownership
+views to the contracts actually filled. If cancellation cannot be confirmed,
+the attempt remains unresolved and no further full-quantity rung is submitted.
+An attempt that ends before Alpaca accepts an order retains a NULL broker ID.
+The spread trade ledger still stores the two OCC legs and remains the
+ownership-reconstruction source; the combo lifecycle row does not duplicate
+leg-level accounting. Consequently, a crash after a combo fill but before those
+leg rows are logged leaves exact order evidence but cannot automatically rebuild
+spread ownership; startup remains restricted for operator reconciliation.
 
 **Operator runbook — clearing a stuck `partial_close` placeholder:**
 

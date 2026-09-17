@@ -2617,7 +2617,7 @@ class AlpacaBroker:
             status: str,
             filled_qty: float,
             avg_price: "float | None",
-            order_id: str,
+            order_id: "str | None",
         ) -> None:
             worker = _worker_cell.get("worker")
             effective_limit = (

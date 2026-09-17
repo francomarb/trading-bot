@@ -1036,6 +1036,21 @@ class TestSpreadExecutionWorkerEntryWalk:
         w.run()
         assert api.submit_order.call_count == 0
 
+    def test_attempt_abandoned_before_submit_reports_no_order_id(self):
+        """A no-submit attempt has no Alpaca identity to persist."""
+        api = self._api()
+        on_fill = MagicMock()
+        w = SpreadExecutionWorker(
+            legs=_open_legs(), qty=1, limit_price=-2.01,
+            strategy_name="credit_spread", api=api,
+            stream_manager=self._stream([]), on_fill=on_fill,
+            entry_walk=self._walk(), quote_provider=lambda: None,
+        )
+
+        w.run()
+
+        on_fill.assert_called_once_with("canceled", 0.0, None, None)
+
     def test_an_outage_mid_walk_abandons_instead_of_marching_on(self):
         """The close walk must push through an outage to guarantee an exit.
         The entry walk stops instead: there is nothing to guarantee, and
@@ -1082,6 +1097,35 @@ class TestSpreadExecutionWorkerEntryWalk:
         assert api.submit_order.call_count == 1
         assert on_fill.call_count == 1
         assert on_fill.call_args.args[0] == "filled"
+        assert on_fill.call_args.args[3] == "combo-1"
+
+    @pytest.mark.parametrize("terminal_status", ["partially_filled", "unknown"])
+    def test_partial_or_unresolved_rung_never_submits_full_qty_again(
+        self, terminal_status
+    ):
+        """Once any quantity may have filled, a new full-qty rung is unsafe."""
+        api = self._api()
+        on_fill = MagicMock()
+        terminal_order = SimpleNamespace(
+            id="combo-partial", status=terminal_status,
+            filled_qty="1", filled_avg_price="1.50",
+        )
+        w = SpreadExecutionWorker(
+            legs=_open_legs(), qty=2, limit_price=-2.01,
+            strategy_name="credit_spread", api=api,
+            stream_manager=self._stream([]), on_fill=on_fill,
+            entry_walk=self._walk(qty=2), quote_provider=lambda: self._quote(),
+        )
+        w._submit_walk_step = MagicMock(
+            return_value=(terminal_status, terminal_order)
+        )
+
+        w.run()
+
+        w._submit_walk_step.assert_called_once()
+        on_fill.assert_called_once_with(
+            terminal_status, 1.0, 1.50, "combo-partial"
+        )
 
     def test_identical_bounded_price_is_not_resubmitted(self):
         """When the floor collapses two rungs onto one price, resubmitting
@@ -1102,6 +1146,17 @@ class TestSpreadExecutionWorkerEntryWalk:
 
     def test_reports_canceled_once_when_the_walk_runs_out(self):
         api = self._api()
+        submitted_ids = []
+
+        def submit(_request):
+            order_id = f"combo-{len(submitted_ids) + 1}"
+            submitted_ids.append(order_id)
+            return _mleg_submitted(order_id)
+
+        api.submit_order.side_effect = submit
+        api.get_order_by_id.side_effect = lambda order_id: _mleg_submitted(
+            order_id, status="accepted"
+        )
         stream = self._stream([False, False, False])
         on_fill = MagicMock()
         w = SpreadExecutionWorker(
@@ -1113,6 +1168,7 @@ class TestSpreadExecutionWorkerEntryWalk:
         w.run()
         assert on_fill.call_count == 1
         assert on_fill.call_args.args[0] == "canceled"
+        assert on_fill.call_args.args[3] == submitted_ids[-1]
 
     def test_max_loss_of_every_submitted_price_stays_inside_budget(self):
         """The bound that makes 'do not overexpose to get a fill' real:

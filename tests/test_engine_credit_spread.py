@@ -324,6 +324,46 @@ class TestEnterCreditSpread:
             )
         broker.dispatch_spread_order.assert_called_once()
 
+    def test_repeated_no_submit_attempts_keep_distinct_null_order_ids(
+        self, tmp_path,
+    ):
+        """Two abandoned attempts must not share a fabricated broker ID."""
+        from engine.positions import spread_substrate_uid
+
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        for position_id in ("no-submit-1", "no-submit-2"):
+            engine._lifecycle_begin_spread(
+                position_id=position_id,
+                strategy_name="credit_spread",
+                symbol="SPY260618P00568000",
+                qty=1,
+            )
+            client_order_id = engine._new_spread_client_order_id(
+                position_id=position_id, role="entry"
+            )
+            assert engine._lifecycle_orders_insert_spread_entry(
+                position_id=position_id,
+                client_order_id=client_order_id,
+                qty=1,
+                intended_limit_price=-1.45,
+                approved_risk_dollars=855.0,
+            )
+            engine._lifecycle_orders_finalize_spread_entry(
+                position_id=position_id,
+                broker_order_id=None,
+                status="canceled",
+                filled_qty=0.0,
+                avg_fill_price=None,
+            )
+
+            rows = engine.lifecycle_orders_store.get_all_for_position(
+                spread_substrate_uid(position_id)
+            )
+            assert len(rows) == 1
+            assert rows[0].status == "canceled"
+            assert rows[0].order_id is None
+
     def test_rejected_entry_does_not_dispatch_or_register(self, tmp_path):
         strategy = _strategy()
         engine, broker = _engine(tmp_path, strategy)

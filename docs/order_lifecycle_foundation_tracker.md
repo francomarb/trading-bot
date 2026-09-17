@@ -151,10 +151,14 @@ rungs), and NULL-ID plus ordinary startup reconciliation cover interrupted
 submissions. Quantity rollups now follow role—entry adds contracts and
 close/protection removes them—so SELL-to-open / BUY-to-close spreads use the
 same state machine safely. If an entry partially fills, the worker cancels
-the remainder before the engine retains only the filled contracts. Historical
-spread rows are not fabricated; the no-entry guard remains for those rows.
-The two-leg trade ledger remains the ownership-reconstruction source because
-one combo-order row intentionally does not duplicate both OCC legs.
+and confirms the remainder before the engine retains only the filled contracts;
+an unconfirmed remainder stays unresolved and stops the walk. A walk ending
+before Alpaca accepts a rung retains a NULL broker ID instead of fabricating
+one. Historical spread rows are not fabricated; the no-entry guard remains for
+those rows. The two-leg trade ledger remains the ownership-reconstruction
+source because one combo-order row intentionally does not duplicate both OCC
+legs. A post-fill crash before leg logging therefore has exact order evidence
+but still requires restricted-startup operator reconciliation for ownership.
 
 ---
 

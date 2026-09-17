@@ -55,8 +55,9 @@ from config.settings import MLEG_ENTRY_WATCH_TIMEOUT_SECONDS
 # each step's limit price against the latest market data.
 QuoteProvider = Callable[[], "MlegQuote | None"]
 
-# Callback signature: (status_str, filled_qty, avg_fill_price, order_id)
-FillCallback = Callable[[str, float, "float | None", str], None]
+# Callback signature: (status_str, filled_qty, avg_fill_price, order_id).
+# ``order_id`` is None when the attempt ends before Alpaca accepts an order.
+FillCallback = Callable[[str, float, "float | None", "str | None"], None]
 SubmittedCallback = Callable[[str, str], None]
 EntryAllowedCallback = Callable[[], bool]
 
@@ -287,7 +288,9 @@ class _BaseExecutionWorker(threading.Thread):
                 f"[{self.name}] on_submitted callback raised: {exc}"
             )
 
-    def _report_fill(self, status: str, order_id: str, order=None) -> None:
+    def _report_fill(
+        self, status: str, order_id: "str | None", order=None
+    ) -> None:
         """Invoke the on_fill callback with normalized fill details.
 
         Also writes the latest step's status to ``_last_walk_step_status`` /
@@ -1190,12 +1193,14 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
                     except Exception as exc:
                         logger.error(f"[{self.name}] on_walk_step raised: {exc}")
 
-                if status == "filled":
-                    terminal_status = "filled"
-                    terminal_order = latest_order
-                    break
                 if status == "rejected":
                     terminal_status = "rejected"
+                    terminal_order = latest_order
+                    break
+                if latest_order is not None:
+                    terminal_order = latest_order
+                if status in ("filled", "partially_filled", "unknown"):
+                    terminal_status = status
                     break
                 walk.advance()
 
@@ -1206,5 +1211,18 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
             )
         finally:
             self._on_fill = outer_on_fill
-            client_order_id = f"spr-{self.strategy_name}-entrywalk-terminal"
-            self._report_fill(terminal_status, client_order_id, terminal_order)
+            # Report the actual final Alpaca order when a rung was accepted.
+            # If the attempt ended before any submit (no quote, bounds, halt,
+            # request validation, or first-rung rejection), None is the only
+            # truthful identity.  A fixed synthetic value would collide across
+            # attempts and could also leak into the trade ledger as if it were
+            # a broker order ID.
+            terminal_order_id = (
+                str(terminal_order.id)
+                if terminal_order is not None
+                and getattr(terminal_order, "id", None) is not None
+                else None
+            )
+            self._report_fill(
+                terminal_status, terminal_order_id, terminal_order
+            )
