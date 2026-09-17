@@ -661,7 +661,14 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
         self._substrate_cloid_used = False
         self._substrate_db_path = substrate_db_path
         self._entry_walk = entry_walk
-        self._settle_partial_fills = True
+        # Entry settlement was added with durable entry lifecycle rows: once
+        # any opening quantity fills, cancel and confirm the remainder before
+        # ownership is resized.  Do not silently apply that new policy to
+        # closes.  Close-side quantity partials retain the PR #72
+        # operator-resolved contract until a separately reviewed residual
+        # cancel/retry policy exists.  Current production verticals are pure
+        # open or pure close orders, so leg intent is the authoritative split.
+        self._settle_partial_fills = all(leg.opening for leg in legs)
         if close_scheduler is not None and entry_walk is not None:
             raise ValueError(
                 "SpreadExecutionWorker: close_scheduler and entry_walk are "

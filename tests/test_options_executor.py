@@ -266,6 +266,14 @@ def _open_legs() -> list[SpreadLeg]:
     ]
 
 
+def _close_legs() -> list[SpreadLeg]:
+    """Close the standard bull put spread as one MLEG order."""
+    return [
+        SpreadLeg(occ_symbol=_SHORT_OCC, side=Side.BUY, opening=False),
+        SpreadLeg(occ_symbol=_LONG_OCC, side=Side.SELL, opening=False),
+    ]
+
+
 def _mleg_submitted(order_id: str = "combo-1", *, status: str = "accepted"):
     return SimpleNamespace(
         id=order_id,
@@ -416,6 +424,37 @@ class TestSpreadExecutionWorker:
         worker.run()
 
         on_fill.assert_called_once_with("unknown", 1.0, 1.50, "combo-1")
+
+    def test_close_partial_preserves_operator_resolved_policy(self):
+        """Entry settlement must not silently change close-side policy."""
+        api = MagicMock()
+        api.submit_order.return_value = _mleg_submitted("combo-close")
+        partial = SimpleNamespace(
+            id="combo-close",
+            status=SimpleNamespace(value="partially_filled"),
+            filled_qty="1",
+            filled_avg_price="0.60",
+            symbol=None,
+            legs=[],
+        )
+        api.get_order_by_id.return_value = partial
+        stream = MagicMock()
+        stream_event = MagicMock()
+        stream_event.wait.return_value = False
+        stream.watch.return_value = stream_event
+        on_fill = MagicMock()
+        worker = SpreadExecutionWorker(
+            legs=_close_legs(), qty=2, limit_price=0.60,
+            strategy_name="credit_spread", api=api,
+            stream_manager=stream, on_fill=on_fill,
+        )
+
+        worker.run()
+
+        api.cancel_order_by_id.assert_not_called()
+        on_fill.assert_called_once_with(
+            "partially_filled", 1.0, 0.60, "combo-close"
+        )
 
     def test_halt_after_dispatch_blocks_sdk_submit(self):
         api = MagicMock()

@@ -304,7 +304,11 @@ confirms the broker filled the residual or cancels the original
 order, and clears the placeholder by hand. Auto-retry of the
 residual close is explicitly out of scope until an actual partial
 fires and the right cancel-vs-retry policy is informed by real
-broker behavior.
+broker behavior. Entry workers cancel and confirm an opening-order
+remainder before resizing ownership; close workers deliberately do
+not inherit that entry policy. Production spreads remain one contract.
+Raising spread quantity above one requires a separately reviewed close-walk
+residual policy and tests first.
 
 **Durability of the substrate close-row attach (PR #72 R1+R2):**
 
