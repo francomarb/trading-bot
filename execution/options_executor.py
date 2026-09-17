@@ -826,7 +826,7 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
             )
         except ValueError as e:
             logger.error(f"[{self.name}] Invalid MLEG request: {e}")
-            self._report_fill("rejected", client_order_id)
+            self._report_fill("rejected", None)
             return
 
         stream_event = None
@@ -839,7 +839,7 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
             )
             if self.stream_manager is not None:
                 self.stream_manager.unwatch(client_order_id)
-            self._report_fill("rejected", client_order_id)
+            self._report_fill("rejected", None)
             return
 
         try:
@@ -849,7 +849,7 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
             logger.error(f"[{self.name}] Failed to submit MLEG combo order: {e}")
             if self.stream_manager is not None:
                 self.stream_manager.unwatch(client_order_id)
-            self._report_fill("rejected", client_order_id)
+            self._report_fill("rejected", None)
             return
 
         # §10.7 fix-up — eager attach the broker order_id to the
@@ -1059,12 +1059,14 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
                             f"[{self.name}] on_walk_step raised: {exc}"
                         )
 
-                if status == "filled":
-                    terminal_status = "filled"
-                    terminal_order = latest_order
-                    break
                 if status == "rejected":
                     terminal_status = "rejected"
+                    terminal_order = latest_order
+                    break
+                if latest_order is not None:
+                    terminal_order = latest_order
+                if status == "filled":
+                    terminal_status = "filled"
                     break
                 # canceled or skipped → advance and continue
                 scheduler.advance()
@@ -1078,8 +1080,15 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
         finally:
             # Restore the outer on_fill and report the terminal outcome.
             self._on_fill = outer_on_fill
-            client_order_id = f"spr-{self.strategy_name}-walk-terminal"
-            self._report_fill(terminal_status, client_order_id, terminal_order)
+            terminal_order_id = (
+                str(terminal_order.id)
+                if terminal_order is not None
+                and getattr(terminal_order, "id", None) is not None
+                else None
+            )
+            self._report_fill(
+                terminal_status, terminal_order_id, terminal_order
+            )
 
     # ── Bounded entry walk ─────────────────────────────────────────────────
     #

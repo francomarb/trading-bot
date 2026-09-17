@@ -317,7 +317,10 @@ queue (drained at the next cycle by
 `_drain_lifecycle_close_attaches` → `attach_or_update_order_id_for_walk_step`).
 For walk-and-market closes, every step's broker `order_id` overwrites
 the previous one — only one broker order is alive at any moment, so
-the substrate row tracks the current in-flight id. If the durable
+the substrate row tracks the current in-flight id. Terminal callbacks and
+new trade rows carry that real Alpaca ID; an attempt that ends before any
+order is accepted retains a NULL broker ID rather than a synthetic one.
+Historical trade rows are not rewritten. If the durable
 write fails (DB locked beyond 5s busy_timeout, etc.) the worker
 logs CRITICAL `[SpreadExecutor-...] durable substrate write FAILED`;
 that is the operator-visible signal that the queue is the only
