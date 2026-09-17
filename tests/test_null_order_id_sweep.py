@@ -188,6 +188,31 @@ def _seed_orphan(
 
 
 class TestSweepAliveOrder:
+    def test_spread_entry_orphan_is_recovered_but_close_placeholder_is_not(
+        self,
+        engine: TradingEngine,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        _seed_orphan(
+            pos_store=pos_store, orders_store=orders_store,
+            owner_key="SPY260918P00679000", cli="cli-spread-entry",
+            role="entry_primary", side="sell", position_type="spread",
+        )
+        engine.broker.get_order_by_client_id_for_sweep = MagicMock(
+            return_value=_make_broker_order(
+                order_id="alpaca-spread-entry", status="new",
+            )
+        )
+
+        engine._sweep_null_order_id_attaches(
+            _make_snapshot(), reason="startup", budget=5,
+        )
+
+        row = orders_store.get_by_client_order_id("cli-spread-entry")
+        assert row.order_id == "alpaca-spread-entry"
+        assert row.status == "working"
+
     def test_attaches_alive_order(
         self,
         engine: TradingEngine,

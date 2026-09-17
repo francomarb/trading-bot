@@ -304,7 +304,11 @@ confirms the broker filled the residual or cancels the original
 order, and clears the placeholder by hand. Auto-retry of the
 residual close is explicitly out of scope until an actual partial
 fires and the right cancel-vs-retry policy is informed by real
-broker behavior.
+broker behavior. Entry workers cancel and confirm an opening-order
+remainder before resizing ownership; close workers deliberately do
+not inherit that entry policy. Production spreads remain one contract.
+Raising spread quantity above one requires a separately reviewed close-walk
+residual policy and tests first.
 
 **Durability of the substrate close-row attach (PR #72 R1+R2):**
 
@@ -317,12 +321,36 @@ queue (drained at the next cycle by
 `_drain_lifecycle_close_attaches` → `attach_or_update_order_id_for_walk_step`).
 For walk-and-market closes, every step's broker `order_id` overwrites
 the previous one — only one broker order is alive at any moment, so
-the substrate row tracks the current in-flight id. If the durable
+the substrate row tracks the current in-flight id. Terminal callbacks and
+new trade rows carry that real Alpaca ID; an attempt that ends before any
+order is accepted retains a NULL broker ID rather than a synthetic one.
+Historical trade rows are not rewritten. If the durable
 write fails (DB locked beyond 5s busy_timeout, etc.) the worker
 logs CRITICAL `[SpreadExecutor-...] durable substrate write FAILED`;
 that is the operator-visible signal that the queue is the only
 remaining attach path and a crash before the next cycle drain
 re-opens the restart gap.
+
+**Entry-order durability (2026-09-16 follow-up):**
+
+Every new MLEG entry creates its spread lifecycle parent and one
+`role='entry_primary'` order row before the execution worker starts. The first
+broker submission uses that row's `client_order_id`; every accepted entry-walk
+rung durably replaces the row's current broker `order_id`, matching the close
+walk's one-logical-attempt model. A startup NULL-ID sweep can therefore resolve
+a crash before attachment, while normal stream/cycle/startup reconciliation
+advances working, filled, canceled, and rejected states. Quantity rollup uses
+role rather than BUY/SELL cash direction because credit spreads are
+SELL-to-open and BUY-to-close. If an entry partially fills, the worker cancels
+the remainder and confirms terminality before the engine resizes both ownership
+views to the contracts actually filled. If cancellation cannot be confirmed,
+the attempt remains unresolved and no further full-quantity rung is submitted.
+An attempt that ends before Alpaca accepts an order retains a NULL broker ID.
+The spread trade ledger still stores the two OCC legs and remains the
+ownership-reconstruction source; the combo lifecycle row does not duplicate
+leg-level accounting. Consequently, a crash after a combo fill but before those
+leg rows are logged leaves exact order evidence but cannot automatically rebuild
+spread ownership; startup remains restricted for operator reconciliation.
 
 **Operator runbook — clearing a stuck `partial_close` placeholder:**
 

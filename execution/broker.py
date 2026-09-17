@@ -2534,6 +2534,11 @@ class AlpacaBroker:
         # gap the in-memory queue alone left open. None disables
         # the durable path (legacy callers / tests).
         close_substrate_db_path: str | None = None,
+        # Opening-side equivalents.  Kept distinct at the public boundary so
+        # callers cannot accidentally bind an entry worker to a close row;
+        # both converge on the worker's generic substrate attachment path.
+        entry_substrate_cloid: str | None = None,
+        entry_substrate_db_path: str | None = None,
     ) -> OrderResult:
         """
         Dispatch an asynchronous MLEG combo via ``SpreadExecutionWorker``
@@ -2612,7 +2617,7 @@ class AlpacaBroker:
             status: str,
             filled_qty: float,
             avg_price: "float | None",
-            order_id: str,
+            order_id: "str | None",
         ) -> None:
             worker = _worker_cell.get("worker")
             effective_limit = (
@@ -2640,6 +2645,12 @@ class AlpacaBroker:
                     (cli_id, broker_order_id, None)
                 )
 
+        substrate_cloid = (
+            close_substrate_cloid if closing else entry_substrate_cloid
+        )
+        substrate_db_path = (
+            close_substrate_db_path if closing else entry_substrate_db_path
+        )
         worker = SpreadExecutionWorker(
             legs=legs,
             qty=qty,
@@ -2654,10 +2665,10 @@ class AlpacaBroker:
             on_walk_step=on_walk_step,
             entry_walk=entry_walk,
             on_submitted=(
-                _on_submitted if close_substrate_cloid is not None else None
+                _on_submitted if substrate_cloid is not None else None
             ),
-            substrate_cloid=close_substrate_cloid,
-            substrate_db_path=close_substrate_db_path,
+            substrate_cloid=substrate_cloid,
+            substrate_db_path=substrate_db_path,
         )
         # Must precede start(): _on_fill only ever runs on the worker
         # thread, which does not exist until start() is called.

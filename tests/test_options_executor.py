@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -266,6 +266,14 @@ def _open_legs() -> list[SpreadLeg]:
     ]
 
 
+def _close_legs() -> list[SpreadLeg]:
+    """Close the standard bull put spread as one MLEG order."""
+    return [
+        SpreadLeg(occ_symbol=_SHORT_OCC, side=Side.BUY, opening=False),
+        SpreadLeg(occ_symbol=_LONG_OCC, side=Side.SELL, opening=False),
+    ]
+
+
 def _mleg_submitted(order_id: str = "combo-1", *, status: str = "accepted"):
     return SimpleNamespace(
         id=order_id,
@@ -341,6 +349,113 @@ class TestBuildMlegRequest:
 
 
 class TestSpreadExecutionWorker:
+    def test_first_submit_uses_durable_substrate_client_order_id(self):
+        api = MagicMock()
+        api.submit_order.return_value = _mleg_submitted("combo-1")
+        api.get_order_by_id.return_value = _mleg_filled("combo-1")
+        stream = MagicMock()
+        stream_event = MagicMock()
+        stream_event.wait.return_value = True
+        stream.watch.return_value = stream_event
+
+        worker = SpreadExecutionWorker(
+            legs=_open_legs(), qty=1, limit_price=-1.45,
+            strategy_name="credit_spread", api=api,
+            stream_manager=stream, on_fill=MagicMock(),
+            substrate_cloid="spr-entry-durable-1",
+        )
+        worker.run()
+
+        request = api.submit_order.call_args.args[0]
+        assert request.client_order_id == "spr-entry-durable-1"
+        stream.watch.assert_called_once_with("spr-entry-durable-1")
+
+    def test_partial_fill_cancels_remainder_before_reporting(self):
+        api = MagicMock()
+        api.submit_order.return_value = _mleg_submitted("combo-1")
+        partial = SimpleNamespace(
+            id="combo-1", status=SimpleNamespace(value="partially_filled"),
+            filled_qty="1", filled_avg_price="1.50", symbol=None, legs=[],
+        )
+        canceled = SimpleNamespace(
+            id="combo-1", status=SimpleNamespace(value="canceled"),
+            filled_qty="1", filled_avg_price="1.50", symbol=None, legs=[],
+        )
+        api.get_order_by_id.side_effect = [partial, canceled]
+        stream = MagicMock()
+        stream_event = MagicMock()
+        stream_event.wait.return_value = False
+        stream.watch.return_value = stream_event
+        on_fill = MagicMock()
+        worker = SpreadExecutionWorker(
+            legs=_open_legs(), qty=2, limit_price=-1.45,
+            strategy_name="credit_spread", api=api,
+            stream_manager=stream, on_fill=on_fill,
+        )
+
+        with patch("execution.options_executor.time.sleep"):
+            worker.run()
+
+        api.cancel_order_by_id.assert_called_once_with("combo-1")
+        on_fill.assert_called_once_with(
+            "partially_filled", 1.0, 1.50, "combo-1"
+        )
+
+    def test_unconfirmed_partial_remainder_reports_unknown(self):
+        api = MagicMock()
+        api.submit_order.return_value = _mleg_submitted("combo-1")
+        partial = SimpleNamespace(
+            id="combo-1", status=SimpleNamespace(value="partially_filled"),
+            filled_qty="1", filled_avg_price="1.50", symbol=None, legs=[],
+        )
+        api.get_order_by_id.return_value = partial
+        api.cancel_order_by_id.side_effect = RuntimeError("cancel unavailable")
+        stream = MagicMock()
+        stream_event = MagicMock()
+        stream_event.wait.return_value = False
+        stream.watch.return_value = stream_event
+        on_fill = MagicMock()
+        worker = SpreadExecutionWorker(
+            legs=_open_legs(), qty=2, limit_price=-1.45,
+            strategy_name="credit_spread", api=api,
+            stream_manager=stream, on_fill=on_fill,
+        )
+
+        worker.run()
+
+        on_fill.assert_called_once_with("unknown", 1.0, 1.50, "combo-1")
+
+    def test_close_partial_preserves_operator_resolved_policy(self):
+        """Entry settlement must not silently change close-side policy."""
+        api = MagicMock()
+        api.submit_order.return_value = _mleg_submitted("combo-close")
+        partial = SimpleNamespace(
+            id="combo-close",
+            status=SimpleNamespace(value="partially_filled"),
+            filled_qty="1",
+            filled_avg_price="0.60",
+            symbol=None,
+            legs=[],
+        )
+        api.get_order_by_id.return_value = partial
+        stream = MagicMock()
+        stream_event = MagicMock()
+        stream_event.wait.return_value = False
+        stream.watch.return_value = stream_event
+        on_fill = MagicMock()
+        worker = SpreadExecutionWorker(
+            legs=_close_legs(), qty=2, limit_price=0.60,
+            strategy_name="credit_spread", api=api,
+            stream_manager=stream, on_fill=on_fill,
+        )
+
+        worker.run()
+
+        api.cancel_order_by_id.assert_not_called()
+        on_fill.assert_called_once_with(
+            "partially_filled", 1.0, 0.60, "combo-close"
+        )
+
     def test_halt_after_dispatch_blocks_sdk_submit(self):
         api = MagicMock()
         stream = MagicMock()
@@ -362,9 +477,7 @@ class TestSpreadExecutionWorker:
         api.submit_order.assert_not_called()
         watched_client_id = stream.watch.call_args.args[0]
         stream.unwatch.assert_called_once_with(watched_client_id)
-        on_fill.assert_called_once_with(
-            "rejected", 0.0, None, watched_client_id
-        )
+        on_fill.assert_called_once_with("rejected", 0.0, None, None)
 
     def test_binds_real_order_id_after_submit(self):
         api = MagicMock()
@@ -444,7 +557,24 @@ class TestSpreadExecutionWorker:
 
         watched_client_id = stream.watch.call_args.args[0]
         stream.unwatch.assert_called_once_with(watched_client_id)
-        on_fill.assert_called_once_with("rejected", 0.0, None, watched_client_id)
+        on_fill.assert_called_once_with("rejected", 0.0, None, None)
+
+    def test_invalid_request_reports_no_broker_order_id(self):
+        api = MagicMock()
+        on_fill = MagicMock()
+        worker = SpreadExecutionWorker(
+            legs=_open_legs(), qty=1, limit_price=3.25,
+            strategy_name="credit_spread", api=api, on_fill=on_fill,
+        )
+
+        with patch(
+            "execution.options_executor.build_mleg_request",
+            side_effect=ValueError("invalid request"),
+        ):
+            worker.run()
+
+        api.submit_order.assert_not_called()
+        on_fill.assert_called_once_with("rejected", 0.0, None, None)
 
     def test_unfilled_combo_cancels_after_timeout(self):
         api = MagicMock()
@@ -550,12 +680,54 @@ class TestSpreadExecutionWorkerWalkAndMarket:
         assert on_fill.call_count == 1
         terminal_call = on_fill.call_args_list[0]
         assert terminal_call.args[0] == "filled"
+        assert terminal_call.args[3] == "combo-1"
         # on_walk_step gets one call for step 1.
         assert on_walk_step.call_count == 1
         kwargs = on_walk_step.call_args.kwargs
         assert kwargs["step_number"] == 1
         assert kwargs["terminal_status"] == "filled"
         assert kwargs["is_market"] is False
+
+    def test_submit_failure_before_any_close_rung_reports_no_order_id(self):
+        api = MagicMock()
+        api.submit_order.side_effect = RuntimeError("broker rejected request")
+        on_fill = MagicMock()
+        sched = self._scheduler([("mid", 30), ("market", 0)])
+        worker = SpreadExecutionWorker(
+            legs=_open_legs(), qty=1, limit_price=3.25,
+            strategy_name="credit_spread", api=api,
+            on_fill=on_fill, close_scheduler=sched,
+            quote_provider=lambda: self._quote(),
+        )
+
+        worker.run()
+
+        api.submit_order.assert_called_once()
+        on_fill.assert_called_once_with("rejected", 0.0, None, None)
+
+    def test_exhausted_close_walk_reports_last_real_order_id(self):
+        api = MagicMock()
+        api.submit_order.return_value = _mleg_submitted("combo-last")
+        api.get_order_by_id.return_value = _mleg_submitted(
+            "combo-last", status="accepted"
+        )
+        stream = MagicMock()
+        stream_event = MagicMock()
+        stream_event.wait.return_value = False
+        stream.watch.return_value = stream_event
+        on_fill = MagicMock()
+        worker = SpreadExecutionWorker(
+            legs=_open_legs(), qty=1, limit_price=3.25,
+            strategy_name="credit_spread", api=api, stream_manager=stream,
+            on_fill=on_fill, close_scheduler=self._scheduler([("mid", 30)]),
+            quote_provider=lambda: self._quote(),
+        )
+
+        worker.run()
+
+        on_fill.assert_called_once_with(
+            "canceled", 0.0, None, "combo-last"
+        )
 
     def test_market_fallback_fires_after_walk_exhausted(self):
         # All limit steps unfilled → walk advances to market → submits market.
@@ -960,6 +1132,21 @@ class TestSpreadExecutionWorkerEntryWalk:
         w.run()
         assert api.submit_order.call_count == 0
 
+    def test_attempt_abandoned_before_submit_reports_no_order_id(self):
+        """A no-submit attempt has no Alpaca identity to persist."""
+        api = self._api()
+        on_fill = MagicMock()
+        w = SpreadExecutionWorker(
+            legs=_open_legs(), qty=1, limit_price=-2.01,
+            strategy_name="credit_spread", api=api,
+            stream_manager=self._stream([]), on_fill=on_fill,
+            entry_walk=self._walk(), quote_provider=lambda: None,
+        )
+
+        w.run()
+
+        on_fill.assert_called_once_with("canceled", 0.0, None, None)
+
     def test_an_outage_mid_walk_abandons_instead_of_marching_on(self):
         """The close walk must push through an outage to guarantee an exit.
         The entry walk stops instead: there is nothing to guarantee, and
@@ -1006,6 +1193,35 @@ class TestSpreadExecutionWorkerEntryWalk:
         assert api.submit_order.call_count == 1
         assert on_fill.call_count == 1
         assert on_fill.call_args.args[0] == "filled"
+        assert on_fill.call_args.args[3] == "combo-1"
+
+    @pytest.mark.parametrize("terminal_status", ["partially_filled", "unknown"])
+    def test_partial_or_unresolved_rung_never_submits_full_qty_again(
+        self, terminal_status
+    ):
+        """Once any quantity may have filled, a new full-qty rung is unsafe."""
+        api = self._api()
+        on_fill = MagicMock()
+        terminal_order = SimpleNamespace(
+            id="combo-partial", status=terminal_status,
+            filled_qty="1", filled_avg_price="1.50",
+        )
+        w = SpreadExecutionWorker(
+            legs=_open_legs(), qty=2, limit_price=-2.01,
+            strategy_name="credit_spread", api=api,
+            stream_manager=self._stream([]), on_fill=on_fill,
+            entry_walk=self._walk(qty=2), quote_provider=lambda: self._quote(),
+        )
+        w._submit_walk_step = MagicMock(
+            return_value=(terminal_status, terminal_order)
+        )
+
+        w.run()
+
+        w._submit_walk_step.assert_called_once()
+        on_fill.assert_called_once_with(
+            terminal_status, 1.0, 1.50, "combo-partial"
+        )
 
     def test_identical_bounded_price_is_not_resubmitted(self):
         """When the floor collapses two rungs onto one price, resubmitting
@@ -1026,6 +1242,17 @@ class TestSpreadExecutionWorkerEntryWalk:
 
     def test_reports_canceled_once_when_the_walk_runs_out(self):
         api = self._api()
+        submitted_ids = []
+
+        def submit(_request):
+            order_id = f"combo-{len(submitted_ids) + 1}"
+            submitted_ids.append(order_id)
+            return _mleg_submitted(order_id)
+
+        api.submit_order.side_effect = submit
+        api.get_order_by_id.side_effect = lambda order_id: _mleg_submitted(
+            order_id, status="accepted"
+        )
         stream = self._stream([False, False, False])
         on_fill = MagicMock()
         w = SpreadExecutionWorker(
@@ -1037,6 +1264,7 @@ class TestSpreadExecutionWorkerEntryWalk:
         w.run()
         assert on_fill.call_count == 1
         assert on_fill.call_args.args[0] == "canceled"
+        assert on_fill.call_args.args[3] == submitted_ids[-1]
 
     def test_max_loss_of_every_submitted_price_stays_inside_budget(self):
         """The bound that makes 'do not overexpose to get a fill' real:

@@ -122,7 +122,7 @@ This corrects the prior cut, which conflated single-leg options with the equity 
 3. **Startup downtime fill discovery.** No path scans broker closed-order history for fills/cancels that happened during downtime and would resolve a still-pending row. PR #58 added a probe of `startup_snapshot.open_orders`, which by definition skips orders that already filled or canceled before the snapshot.
 4. **Stream-driven cancellation outside the 240s window.** No hook.
 5. **Stream-driven partial fill on a resting order.** No hook. Stays pending after each partial.
-6. **Spread lifecycle (entries and exits).** Confirmed by `grep -n lifecycle execution/options_executor.py` returning nothing and by the absence of spread-path `create_pending` call sites. Spreads are explicitly Phase-A-deferred.
+6. ~~**Spread lifecycle (entries and exits).**~~ **NOW WIRED.** PR #72 added durable parents and close rows; the 2026-09-16 follow-up added pre-submit `entry_primary` rows, worker-side crash-durable broker-ID attachment, role-directed quantity rollup, and entry reconciliation.
 
 ### 2.3 The §8.1 invariant — verified, and scoped to the position level
 
@@ -138,7 +138,7 @@ if first_fill_at is not None or (current_qty or 0.0) > 0.0:
 **Important scope correction (PR #59 review-2):** §8.1 is a **position-level invariant**, not a per-order one. At the broker, an order that is partially filled and then canceled DOES terminate as `canceled` with a preserved `filled_qty`. That's normal Alpaca behavior. The position that the order partially filled remains `open` at the filled quantity. Under §6's per-order table:
 
 - the per-order row transitions `partially_filled → canceled` and stays at `filled_qty` (this is the broker truth)
-- the position-level `current_qty` is the side-signed rollup `SUM(CASE side WHEN 'buy' THEN filled_qty ELSE -filled_qty END)` across the position's orders and stays > 0 (see §6.6 for the full query)
+- the position-level `current_qty` is the role-directed rollup (entry roles add; close/protection roles subtract) across the position's orders and stays > 0 (see §6.6 for the full query)
 - the §8.1 invariant applies to the position-level row's status only — it must remain `open` / `partially_filled`, never `canceled`, if any per-order row has `filled_qty > 0`
 
 The current store-level `mark_canceled` check is still correct *for the position-level row*. The foundation PR adds a parallel per-order state machine where `partially_filled → canceled` is a valid order-level transition.
@@ -519,7 +519,7 @@ rejected         → (terminal)
 **Per-order vs. position-level invariant (PR #59 review-2 fix).** A `partially_filled → canceled` transition IS valid at the per-order level. That is how Alpaca describes a partially-filled order that gets canceled: the order terminates as `canceled` with its `filled_qty` preserved. The §8.1 invariant from the operator proposal is a *position-level* claim — the parent position must remain `open` (or `partially_filled`) at the filled quantity, never reach `canceled`. Under §6's two-table shape:
 
 - **Per-order rows** record broker truth. `partially_filled → canceled` is allowed; `filled_qty` is preserved on the terminal row.
-- **Position-level row** rolls up `current_qty` via the side-signed sum specified in §6.6 (`SUM(CASE side WHEN 'buy' THEN filled_qty ELSE -filled_qty END)`) and updates `status` accordingly. The store-boundary `mark_canceled` guard at [engine/lifecycle.py:486](../engine/lifecycle.py:486) keeps doing its job: a position whose roll-up `current_qty > 0` cannot transition to `canceled`. Belt-and-suspenders in `apply_order_event` (see §6.4).
+- **Position-level row** rolls up `current_qty` by order role as specified in §6.6 (entry roles add; close/protection roles subtract) and updates `status` accordingly. The store-boundary `mark_canceled` guard at [engine/lifecycle.py:486](../engine/lifecycle.py:486) keeps doing its job: a position whose roll-up `current_qty > 0` cannot transition to `canceled`. Belt-and-suspenders in `apply_order_event` (see §6.4).
 
 State-machine ordering (used by §6.4 atomicity):
 
@@ -619,7 +619,7 @@ with conn:  # sqlite3 context manager: commits on success, rolls back on any exc
 
     # Step 3: recompute position-level rollup fields:
     #   - current_qty + avg_entry_price from the per-order rows
-    #     (§6.6 side-signed sum)
+    #     (§6.6 role-directed sum)
     #   - net_realized_pnl from `trades` (§6.6 — per-order table
     #     does not carry realized P&L; trades is the source of
     #     truth per §11's ownership boundary)
@@ -779,19 +779,22 @@ elif delta_filled == 0 and broker_state.status != order_row.status:
 
 Stream path uses `update.execution_id` when present and writes it through as audit-only. REST and startup paths leave `execution_id` NULL. No path ever fabricates one.
 
-### 6.6 Position rollup — side-signed sum, not raw `SUM(filled_qty)`
+### 6.6 Position rollup — role-directed sum, not raw `SUM(filled_qty)`
 
 PR #59 review-3 P1 also caught the rollup math. A position's `current_qty` is the net of inflows (entry fills) and outflows (exit / stop / partial-close fills). A naive `SUM(filled_qty)` over all per-order rows double-counts: an entry that filled 10 and an exit that filled 10 would produce `current_qty = 20`, not `0`.
 
-Authoritative rollup query (for single-leg long-equity / long-options positions — the only types this PR wires):
+Authoritative rollup query for single-leg and MLEG positions:
 
 ```sql
 SELECT
     COALESCE(SUM(
-        CASE side
-            WHEN 'buy'  THEN  filled_qty
-            WHEN 'sell' THEN -filled_qty
-            ELSE              0
+        CASE
+            WHEN role IN ('entry_primary', 'entry_residual')
+                THEN filled_qty
+            WHEN role IN ('exit', 'partial_close',
+                          'protective_stop', 'replacement_stop')
+                THEN -filled_qty
+            ELSE 0
         END
     ), 0.0) AS current_qty
 FROM position_lifecycle_orders
@@ -823,13 +826,13 @@ Canceled rows with `filled_qty = 0` contribute 0 to the per-order rollups (`curr
 
 The §8.1 invariant on the position-level row uses this rollup: if `current_qty > 0`, the position-level row's status stays `open` / `partially_filled`. The store-boundary `mark_canceled` guard at [engine/lifecycle.py:486](../engine/lifecycle.py:486) continues to refuse `pending → canceled` when there are fills.
 
-**Short-position math (out of scope today).** This PR wires only long-equity / long-options strategies. If a future strategy goes short, the rollup needs to know whether the position was *opened* by a sell (short entry) or *closed* by a sell (long exit). The cleanest way to handle that later is a column or convention on the per-order row (e.g. `role` already encodes the intent: `entry_*` rows are inflows regardless of side; `exit` / `partial_close` / `protective_stop` / `replacement_stop` are outflows). For now the foundation PR assumes long-only and uses `side` as a sufficient proxy.
+Role, rather than cash side, is the durable position-intent signal. This keeps long equities/options unchanged while correctly representing SELL-to-open / BUY-to-close credit spreads. A future directional short position can use the same entry/close roles without reversing ownership quantity.
 
 ### 6.6.1 Position-status update — must distinguish "never filled" from "fully exited"
 
-PR #59 review-7 P0: a naive `current_qty == 0 → 'closed'` rule wrongly marks a brand-new working entry as closed. A position whose only per-order row is an `entry_primary` at `status='working'` with `filled_qty=0` has `current_qty=0` because zero side-signed values sum to zero — but the position has never filled. Marking it `closed` would close the lifecycle before the entry ever runs.
+PR #59 review-7 P0: a naive `current_qty == 0 → 'closed'` rule wrongly marks a brand-new working entry as closed. A position whose only per-order row is an `entry_primary` at `status='working'` with `filled_qty=0` has `current_qty=0` because zero role-directed values sum to zero — but the position has never filled. Marking it `closed` would close the lifecycle before the entry ever runs.
 
-**Precondition added 2026-08-17: derivation requires at least one entry row.** The whole ladder reads per-order rows to infer what happened to the position, so a position with no `entry_primary` / `entry_residual` row has nothing to infer *from* — and the clauses then read "no entry order is live" as "the entry was cancelled", when the truth is "the entry was never recorded here". Spreads hit this on every close, because PR #72 deferred spread `entry_primary` writes: an exit going `working` derived `canceled` for a LIVE position, and an exit that FILLED derived `open` with `current_qty = +1` for a flat one (the entry of a credit spread is a SELL to open, so without it the buy-to-close sums as an opening buy). Both `POSITION_STATUS_SQL` and `POSITION_ROLLUP_SQL` return the stored value unchanged when no entry row exists, leaving the caller's explicit `mark_open` / `mark_closed` stamp authoritative. `net_realized_pnl` is deliberately NOT guarded because it reads `trades`, not order rows. **Spread accounting fix in review 2026-08-25:** new spread rows preserve the raw UUID in `trades.position_id` but write the canonical `spread_substrate_uid(position_id)` to `trades.position_uid`. Because the spread lifecycle event still arrives before the accounting writer, the engine refreshes the parent aggregate after each partial/full `log_spread_fill` commit. Removing the entry-row guard remains safe only after spreads write entry rows (PLAN: *PR #72 follow-up: spread `entry_primary` per-order substrate rows*).
+**Precondition added 2026-08-17: derivation requires at least one entry row.** The whole ladder reads per-order rows to infer what happened to the position, so a position with no `entry_primary` / `entry_residual` row has nothing to infer *from* — and the clauses then read "no entry order is live" as "the entry was cancelled", when the truth is "the entry was never recorded here". PR #72-era spreads had this shape. New MLEG entries now write `entry_primary` before dispatch and quantity direction is derived from role (entry adds, close/protection subtracts), not cash side; this is required because credit spreads are SELL-to-open / BUY-to-close. The guard remains for honest legacy rows and must not be removed by inventing historical order identity. `net_realized_pnl` is deliberately NOT guarded because it reads `trades`, not order rows. Spread rows preserve the raw UUID in `trades.position_id` and write the canonical `spread_substrate_uid(position_id)` to `trades.position_uid`; the engine refreshes the parent aggregate after each partial/full `log_spread_fill` commit.
 
 `POSITION_STATUS_SQL` must use the position's fill history together with the current rollup, distinguish close-side from stop-side per-order roles, AND avoid reading a stale `status` value when setting `closed_at`. Earlier drafts subqueried `(SELECT status FROM position_lifecycle ...)` inside the SET clause — SQL evaluates SET-clause expressions against the **pre-update** row state, so that subquery would return the OLD status, never the just-computed new one. `closed_at` would remain NULL on every transition into `closed` / `external_closed`. PR #59 review-9 P1 fix: compute the new status once in a CTE, then reference it from both SET expressions:
 
@@ -1051,16 +1054,14 @@ The `role` column in `position_lifecycle_orders` is an open enum (§6.2). The fo
 
 | Role | Wired in foundation? | Code path owner | When the rollup becomes authoritative |
 |---|---|---|---|
-| `entry_primary` | ✅ Wired | Foundation PR. `_lifecycle_begin` already creates the pending row; foundation adds `apply_order_event` for all status transitions. | Immediately on merge. |
+| `entry_primary` | ✅ Wired | Foundation PR for single-leg orders; the 2026-09-16 spread follow-up creates MLEG entry rows before worker dispatch and advances them through the same state machine. | Immediately for single-leg orders; now authoritative for new spreads too. |
 | `protective_stop` | ✅ Wired | Foundation PR. The OTO child stop attached at submit becomes its own per-order row with `parent_order_id = entry_primary.order_id`. | Immediately on merge. |
 | `replacement_stop` | ✅ Wired | Foundation PR. Broker-supported replacement paths such as option trailing-stop ratchets write the replacement as a new per-order row with `replaces_order_id = previous_stop.order_id`. Alpaca-verified 2026-07-09: capped equity OTO DAY children are not TIF-promoted through this role; they are canceled and rebuilt as standalone `protective_stop` rows. | Immediately on merge. |
 | `exit` | ✅ Wired | Foundation PR. Every `_log_close` / `_close_lifecycle_for_owner_key` path produces an `exit` per-order row. | Immediately on merge. |
 | `entry_residual` | 🟡 Schema-only | PR #58 rebuild. Enum value exists; no writer in foundation. | When PR #58 rebuild wires Donchian hybrid. Until then no current strategy needs this role. |
 | `partial_close` | ✅ Wired | Operator Controls Phase C. `reduce-position` writes a tagged `partial_close` row. A timed-out broker `partially_filled` order is canceled and settled before accounting or residual-stop submission; its trade row remains semantic `status='partial'`. The handler writes an absolute broker-derived residual, then verifies or restores exact GTC protection before reporting success. | No bot-originated path creates partial closes; only the operator queue does. |
 
-**Consequence for live readiness — and what the rollup does NOT cover.** The four wired roles cover the active strategies that operate at the **single-leg level**: SMA Crossover, RSI Reversion, Donchian Breakout (classic market entries), and single-leg SPY options. The position-level rollup is authoritative for every position those strategies open.
-
-**MLEG spreads (credit_spread strategy) remain on their existing path.** Spread entries and exits do not use any of the four wired roles. They continue to use `log_spread_fill` and the existing `trades` aggregation. The foundation PR adds no `position_lifecycle_orders` writes for spread legs, and the per-order rollup at §6.6 is **not authoritative for spread positions** — those positions remain visible through `log_spread_fill`'s rows on `trades` and through the spread-side ownership tracking in `engine.positions`. PR #59 review-4 (P2) correctly pushed back on a prior wording that implied spreads benefited from foundation wiring; they do not. Spread lifecycle wiring is the separate spread-lifecycle PR's responsibility ([3] in the recommended sequence).
+**Consequence for live readiness.** The wired roles cover the active single-leg strategies and new MLEG spreads. Spread combo orders use one per-order row while `log_spread_fill` continues to own the two leg-level accounting rows. Consequently the lifecycle rollup is authoritative for spread order state and contract quantity, while restart ownership reconstruction still reads both OCC legs from `trades`.
 
 `partial_close` was unlocked by Operator Controls Phase C (PR #66, merged 2026-06-16). `entry_residual` remains schema-only until PR #58 rebuild wires Donchian hybrid. Both unlock without a schema change.
 
@@ -1082,7 +1083,7 @@ The `role` column in `position_lifecycle_orders` is an open enum (§6.2). The fo
 | Item | Schema artifact | Behavior in this PR |
 |---|---|---|
 | Operator-issued order origin | `origin_kind` (default `'bot'`), `operator_command_uid` (NULL) on `position_lifecycle_orders` | No destructive operator commands implemented. Phase C populates these columns when it ships. |
-| Spread (MLEG) order lifecycle | Per-order schema is shape-compatible (`role`, `parent_order_id`, `replaces_order_id` carry MLEG legs naturally) | No spread `create_pending` / `apply_order_event` paths wired. Spread lifecycle remains deferred. |
+| ~~Spread (MLEG) order lifecycle~~ | Per-order schema carries the combo-order intent; `trades` carries both legs | ✅ Parents, closes, and pre-submit `entry_primary` rows are wired. Entry rows use ordinary reconciliation; close rows retain their dedicated reconciler. |
 | Future order roles beyond §6.1's six | `role TEXT` is open enum | This PR ships only the six roles enumerated in §6.1. |
 | Bracket take-profit | `intended_take_profit_price` column exists | No strategy uses bracket TP today; column is reserved for future strategies. |
 
@@ -1096,7 +1097,7 @@ The `role` column in `position_lifecycle_orders` is an open enum (§6.2). The fo
 | Health monitor / sleeve allocator / PnL reporting / backtest reconciliation adoption of `position_uid` | Separate consumer PRs per §17 |
 | ~~Slippage Phase 2 + 4 consumer migration (health, risk kill switch, calibration script, dashboard display + denominator fix, pnl reports, reconcile gate, legacy dual-write removal)~~ ✅ SHIPPED (PR #67, merged 2026-06-17) | ~~Slippage Phase 2 PR~~ |
 | ~~Slippage Phase 3 historical cleanup~~ ✅ Closed without migration 2026-09-04; version-aware consumers already exclude incompatible history | No PR; preserve raw audit rows |
-| Spread lifecycle wiring | Separate spread-lifecycle PR |
+| ~~Spread lifecycle wiring~~ ✅ Shipped | PR #72 plus the 2026-09-16 spread-entry follow-up |
 | Implementation-shortfall or trigger-time-quote metrics | Out of taxonomy; not in scope anywhere current |
 
 The PR-#58 capability (Donchian stop-limit + hybrid residual) is rebuilt AFTER this foundation lands, on top of it. Not in this PR.
@@ -1127,7 +1128,7 @@ This matrix is the **implementation PR's migration checklist**. Every row should
 |---|---|
 | **Workaround today** | `_suspect_exit_orders` (§4.3) — exit-side parallel of `_suspect_orders`. Memory-only, restart-volatile |
 | **Anchor commits** | PR #53 — `28352a0` ("fix: recover uncertain single-leg exits"), `e0bedc2` ("fix: tighten exit history recovery bounds") |
-| **Foundation absorption (PR #59 review-6 finding #3 fix)** | `role='exit'` rows replace `_suspect_exit_orders` for **discretionary exits only** — strategy-signaled market closes and (future) operator-issued closes. A **stop fill is NOT a new exit row.** When a protective or replacement stop fires, the existing `role='protective_stop'` or `role='replacement_stop'` row advances to `status='filled'` via `apply_order_event`. The position rollup (§6.6) handles the close correctly because the stop row's `side='sell'` contributes negatively to `current_qty` when it fills. Treating a stop fill as a new exit row would create a duplicate accounting event and break the side-signed sum |
+| **Foundation absorption (PR #59 review-6 finding #3 fix)** | `role='exit'` rows replace `_suspect_exit_orders` for **discretionary exits only** — strategy-signaled market closes and (future) operator-issued closes. A **stop fill is NOT a new exit row.** When a protective or replacement stop fires, the existing `role='protective_stop'` or `role='replacement_stop'` row advances to `status='filled'` via `apply_order_event`. The position rollup (§6.6) handles the close because stop roles subtract from `current_qty`. Treating a stop fill as a new exit row would create a duplicate accounting event and break the role-directed sum |
 | **Preserved invariants** | (a) Broker order-history queries only after the current lifecycle's entry timestamp. (b) Recovered cumulative sell quantity must explain the open quantity (no phantom fills). (c) Broker timestamps and VWAP preserved on the per-order row and propagated into `trades`. (d) External-close detection cannot race ahead of a known submitted close — the durable `role='exit'` row blocks the external-close path |
 | **Tests that survive** | PR #53's R0–R2 acceptance tests for CIEN-style late-fill recovery, the bounded-history-window test from `e0bedc2` |
 | **Cache removal timing** | After `role='exit'` is verified across stream / cycle / startup paths. Not on day-one of foundation merge |
@@ -1177,7 +1178,7 @@ This matrix is the **implementation PR's migration checklist**. Every row should
 | **Workarounds today** | Various ad-hoc fixes that established correct partial-close and recovery accounting semantics |
 | **Anchor commits** | `7bdd238`, `a20357d` (PR #33 position_uid foundation), `e151830`, `21120a9`, `095fe19` |
 | **Behaviors that survive as acceptance tests** | (a) Partial fills / closes keep the logical lifecycle `open` / `partially_filled` at the realized quantity. (b) Residual quantity is preserved across partial events. (c) Full-close trade counting happens once per `position_uid` (no double-count when stop and signal-exit interleave). (d) Recovered stop / exit fills close the lifecycle correctly via the same `_record_realized_pnl` → `_close_lifecycle_for_owner_key` path |
-| **Foundation responsibility** | The §6.6 side-signed rollup must produce the same observable accounting as today. These tests stay green when the rollup math replaces the event-driven mutations |
+| **Foundation responsibility** | The §6.6 role-directed rollup must produce the same observable accounting as today. These tests stay green when the rollup math replaces the event-driven mutations |
 | **What the foundation does NOT touch** | Allocator / health monitor / dashboard consumer migration. The foundation only ensures existing consumers continue to read correct values from `trades` and `position_lifecycle` |
 
 ### 10.7 MLEG partial-close pending state — defer behavior, reserve substrate
@@ -1232,7 +1233,7 @@ Explicit so the implementation PR cannot silently expand any one table into anot
 
 This boundary is the load-bearing answer to "the per-order table is not a second slippage-reporting store." Foundation PR persists pre-fill benchmark provenance on the order row; the trades row continues to be the source of truth for computed slippage. Phase 2 consumer migration reads computed values from `trades` exactly as it does today.
 
-At startup these boundaries now determine restoration order. Broker state answers whether a position exists; `position_lifecycle` supplies identity and strategy ownership for single-leg positions; `trades` supplies fill accounting and serves as an ownership fallback only where no lifecycle claim exists. An `error` lifecycle row remains a claim because the partial unique index still reserves its `owner_key`; it must be resolved, not bypassed. MLEG spreads remain the documented exception in §10.7: their runtime legs and entry economics are still reconstructed from `trades` until the spread entry substrate is complete.
+At startup these boundaries now determine restoration order. Broker state answers whether a position exists; `position_lifecycle` supplies identity and strategy ownership for single-leg positions; `trades` supplies fill accounting and serves as an ownership fallback only where no lifecycle claim exists. An `error` lifecycle row remains a claim because the partial unique index still reserves its `owner_key`; it must be resolved, not bypassed. MLEG spreads remain the documented exception in §10.7: entry-order recovery is now lifecycle-exact, but runtime legs, entry economics, and ownership are still reconstructed from `trades` because one combo-order row intentionally does not duplicate both OCC legs.
 
 **Idempotency keys differ between the two tables, but both use cumulative state.** §6.4 / §6.5 spell this out:
 

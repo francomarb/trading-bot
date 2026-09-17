@@ -2706,6 +2706,23 @@ class TestDispatchSpreadOrder:
         # Nothing drained yet — the worker reports asynchronously.
         assert broker.drain_spread_fills() == []
 
+    def test_open_dispatch_wires_entry_substrate_attachment(self):
+        api = MagicMock()
+        broker = AlpacaBroker(client=api, max_attempts=1, base_delay=0.0, dry_run=False)
+        with patch("execution.broker.SpreadExecutionWorker") as worker_cls:
+            worker_cls.return_value = MagicMock()
+            broker.dispatch_spread_order(
+                legs=_open_spread_legs(), qty=1, limit_price=-1.45,
+                strategy_name="credit_spread", position_id="pos-entry",
+                entry_substrate_cloid="spr-entry-posentry-1",
+                entry_substrate_db_path="/tmp/test-spread-entry.db",
+            )
+
+        kwargs = worker_cls.call_args.kwargs
+        assert kwargs["substrate_cloid"] == "spr-entry-posentry-1"
+        assert kwargs["substrate_db_path"] == "/tmp/test-spread-entry.db"
+        assert kwargs["on_submitted"] is not None
+
     def test_dry_run_queues_synthetic_fill_and_returns_accepted(self):
         api = MagicMock()
         broker = AlpacaBroker(client=api, max_attempts=1, base_delay=0.0, dry_run=True)

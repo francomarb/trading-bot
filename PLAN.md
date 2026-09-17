@@ -168,9 +168,9 @@ Evidence still collecting: slippage calibration **2/10**; RSI3 **9 entries / 6 c
 | Option-trailing consumer migration | **OPEN — organic adoption.** Readers should use `get_by_occ_joined` for substrate-authoritative order identity. | Migrate each dashboard/health/reporting consumer when next changed; no horizontal refactor is justified alone. |
 | ~~Stop-fill legacy fallback removal~~ | ✅ **SHIPPED 2026-08-14.** Substrate events are the sole immediate stop-fill path; broker-history reconciliation remains the recovery path for a rare missing substrate row. | Closed; reopen only if the substrate-write CRITICAL occurs. |
 | ~~MLEG partial-close residual reconciliation~~ | ✅ **SHIPPED IN PR #72.** Spread close rows and duplicate-dispatch locks are durable across restart. | Closed. |
-| Spread `entry_primary` per-order substrate rows | **OPEN — low priority.** Spread parents and close orders are durable, but spread entry orders are not yet recorded in the per-order substrate. A shipped guard preserves correct parent state meanwhile. | Wire entry rows when a real consumer needs them; cover fill, partial, cancel, and restart paths. |
+| ~~Spread `entry_primary` per-order substrate rows~~ | ✅ **IMPLEMENTED.** Every new MLEG entry writes its parent and `entry_primary` intent before worker dispatch, attaches the current Alpaca order ID durably, and records fill/cancel/partial outcomes. Quantity rollups use entry/exit roles so SELL-to-open spreads reconcile correctly. | Closed. Confirmed partial fills cancel the remainder and retain only filled contracts; an unconfirmed remainder stays unresolved and blocks further rungs. Attempts ending before Alpaca accepts an order correctly retain a NULL broker ID. Historical spreads are not backfilled, so the no-entry guard remains as legacy protection. |
 | ~~Spread lifecycle realized-P&L rollup~~ | ✅ **FIXED IN PR #123.** Spread rows now use the canonical lifecycle identity and refresh the parent after partial or full closes. | Closed. Current paper audit found 6 spread parents and zero realized-P&L mismatches. |
-| Operator command for a stuck MLEG `partial_close` placeholder | **EVENT-GATED.** No spread partial fill has occurred; manual SQL remains the emergency procedure. | Build the operator command only when a real partial fill makes the placeholder load-bearing, or as part of broader MLEG operator work. |
+| Operator command for a stuck MLEG `partial_close` placeholder | **EVENT-GATED.** No spread partial fill has occurred; production spreads remain one contract and manual SQL is the emergency procedure. | Before allowing spread quantity above one, explicitly design and test close-walk residual handling (wait/cancel/retry/operator resolution). Build the operator command when a real partial fill makes the placeholder load-bearing, or as part of that broader MLEG work. |
 
 ---
 
@@ -236,7 +236,7 @@ Evidence still collecting: slippage calibration **2/10**; RSI3 **9 entries / 6 c
   orphaned. See `docs/rsi-watchlist-selection.md`.
 - Same-underlying single-leg option strategies must use separate exact OCC contracts; never bypass the exact-contract conflict guard.
 - Do not tune paper-watch parameters pre-emptively; audit first, change second.
-- `position_uid` is project-wide lifecycle identity, generated before broker submission and persisted in `position_lifecycle`. Operator controls, the per-order substrate, and single-leg startup ownership use it today. Remaining dashboard/reconcile consumers adopt it only when their contracts require it; MLEG startup reconstruction remains trade-ledger based until spread entry substrate data is complete.
+- `position_uid` is project-wide lifecycle identity, generated before broker submission and persisted in `position_lifecycle`. Operator controls and the per-order substrate use it today. Single-leg startup ownership is lifecycle-first. MLEG entry-order recovery is lifecycle-exact, while spread ownership reconstruction intentionally remains trade-ledger based because its two OCC legs live in the spread trade rows rather than the one-row combo-order substrate.
 
 ---
 

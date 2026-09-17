@@ -3608,6 +3608,12 @@ class TradingEngine:
             )
             if pos_row is None:
                 return
+            # Spread fills retain their dedicated combo drain/recovery path.
+            # Treating the representative OCC symbol as an ordinary long
+            # option would bind the wrong ownership and build an invalid
+            # single-leg RiskDecision for a SELL-to-open MLEG order.
+            if getattr(pos_row, "position_type", "single_leg") != "single_leg":
+                return
             symbol = pos_row.symbol
             from risk.manager import RiskDecision, Side
             # PR #68 round-2 review P2: split the gate. The side-effects
@@ -10651,11 +10657,11 @@ class TradingEngine:
         """§10.7: walk non-terminal spread close substrate rows and
         resolve any whose broker order is now terminal.
 
-        Separate from `_reconcile_substrate_via_rest` because spreads
-        cannot go through `apply_order_event` (single-leg-scoped
-        trades UPSERT, position-rollup CTE doesn't apply to spread
-        sides). Uses `mark_terminal_after_dispatch` to advance per-
-        order rows individually.
+        Separate from `_reconcile_substrate_via_rest` because spread close
+        rows preserve their dedicated dispatch/accounting path. The ordinary
+        reconciler excludes those rows; spread entry rows do use the ordinary
+        state machine now that quantity is role-directed. This helper uses
+        `mark_terminal_after_dispatch` for close rows individually.
 
         ``reason`` is 'cycle' or 'startup' — flows through to logs so
         the operator can grep advance events by source. Cycle should
@@ -11453,14 +11459,100 @@ class TradingEngine:
     # position_id + a timestamp + uuid suffix) and threaded to the
     # broker via dispatch_spread_order so the drain can join back.
 
-    def _new_spread_close_client_order_id(
+    def _new_spread_client_order_id(
         self, *, position_id: str, role: str
     ) -> str:
-        """Engine-side client_order_id for a spread close substrate row.
+        """Engine-side client_order_id for a spread lifecycle order row.
         Format: ``spr-{role}-{position_id_prefix}-{rand}``."""
         import uuid as _uuid
         suffix = _uuid.uuid4().hex[:8]
         return f"spr-{role}-{position_id[:8]}-{suffix}"
+
+    def _lifecycle_orders_insert_spread_entry(
+        self,
+        *,
+        position_id: str,
+        client_order_id: str,
+        qty: float,
+        intended_limit_price: float,
+        approved_risk_dollars: float | None,
+    ) -> bool:
+        """Persist one logical MLEG entry attempt before broker dispatch.
+
+        The row is load-bearing: with the durable stores wired, a failed
+        insert aborts submission.  Entry walks reuse this row and advance its
+        broker ``order_id`` to the currently resting rung, matching the
+        already-shipped close-walk contract.
+        """
+        if self.lifecycle_orders_store is None or self.lifecycle_store is None:
+            return True
+        try:
+            self.lifecycle_orders_store.insert_pending(
+                position_uid=spread_substrate_uid(position_id),
+                role="entry_primary",
+                client_order_id=client_order_id,
+                order_type="limit",
+                order_class="mleg",
+                time_in_force="day",
+                side="sell",
+                intended_qty=float(qty),
+                intended_limit_price=float(intended_limit_price),
+                sizing_model=SizingModel.DEFINED_MAX_LOSS,
+                protection_model=ProtectionModel.SIGNAL_EXIT_ONLY,
+                approved_risk_dollars=approved_risk_dollars,
+                slippage_benchmark_price=abs(float(intended_limit_price)),
+                slippage_benchmark_kind="combo_limit",
+                slippage_benchmark_timestamp=datetime.now(timezone.utc).isoformat(),
+                slippage_measurement_quality="primary",
+                entry_reference_price=abs(float(intended_limit_price)),
+            )
+            return True
+        except Exception as exc:
+            logger.critical(
+                f"spread entry substrate insert FAILED for "
+                f"position_id={position_id[:8]}: {type(exc).__name__}: "
+                f"{exc} — entry will not be submitted"
+            )
+            return False
+
+    def _lifecycle_orders_finalize_spread_entry(
+        self,
+        *,
+        position_id: str,
+        broker_order_id: str | None,
+        status: str,
+        filled_qty: float,
+        avg_fill_price: float | None,
+    ) -> None:
+        """Advance the spread entry row from the worker's terminal report."""
+        if self.lifecycle_orders_store is None:
+            return
+        try:
+            rows = self.lifecycle_orders_store.get_all_for_position(
+                spread_substrate_uid(position_id)
+            )
+            row = next((item for item in rows if item.role == "entry_primary"), None)
+            if row is None:
+                # Legacy/test-created spreads can legitimately predate this
+                # row.  New production entries fail closed if insertion did
+                # not succeed, so absence here is not reachable for them.
+                logger.debug(
+                    f"spread entry finalize skipped legacy position without "
+                    f"entry_primary: position_id={position_id[:8]}"
+                )
+                return
+            self.lifecycle_orders_store.mark_terminal_after_dispatch(
+                client_order_id=row.client_order_id,
+                broker_order_id=broker_order_id,
+                status=status,
+                filled_qty=float(filled_qty),
+                avg_fill_price=avg_fill_price,
+            )
+        except Exception as exc:
+            logger.critical(
+                f"spread entry substrate finalize FAILED for "
+                f"position_id={position_id[:8]}: {type(exc).__name__}: {exc}"
+            )
 
     def _lifecycle_orders_insert_spread_close(
         self,
@@ -11854,6 +11946,80 @@ class TradingEngine:
             position_id=position_id,
             notional_cap=notional_cap,
         )
+
+        # Persist identity and order intent BEFORE the asynchronous worker can
+        # submit.  The previous spread path created its parent only after
+        # dispatch returned, leaving no exact broker-order recovery anchor in
+        # the submit→engine-drain crash window.
+        entry_cloid = self._new_spread_client_order_id(
+            position_id=position_id, role="entry",
+        )
+        lifecycle_uid = self._lifecycle_begin_spread(
+            position_id=position_id,
+            strategy_name=strategy.name,
+            symbol=plan.short_occ,
+            qty=plan.qty,
+            entry_client_order_id=entry_cloid,
+            strategy_version=identity.strategy_version,
+            strategy_config_hash=identity.strategy_config_hash,
+            bot_git_commit=identity.bot_git_commit,
+            entry_regime=current_regime.value if current_regime is not None else None,
+        )
+        if self.lifecycle_store is not None and lifecycle_uid is None:
+            _done(
+                "No Signal",
+                disposition="persistence_error",
+                reason="spread lifecycle parent could not be persisted",
+                selected=True,
+            )
+            return
+        if not self._lifecycle_orders_insert_spread_entry(
+            position_id=position_id,
+            client_order_id=entry_cloid,
+            qty=float(plan.qty),
+            intended_limit_price=float(plan.limit_price),
+            approved_risk_dollars=float(plan.max_loss) * float(plan.qty),
+        ):
+            self._lifecycle_mark_spread_canceled(position_id)
+            _done(
+                "No Signal",
+                disposition="persistence_error",
+                reason="spread entry order could not be persisted",
+                selected=True,
+                position_uid=lifecycle_uid,
+            )
+            return
+
+        # Pre-register before starting the worker.  Fill callbacks queue their
+        # outcome for the next engine drain, but the worker may submit
+        # immediately; establishing ownership first removes that race too.
+        legs = [
+            PositionLeg(symbol=plan.short_occ, qty=-float(plan.qty), side="SELL"),
+            PositionLeg(symbol=plan.long_occ, qty=float(plan.qty), side="BUY"),
+        ]
+        self._positions[position_id] = make_spread(
+            strategy_name=strategy.name,
+            position_id=position_id,
+            legs=legs,
+        )
+        self._spread_owner_strategy[position_id] = strategy
+        self._pending_spread_plans[position_id] = plan
+        strategy.register_spread(plan.to_open_spread(position_id=position_id))
+
+        def _rollback_pre_submit(status: str = "rejected") -> None:
+            self._pending_spread_plans.pop(position_id, None)
+            self._pop_position(position_id)
+            self._spread_owner_strategy.pop(position_id, None)
+            strategy.release_spread(position_id)
+            self._lifecycle_orders_finalize_spread_entry(
+                position_id=position_id,
+                broker_order_id=None,
+                status=status,
+                filled_qty=0.0,
+                avg_fill_price=None,
+            )
+            self._lifecycle_mark_spread_canceled(position_id)
+
         try:
             result = self.broker.dispatch_spread_order(
                 legs=plan.legs,
@@ -11863,8 +12029,14 @@ class TradingEngine:
                 position_id=position_id,
                 entry_walk=entry_walk,
                 quote_provider=entry_quote_provider,
+                entry_substrate_cloid=entry_cloid,
+                entry_substrate_db_path=(
+                    self.trade_logger.path
+                    if self.trade_logger is not None else None
+                ),
             )
         except Exception as e:
+            _rollback_pre_submit()
             logger.error(f"[{strategy.name}] {symbol}: dispatch_spread_order raised: {e}")
             self.risk.record_broker_error()
             self.alerts.broker_error(f"{symbol} dispatch_spread_order: {e}")
@@ -11877,6 +12049,7 @@ class TradingEngine:
             return
 
         if result.status is not OrderStatus.ACCEPTED:
+            _rollback_pre_submit()
             logger.warning(
                 f"[{strategy.name}] {symbol}: spread dispatch returned "
                 f"{result.status.value} — not pre-registering"
@@ -11902,36 +12075,6 @@ class TradingEngine:
         if _lc is not None:
             _lc.submitted += 1
 
-        # Pre-register the spread Position + the strategy's open-spread view.
-        # The combo fill confirms via _drain_spread_fills (or rolls back).
-        legs = [
-            PositionLeg(symbol=plan.short_occ, qty=-float(plan.qty), side="SELL"),
-            PositionLeg(symbol=plan.long_occ, qty=float(plan.qty), side="BUY"),
-        ]
-        self._positions[position_id] = make_spread(
-            strategy_name=strategy.name,
-            position_id=position_id,
-            legs=legs,
-        )
-        self._spread_owner_strategy[position_id] = strategy
-        self._pending_spread_plans[position_id] = plan
-        strategy.register_spread(plan.to_open_spread(position_id=position_id))
-        # §10.7 spread lifecycle PR: write the substrate pending row
-        # AFTER pre-registration so the drain path's mark_open finds a
-        # row to advance. Best-effort — failure here logs and leaves the
-        # spread tracked at the engine level so the close path still
-        # works; cycle reconciliation will not see a substrate row but
-        # the legacy in-memory ownership is preserved.
-        lifecycle_uid = self._lifecycle_begin_spread(
-            position_id=position_id,
-            strategy_name=strategy.name,
-            symbol=plan.short_occ,
-            qty=plan.qty,
-            strategy_version=identity.strategy_version,
-            strategy_config_hash=identity.strategy_config_hash,
-            bot_git_commit=identity.bot_git_commit,
-            entry_regime=current_regime.value if current_regime is not None else None,
-        )
         logger.info(
             f"[{strategy.name}] {symbol}: credit spread dispatched "
             f"{plan.short_occ}/{plan.long_occ} width=${plan.width:.0f} "
@@ -11969,7 +12112,47 @@ class TradingEngine:
 
             if not closing:
                 # ── Spread OPEN ──────────────────────────────────────────
+                plan = self._pending_spread_plans.get(position_id)
+                if status == "unknown":
+                    # A partial fill whose remainder could not be proven
+                    # canceled is still capable of changing quantity. Keep
+                    # the conservative requested-qty ownership in memory and
+                    # the order non-terminal for reconciliation; never resize
+                    # to a snapshot that may already be stale.
+                    self._lifecycle_orders_finalize_spread_entry(
+                        position_id=position_id,
+                        broker_order_id=order_id,
+                        status="unknown",
+                        filled_qty=float(filled_qty or 0.0),
+                        avg_fill_price=avg_fill_price,
+                    )
+                    message = (
+                        f"[{strategy_name}] spread entry unresolved after "
+                        f"partial fill — position_id={position_id[:8]} "
+                        f"order={order_id}; manual broker reconciliation required"
+                    )
+                    logger.critical(message)
+                    self.risk.record_broker_error()
+                    self.alerts.broker_error(message)
+                    continue
                 plan = self._pending_spread_plans.pop(position_id, None)
+                # Persist the worker's terminal observation before applying
+                # engine-side bookkeeping.  A restart from this point can
+                # recover the exact broker order even if trade logging fails.
+                self._lifecycle_orders_finalize_spread_entry(
+                    position_id=position_id,
+                    broker_order_id=order_id,
+                    # The worker cancels a partially-filled entry's
+                    # remainder before reporting it.  Persist the broker
+                    # order as terminal canceled-with-fills; keeping the row
+                    # at non-terminal ``partially_filled`` would make restart
+                    # reconciliation chase an order that can no longer fill.
+                    status=(
+                        "canceled" if status == "partially_filled" else status
+                    ),
+                    filled_qty=float(filled_qty or 0.0),
+                    avg_fill_price=avg_fill_price,
+                )
                 if filled:
                     # PLAN 11.10f: lifecycle counter — filled_entries++
                     # for the credit-spread MLEG path. Multi-leg combo
@@ -11991,7 +12174,50 @@ class TradingEngine:
                         f"net_credit=${net_credit:.2f}/sh order={order_id}"
                     )
                     if plan is not None:
-                        open_qty = float(filled_qty or plan.qty)
+                        open_qty = float(
+                            filled_qty or getattr(plan, "qty", 1.0)
+                        )
+                        tracked = self._positions.get(position_id)
+                        requested_qty = float(
+                            getattr(plan, "qty", 0.0)
+                            or (
+                                abs(tracked.primary_leg.qty)
+                                if tracked is not None
+                                and tracked.primary_leg is not None
+                                else open_qty
+                            )
+                        )
+                        if open_qty < requested_qty:
+                            # The worker reports cumulative quantity after
+                            # canceling the unfilled remainder.  Resize both
+                            # ownership views to the contracts actually held;
+                            # never leave the strategy managing the requested
+                            # quantity when the broker filled fewer contracts.
+                            self._positions[position_id] = make_spread(
+                                strategy_name=strategy_name,
+                                position_id=position_id,
+                                legs=[
+                                    PositionLeg(
+                                        symbol=plan.short_occ,
+                                        qty=-open_qty,
+                                        side="SELL",
+                                    ),
+                                    PositionLeg(
+                                        symbol=plan.long_occ,
+                                        qty=open_qty,
+                                        side="BUY",
+                                    ),
+                                ],
+                            )
+                            if strategy is not None:
+                                strategy.register_spread(
+                                    replace(
+                                        plan,
+                                        qty=int(open_qty),
+                                        net_credit=net_credit,
+                                        max_loss=(plan.width - net_credit) * 100,
+                                    ).to_open_spread(position_id=position_id)
+                                )
                         # §10.7 spread lifecycle PR: transition the
                         # substrate row to 'open' once the combo fill
                         # lands. The pending row was created in
@@ -12166,7 +12392,7 @@ class TradingEngine:
                             avg_fill_price=avg_fill_price,
                         )
                         residual_cloid = (
-                            self._new_spread_close_client_order_id(
+                            self._new_spread_client_order_id(
                                 position_id=position_id,
                                 role="partial_close",
                             )
@@ -12715,7 +12941,7 @@ class TradingEngine:
             # refuses (already a non-terminal close on this position),
             # skip dispatch entirely. Survives restart because the row
             # is committed to the DB.
-            close_cloid = self._new_spread_close_client_order_id(
+            close_cloid = self._new_spread_client_order_id(
                 position_id=position_id, role="exit",
             )
             substrate_inserted = self._lifecycle_orders_insert_spread_close(
