@@ -8,6 +8,7 @@ recovery logic without opening a real websocket connection.
 from __future__ import annotations
 
 import asyncio
+import gc
 import threading
 from dataclasses import replace
 from datetime import timedelta
@@ -86,6 +87,7 @@ class _LoopTestStream(StreamManager):
         self.delays: list[float] = []
 
     async def _run_session(self) -> None:
+        self._session_heartbeat_ok = False
         action = self.actions.pop(0)
         if action == "heartbeat_timeout":
             raise TimeoutError("trading websocket heartbeat timeout")
@@ -96,6 +98,7 @@ class _LoopTestStream(StreamManager):
             raise RuntimeError("socket dropped immediately after connect")
         if action == "stable_disconnect":
             await self._mark_connected()
+            self._session_heartbeat_ok = True
             with self._lock:
                 self._health = replace(
                     self._health,
@@ -111,6 +114,23 @@ class _LoopTestStream(StreamManager):
                     ),
                 )
             raise RuntimeError("socket dropped after a stable session")
+        if action == "unacknowledged_disconnect":
+            await self._mark_connected()
+            with self._lock:
+                self._health = replace(
+                    self._health,
+                    last_reconnect_at=(
+                        _utcnow()
+                        - timedelta(
+                            seconds=(
+                                self._heartbeat_interval
+                                + self._heartbeat_timeout
+                                + 1
+                            )
+                        )
+                    ),
+                )
+            raise TimeoutError("trading websocket heartbeat timeout")
         if action == "success_stop":
             await self._mark_connected()
             self._thread_stop.set()
@@ -435,6 +455,47 @@ class TestReconnectLoop:
 
         assert sm.delays == [1.0, 2.0, 4.0]
 
+    def test_backoff_keeps_escalating_without_acknowledged_heartbeat(self, monkeypatch):
+        monkeypatch.setattr("execution.stream.random.uniform", lambda *_: 0.0)
+        sm = _LoopTestStream(
+            [
+                "disconnect",
+                "unacknowledged_disconnect",
+                "unacknowledged_disconnect",
+                "success_stop",
+            ]
+        )
+
+        asyncio.run(sm._run_async())
+
+        assert sm.delays == [1.0, 2.0, 4.0]
+
+    def test_successful_pong_marks_session_heartbeat_acknowledged(self):
+        sm = _stream()
+        sm._heartbeat_interval = 0.0
+
+        class _WebSocket:
+            async def ping(self):
+                pong = asyncio.get_running_loop().create_future()
+                pong.set_result(None)
+                return pong
+
+        async def run() -> None:
+            sm._stop_event = asyncio.Event()
+            sm._ws = _WebSocket()
+            original_touch_rx = sm._touch_rx
+
+            def touch_rx_and_stop() -> None:
+                original_touch_rx()
+                sm._thread_stop.set()
+
+            sm._touch_rx = touch_rx_and_stop
+            await sm._heartbeat_loop()
+
+        asyncio.run(run())
+
+        assert sm._session_heartbeat_ok is True
+
     def test_session_collects_simultaneous_task_failures(self):
         sm = _stream()
         unhandled: list[dict] = []
@@ -469,6 +530,7 @@ class TestReconnectLoop:
             await asyncio.sleep(0)
 
         asyncio.run(run())
+        gc.collect()
 
         assert unhandled == []
 

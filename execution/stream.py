@@ -173,6 +173,7 @@ class StreamManager:
 
         self._heartbeat_interval = settings.STREAM_HEARTBEAT_INTERVAL_SECONDS
         self._heartbeat_timeout = settings.STREAM_HEARTBEAT_TIMEOUT_SECONDS
+        self._session_heartbeat_ok = False
         self._reconnect_base_delay = settings.STREAM_RECONNECT_BASE_DELAY_SECONDS
         self._reconnect_max_delay = settings.STREAM_RECONNECT_MAX_DELAY_SECONDS
 
@@ -424,9 +425,9 @@ class StreamManager:
             except Exception as exc:
                 if self._thread_stop.is_set():
                     break
-                # A connection that survived a complete heartbeat window was
-                # healthy.  Retry it from the base delay; reserve exponential
-                # escalation for repeated connect/auth or immediate failures.
+                # A connection that survived a complete heartbeat window and
+                # received a Pong was healthy. Retry it from the base delay;
+                # reserve escalation for repeated connect/auth/heartbeat failures.
                 if self._session_was_stable():
                     delay = self._reconnect_base_delay
                 await self._mark_disconnected(exc)
@@ -444,6 +445,7 @@ class StreamManager:
         self._stop_event = None
 
     async def _run_session(self) -> None:
+        self._session_heartbeat_ok = False
         had_gap = self.health_snapshot().last_disconnect_at is not None
         await self._connect_and_subscribe()
         await self._mark_connected()
@@ -475,7 +477,9 @@ class StreamManager:
                 raise result
 
     def _session_was_stable(self) -> bool:
-        """Return whether the active session survived one heartbeat window."""
+        """Return whether the active session completed an acknowledged heartbeat."""
+        if not self._session_heartbeat_ok:
+            return False
         health = self.health_snapshot()
         if not health.connected or health.last_reconnect_at is None:
             return False
@@ -549,6 +553,7 @@ class StreamManager:
                 await asyncio.wait_for(pong_waiter, timeout=self._heartbeat_timeout)
             except asyncio.TimeoutError as exc:
                 raise TimeoutError("trading websocket heartbeat timeout") from exc
+            self._session_heartbeat_ok = True
             self._touch_rx()
 
     async def _dispatch_message(self, msg: dict[str, Any]) -> None:
