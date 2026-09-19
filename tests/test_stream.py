@@ -8,7 +8,9 @@ recovery logic without opening a real websocket connection.
 from __future__ import annotations
 
 import asyncio
+import gc
 import threading
+from dataclasses import replace
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -85,11 +87,50 @@ class _LoopTestStream(StreamManager):
         self.delays: list[float] = []
 
     async def _run_session(self) -> None:
+        self._session_heartbeat_ok = False
         action = self.actions.pop(0)
         if action == "heartbeat_timeout":
             raise TimeoutError("trading websocket heartbeat timeout")
         if action == "disconnect":
             raise RuntimeError("socket dropped")
+        if action == "unstable_disconnect":
+            await self._mark_connected()
+            raise RuntimeError("socket dropped immediately after connect")
+        if action == "stable_disconnect":
+            await self._mark_connected()
+            self._session_heartbeat_ok = True
+            with self._lock:
+                self._health = replace(
+                    self._health,
+                    last_reconnect_at=(
+                        _utcnow()
+                        - timedelta(
+                            seconds=(
+                                self._heartbeat_interval
+                                + self._heartbeat_timeout
+                                + 1
+                            )
+                        )
+                    ),
+                )
+            raise RuntimeError("socket dropped after a stable session")
+        if action == "unacknowledged_disconnect":
+            await self._mark_connected()
+            with self._lock:
+                self._health = replace(
+                    self._health,
+                    last_reconnect_at=(
+                        _utcnow()
+                        - timedelta(
+                            seconds=(
+                                self._heartbeat_interval
+                                + self._heartbeat_timeout
+                                + 1
+                            )
+                        )
+                    ),
+                )
+            raise TimeoutError("trading websocket heartbeat timeout")
         if action == "success_stop":
             await self._mark_connected()
             self._thread_stop.set()
@@ -394,6 +435,105 @@ class TestReconnectLoop:
 
         assert sm.delays[:2] == [1.0, 1.0]
 
+    def test_backoff_resets_after_stable_session_disconnect(self, monkeypatch):
+        monkeypatch.setattr("execution.stream.random.uniform", lambda *_: 0.0)
+        sm = _LoopTestStream(
+            ["disconnect", "disconnect", "stable_disconnect", "success_stop"]
+        )
+
+        asyncio.run(sm._run_async())
+
+        assert sm.delays == [1.0, 2.0, 1.0]
+
+    def test_backoff_keeps_escalating_after_immediate_disconnects(self, monkeypatch):
+        monkeypatch.setattr("execution.stream.random.uniform", lambda *_: 0.0)
+        sm = _LoopTestStream(
+            ["disconnect", "unstable_disconnect", "unstable_disconnect", "success_stop"]
+        )
+
+        asyncio.run(sm._run_async())
+
+        assert sm.delays == [1.0, 2.0, 4.0]
+
+    def test_backoff_keeps_escalating_without_acknowledged_heartbeat(self, monkeypatch):
+        monkeypatch.setattr("execution.stream.random.uniform", lambda *_: 0.0)
+        sm = _LoopTestStream(
+            [
+                "disconnect",
+                "unacknowledged_disconnect",
+                "unacknowledged_disconnect",
+                "success_stop",
+            ]
+        )
+
+        asyncio.run(sm._run_async())
+
+        assert sm.delays == [1.0, 2.0, 4.0]
+
+    def test_successful_pong_marks_session_heartbeat_acknowledged(self):
+        sm = _stream()
+        sm._heartbeat_interval = 0.0
+
+        class _WebSocket:
+            async def ping(self):
+                pong = asyncio.get_running_loop().create_future()
+                pong.set_result(None)
+                return pong
+
+        async def run() -> None:
+            sm._stop_event = asyncio.Event()
+            sm._ws = _WebSocket()
+            original_touch_rx = sm._touch_rx
+
+            def touch_rx_and_stop() -> None:
+                original_touch_rx()
+                sm._thread_stop.set()
+
+            sm._touch_rx = touch_rx_and_stop
+            await sm._heartbeat_loop()
+
+        asyncio.run(run())
+
+        assert sm._session_heartbeat_ok is True
+
+    def test_session_collects_simultaneous_task_failures(self):
+        sm = _stream()
+        unhandled: list[dict] = []
+
+        async def run() -> None:
+            loop = asyncio.get_running_loop()
+            loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+
+            async def connect() -> None:
+                sm._ws = SimpleNamespace(close=lambda: None)
+
+            async def mark_connected() -> None:
+                return None
+
+            async def close() -> None:
+                sm._ws = None
+
+            async def recv_failure() -> None:
+                raise ConnectionResetError(54, "Connection reset by peer")
+
+            async def heartbeat_failure() -> None:
+                raise TimeoutError("trading websocket heartbeat timeout")
+
+            sm._connect_and_subscribe = connect
+            sm._mark_connected = mark_connected
+            sm._close_ws = close
+            sm._recv_loop = recv_failure
+            sm._heartbeat_loop = heartbeat_failure
+
+            with pytest.raises(ConnectionResetError):
+                await sm._run_session()
+            await asyncio.sleep(0)
+
+        asyncio.run(run())
+        gc.collect()
+
+        assert unhandled == []
+
 
 class TestDisconnectObservability:
     def test_disconnect_reason_buckets_known_cases(self):
@@ -412,6 +552,12 @@ class TestDisconnectObservability:
         exc.__cause__ = OSError(65, "No route to host")
 
         assert StreamManager._disconnect_reason(exc) == "network_unreachable"
+
+    def test_disconnect_reason_prefers_tcp_reset_over_websocket_wrapper(self):
+        exc = ConnectionClosedError(None, None, None)
+        exc.__cause__ = ConnectionResetError(54, "Connection reset by peer")
+
+        assert StreamManager._disconnect_reason(exc) == "connection_reset"
 
     def test_mark_disconnected_logs_reason_and_timing_context(self, monkeypatch):
         sm = _stream()

@@ -649,6 +649,7 @@ The MLEG limit-price sign convention was confirmed against the Alpaca paper API 
 - Order errors are caught, logged, and never crash the bot
 - Position ownership is tracked per strategy to prevent cross-strategy interference
 - WebSocket streaming (Phase 10.E1) is the primary fill notification path; REST polling is the fallback
+- Stream reconnects use capped exponential backoff for repeated connection/authentication failures. A session resets escalation to the base delay only after it survives one complete heartbeat window and Alpaca acknowledges a Ping with a Pong. Receiver, heartbeat, and shutdown tasks are always drained together so simultaneous transport failures cannot leak unhandled asyncio exceptions. Concrete chained transport causes (DNS, routing, TCP reset) take precedence over the generic missing-close-frame wrapper in operator logs.
 
 ### 7. Reporting & Monitoring
 
