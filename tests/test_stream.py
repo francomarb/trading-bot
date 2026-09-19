@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from dataclasses import replace
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -90,6 +91,26 @@ class _LoopTestStream(StreamManager):
             raise TimeoutError("trading websocket heartbeat timeout")
         if action == "disconnect":
             raise RuntimeError("socket dropped")
+        if action == "unstable_disconnect":
+            await self._mark_connected()
+            raise RuntimeError("socket dropped immediately after connect")
+        if action == "stable_disconnect":
+            await self._mark_connected()
+            with self._lock:
+                self._health = replace(
+                    self._health,
+                    last_reconnect_at=(
+                        _utcnow()
+                        - timedelta(
+                            seconds=(
+                                self._heartbeat_interval
+                                + self._heartbeat_timeout
+                                + 1
+                            )
+                        )
+                    ),
+                )
+            raise RuntimeError("socket dropped after a stable session")
         if action == "success_stop":
             await self._mark_connected()
             self._thread_stop.set()
@@ -394,6 +415,63 @@ class TestReconnectLoop:
 
         assert sm.delays[:2] == [1.0, 1.0]
 
+    def test_backoff_resets_after_stable_session_disconnect(self, monkeypatch):
+        monkeypatch.setattr("execution.stream.random.uniform", lambda *_: 0.0)
+        sm = _LoopTestStream(
+            ["disconnect", "disconnect", "stable_disconnect", "success_stop"]
+        )
+
+        asyncio.run(sm._run_async())
+
+        assert sm.delays == [1.0, 2.0, 1.0]
+
+    def test_backoff_keeps_escalating_after_immediate_disconnects(self, monkeypatch):
+        monkeypatch.setattr("execution.stream.random.uniform", lambda *_: 0.0)
+        sm = _LoopTestStream(
+            ["disconnect", "unstable_disconnect", "unstable_disconnect", "success_stop"]
+        )
+
+        asyncio.run(sm._run_async())
+
+        assert sm.delays == [1.0, 2.0, 4.0]
+
+    def test_session_collects_simultaneous_task_failures(self):
+        sm = _stream()
+        unhandled: list[dict] = []
+
+        async def run() -> None:
+            loop = asyncio.get_running_loop()
+            loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+
+            async def connect() -> None:
+                sm._ws = SimpleNamespace(close=lambda: None)
+
+            async def mark_connected() -> None:
+                return None
+
+            async def close() -> None:
+                sm._ws = None
+
+            async def recv_failure() -> None:
+                raise ConnectionResetError(54, "Connection reset by peer")
+
+            async def heartbeat_failure() -> None:
+                raise TimeoutError("trading websocket heartbeat timeout")
+
+            sm._connect_and_subscribe = connect
+            sm._mark_connected = mark_connected
+            sm._close_ws = close
+            sm._recv_loop = recv_failure
+            sm._heartbeat_loop = heartbeat_failure
+
+            with pytest.raises(ConnectionResetError):
+                await sm._run_session()
+            await asyncio.sleep(0)
+
+        asyncio.run(run())
+
+        assert unhandled == []
+
 
 class TestDisconnectObservability:
     def test_disconnect_reason_buckets_known_cases(self):
@@ -412,6 +490,12 @@ class TestDisconnectObservability:
         exc.__cause__ = OSError(65, "No route to host")
 
         assert StreamManager._disconnect_reason(exc) == "network_unreachable"
+
+    def test_disconnect_reason_prefers_tcp_reset_over_websocket_wrapper(self):
+        exc = ConnectionClosedError(None, None, None)
+        exc.__cause__ = ConnectionResetError(54, "Connection reset by peer")
+
+        assert StreamManager._disconnect_reason(exc) == "connection_reset"
 
     def test_mark_disconnected_logs_reason_and_timing_context(self, monkeypatch):
         sm = _stream()

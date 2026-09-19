@@ -424,6 +424,11 @@ class StreamManager:
             except Exception as exc:
                 if self._thread_stop.is_set():
                     break
+                # A connection that survived a complete heartbeat window was
+                # healthy.  Retry it from the base delay; reserve exponential
+                # escalation for repeated connect/auth or immediate failures.
+                if self._session_was_stable():
+                    delay = self._reconnect_base_delay
                 await self._mark_disconnected(exc)
             if self._thread_stop.is_set():
                 break
@@ -445,22 +450,38 @@ class StreamManager:
         if had_gap:
             await self._resync_tracked_state()
 
-        receiver = asyncio.create_task(self._recv_loop())
-        heartbeat = asyncio.create_task(self._heartbeat_loop())
-        stopper = asyncio.create_task(self._wait_for_stop())
-        done, pending = await asyncio.wait(
-            {receiver, heartbeat, stopper},
-            return_when=asyncio.FIRST_COMPLETED,
+        tasks = (
+            asyncio.create_task(self._recv_loop()),
+            asyncio.create_task(self._heartbeat_loop()),
+            asyncio.create_task(self._wait_for_stop()),
         )
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
+        done: set[asyncio.Task[Any]] = set()
+        try:
+            done, _ = await asyncio.wait(
+                tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            # More than one task can fail when a socket disappears.  Await
+            # every task so asyncio never reports an uncollected exception.
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            await self._close_ws()
 
-        result = next(iter(done))
-        exc = result.exception()
-        await self._close_ws()
-        if exc is not None:
-            raise exc
+        for task, result in zip(tasks, results):
+            if task in done and isinstance(result, BaseException):
+                raise result
+
+    def _session_was_stable(self) -> bool:
+        """Return whether the active session survived one heartbeat window."""
+        health = self.health_snapshot()
+        if not health.connected or health.last_reconnect_at is None:
+            return False
+        connected_for = _seconds_since(health.last_reconnect_at, _utcnow())
+        stable_after = self._heartbeat_interval + self._heartbeat_timeout
+        return connected_for is not None and connected_for >= stable_after
 
     async def _wait_for_stop(self) -> None:
         assert self._stop_event is not None
@@ -638,12 +659,8 @@ class StreamManager:
         msg = StreamManager._exception_text(exc)
         if "heartbeat timeout" in msg:
             return "heartbeat_timeout"
-        if "no close frame received or sent" in msg:
-            return "remote_close_no_frame"
         if "timed out during opening handshake" in msg:
             return "connect_timeout"
-        if "connection reset" in msg or "connection aborted" in msg:
-            return "connection_reset"
         if (
             "name or service not known" in msg
             or "temporary failure in name resolution" in msg
@@ -653,6 +670,10 @@ class StreamManager:
             return "dns_failure"
         if "network is unreachable" in msg or "no route to host" in msg:
             return "network_unreachable"
+        if "connection reset" in msg or "connection aborted" in msg:
+            return "connection_reset"
+        if "no close frame received or sent" in msg:
+            return "remote_close_no_frame"
         return type(exc).__name__.lower()
 
     @staticmethod
