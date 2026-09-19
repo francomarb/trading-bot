@@ -290,7 +290,11 @@ costs: 2022 worsens −9.1R → −16.1R, and entries rise ~40%, which `11.60`
 | ATR stop-loss | Price falls to `entry_price − (ATR × 2.0)` → broker stop fires | `risk/manager.py` |
 
 **Watchlist (`DONCHIAN_WATCHLIST` in `config/settings.py`):**
-32-name ai_bigtech universe: 23 AI core names (NVDA, MSFT, GOOGL, META, AMZN, etc.) + 9 AI-adjacent names (semiconductor equipment, data-centre power, quantum). See [`docs/donchian_breakout_strategy.md`](donchian_breakout_strategy.md) for the full universe methodology.
+100-name static snapshot from the durable-liquidity selector, plus any
+temporarily protected open Donchian holdings. Price, SIP dollar liquidity,
+company size, and affirmative solvency determine membership; current trend
+state and historical Donchian outcomes do not. See
+[`donchian-watchlist-selection.md`](donchian-watchlist-selection.md).
 
 **Why this strategy:**
 Donchian breakout is a pure trend-continuation system (Turtle Trading, System 1). It profits when a stock breaks to new highs with momentum and rides the trend until it reverses. It is allowed in TRENDING, RANGING, and VOLATILE regimes; only BEAR is blocked.

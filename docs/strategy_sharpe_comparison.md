@@ -36,7 +36,7 @@ This is a snapshot reference comparing the active strategies under backtest sett
 | RSI Reversion (14, 30/70) | Promoted static basket (24 symbols, scanner-selected — see methodology note 2) | 24/24 | +1.08† | +126.5% | -26.3% | 150 | 90.0% |
 | BB Squeeze (bb=10, kc=10, min=6, roc=5) | Sector ETFs (GICS SPDRs — selected by universe research) | 11/11 | +0.22 | +3.5% | -7.7% | 98 | 46.9% |
 | BB Squeeze (aggressive 10/4/3) | AI / Big-Tech / Semis (user thesis universe) | 32/32 | +0.17 | +13.6% | -26.8% | 394 | 40.6% |
-| Donchian Breakout (30/15, mid-range) | AI / Big-Tech / Semis (DONCHIAN_WATCHLIST — universe research winner) | 32/32 | +0.87 | +171.1% | -36.3% | 435 | 50.6% |
+| Donchian Breakout (30/15, mid-range) | Historical AI / Big-Tech / Semis 32-name research snapshot | 32/32 | +0.87 | +171.1% | -36.3% | 435 | 50.6% |
 
 † RSI per-symbol average Sharpe from `docs/reports/rsi_static_backtest_report_latest.md` (SIP feed, 5-year window ending 2026-05-01, 24 promoted symbols). Combined portfolio equity-curve Sharpe is **+1.17** (static basket) and **+1.08** (hybrid2 basket). The previous `compare_strategy_sharpes.py` run on the old frozen 28-symbol watchlist yielded only +0.31 — an artefact of backtesting a snapshot watchlist against a 4-year window where most names had no setup. The promoted static basket eliminates that structural bias.
 
@@ -70,7 +70,8 @@ This is a snapshot reference comparing the active strategies under backtest sett
 
 ### Donchian Breakout (30/15, mid-range)
 
-- **Universe kind:** AI / Big-Tech / Semis (DONCHIAN_WATCHLIST — universe research winner)
+- **Universe kind:** Historical AI / Big-Tech / Semis 32-name research snapshot.
+  This is not the active 2026-09-19 durable-liquidity watchlist.
 - **Symbols (32):** `NVDA, AMD, AVGO, SMCI, TSM, MU, QCOM, ARM, MRVL, ANET, VRT, MSFT, AAPL, GOOGL, META, AMZN, ORCL, TSLA, PLTR, CRWD, NOW, IREN, IONQ, ASML, CLS, CIEN, CEG, VST, BE, PWR, RGTI, QBTS`
 - **Symbols that produced any trade:** 32 of 32
 

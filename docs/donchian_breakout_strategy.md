@@ -42,7 +42,7 @@ low exit only triggers when the trend genuinely fails.
 | Max positions | **8** (`STRATEGY_ALLOCATIONS["donchian_breakout"]["hard_max_positions"]`) — *doc said 5 until 2026-08-18* |
 | ATR stop | 2× ATR (engine's `ATR_STOP_MULTIPLIER`) |
 | HWM drawdown gate | Live (and opt-in mature paper): entries pause if cumulative realized P&L drops >15% of sleeve budget below peak; default paper reports the breach without pausing |
-| Universe | `DONCHIAN_WATCHLIST` — 32 names (see below) |
+| Universe | `DONCHIAN_WATCHLIST` — 100 durable-liquidity candidates plus protected open holdings; refreshed 2026-09-19 |
 
 **Capital math at $100k equity** *(from `config/settings.py`, 2026-08-29):*
 
@@ -59,7 +59,7 @@ low exit only triggers when the trend genuinely fails.
   with it: $13,800 × 0.40 = $5,520. Borrowed capacity is returned as the pool
   fills, so $4,800 is the number to plan with and $5,520 is the ceiling a
   single position can actually reach.
-- **Risk per trade** = `risk_per_trade_pct` 0.004 × $100k = **$400** *(target; sizing is risk-first in `RiskManager`, and `11.48` tracks the gap between this target and recorded risk)*
+- **Risk per trade** = `risk_per_trade_pct` 0.004 × $100k = **$400** *(target; the current 4.8%-of-equity baseline notional cap means names below 4.17% ATR14/close are conservatively clipped below it)*
 - **Planned max simultaneous risk** (all 8 stops fire at target size) = 8 × $400 = **$3,200** — well inside the 5% daily-loss kill switch
 
 > **Do not re-derive these by hand.** `11.48` (allocator risk-target
@@ -69,11 +69,19 @@ low exit only triggers when the trend genuinely fails.
 
 ---
 
-## Watchlist — generation methodology
+## Watchlist selection
 
-> **This section is critical for future refreshes.** The watchlist is not
-> generated from a screen — it is curated from thesis-driven categories with
-> specific liquidity and history requirements. Re-read this before making changes.
+The active procedure is [`donchian-watchlist-selection.md`](donchian-watchlist-selection.md).
+As of 2026-09-19, the paper universe is the first 100 companies produced by the
+durable-liquidity selector plus any protected open holdings. Membership uses
+price, delayed-SIP dollar liquidity, company size, and affirmative solvency;
+temporary trend state and historical Donchian outcomes are diagnostics only.
+
+The material below preserves the **retired manual-universe research** that
+selected the original 32-name AI/Big-Tech basket. It remains necessary for
+interpreting the historical backtests, but it is not the active refresh policy.
+
+### Retired manual selection criteria
 
 ### Selection criteria
 
@@ -108,9 +116,9 @@ thin. Reconsider in 2026 Q1.*
 ### Historical research watchlist (32 names, as of 2026-05-01)
 
 This table preserves the universe used for the original research results below;
-it is not the active runtime list. The current curated paper watchlist lives in
-`config/settings.py` as `DONCHIAN_WATCHLIST`. It contains 52 symbols as of
-2026-09-08, including the operator-directed additions PANW, CRDO, LITE, and SPCX.
+it is not the active runtime list. The active generated snapshot lives in
+`config/settings.py` as `DONCHIAN_WATCHLIST` and its auditable source report is
+`docs/reports/donchian_watchlist_scan_latest.md`.
 
 #### Category 1 — AI / Semiconductors (primary, 9 names)
 The core thesis: AI training and inference hardware; highest-conviction names.
@@ -189,7 +197,7 @@ Thematically adjacent to AI capex — high correlation with the core AI names.
 
 ---
 
-### Parked diversifiers (tested but not deployed)
+### Historical diversifier experiment
 
 During DD-reduction research (2026-04-30), the following 18 names were tested
 in a blended 50-name universe alongside the AI core. Results showed modest DD
@@ -226,26 +234,13 @@ universe aggregate.
 
 ---
 
-### Watchlist refresh process
+### Active refresh process
 
-> Refresh annually (January) or on any of the triggers below.
-
-**Triggers for ad-hoc refresh:**
-- New AI-sector IPO reaches ≥2y of trading history and meets liquidity criteria
-- Any current name drops below liquidity floor or market cap threshold
-- Strategy underperforms buy-and-hold on the universe by >10pp Sharpe over a
-  rolling 12-month paper window
-- Major sector regime change (e.g., AI investment cycle peaks)
-
-**Refresh procedure:**
-1. Draft candidate additions/removals against the selection criteria above
-2. Add candidates to the `ai_bigtech` universe in `scripts/backtest_bollinger_squeeze.py`
-3. Run sweep: `python scripts/backtest_donchian_breakout.py --sweep --universe ai_bigtech --years 4 --end-date <today> --atr-stop-mult 2.0`
-4. Compare Sharpe and MeanDD vs. current production universe result
-5. If Sharpe ≥ current −0.05 AND MeanDD ≤ current +2pp → candidate additions are safe
-6. Get explicit user approval before deploying updated watchlist
-7. Update `DONCHIAN_WATCHLIST` in `config/settings.py` and the table in this doc
-8. Commit, push, recycle bot
+Run the report-only selector quarterly and follow the review, open-position
+protection, risk-coverage, approval, and cohort rules in
+[`donchian-watchlist-selection.md`](donchian-watchlist-selection.md). Do not
+restore the old procedure of manually adding themes and accepting them because
+an in-sample per-symbol Sharpe remains close to the previous basket.
 
 ---
 

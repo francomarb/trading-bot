@@ -151,7 +151,7 @@ def main() -> int:
         ),
         (
             "Donchian Breakout (30/15, mid-range)",
-            "AI / Big-Tech / Semis (DONCHIAN_WATCHLIST — universe research winner)",
+            "Historical AI / Big-Tech / Semis 32-name research snapshot",
             lambda: DonchianBreakout(
                 entry_window=30, exit_window=15,
                 edge_filter=DonchianEdgeFilter(feed_label=settings.BACKTEST_DATA_FEED),

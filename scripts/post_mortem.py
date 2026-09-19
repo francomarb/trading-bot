@@ -23,6 +23,7 @@ from config import settings
 from data.fetcher import fetch_symbol
 from indicators.technicals import add_sma, add_rsi, add_adx
 from reporting.logger import TradeLogger
+from sector.resolver import SectorResolver
 
 # Map symbols to their sector ETF for Relative Strength comparison.
 # If a symbol isn't here, it will just default to comparing against SPY.
@@ -62,6 +63,16 @@ SECTOR_MAP = {
     "SPCX": "SPY",
 }
 
+
+def _sector_etf_for(symbol: str, resolver: SectorResolver) -> str | None:
+    """Resolve a sector ETF dynamically, retaining the legacy map as fallback."""
+    sector = resolver.resolve(symbol)
+    if sector is not None:
+        resolved = settings.SECTOR_ETFS.get(sector)
+        if resolved is not None:
+            return resolved
+    return SECTOR_MAP.get(symbol)
+
 def analyze_trades(days: int):
     logger = TradeLogger(settings.TRADE_LOG_DB)
     trades = logger.read_all()
@@ -72,6 +83,9 @@ def analyze_trades(days: int):
     if not buy_trades:
         print(f"No buy trades found in the last {days} days.")
         return
+
+    sector_resolver = SectorResolver(valid_sectors=set(settings.SECTOR_ETFS))
+    sector_resolver.hydrate(sorted({trade["symbol"] for trade in buy_trades}))
 
     print(f"Found {len(buy_trades)} buy trades in the last {days} days.")
     print("⚠️  = Triggered proposed Phase 11 gates (ADX < 20 or RSI >= 70)")
@@ -141,7 +155,7 @@ def analyze_trades(days: int):
                 
             # Calculate Sector ETF 20-day Relative Strength
             rs_sector_20 = float("nan")
-            sector_etf = SECTOR_MAP.get(sym)
+            sector_etf = _sector_etf_for(sym, sector_resolver)
             if sector_etf:
                 try:
                     sec_df, _ = fetch_symbol(
