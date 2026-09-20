@@ -168,9 +168,10 @@ REJECTION_LABELS: dict[str, str] = {
     "price": "Latest close is below the minimum price threshold.",
     "dollar_volume": "50-day average dollar volume is below the liquidity threshold.",
     "market_cap": "Market capitalization is below the RSI minimum size threshold.",
-    "solvency": (
-        "Solvency was not affirmatively established or the fundamentals request failed."
-    ),
+    "market_cap_unknown": "Market capitalization could not be established.",
+    "fundamentals_error": "The fundamentals provider request failed.",
+    "solvency_unknown": "Profitability or required cash data was unavailable.",
+    "solvency": "Known cash runway is below the strategy minimum.",
     "nonpreferred_share_class": (
         "Excluded by share-class policy; use GOOG for Alphabet exposure, never GOOGL."
     ),
@@ -245,7 +246,21 @@ def scan_candidates(
         if include_fundamentals:
             fundamentals = fetch_fundamentals(symbol)
             market_cap = fundamentals.market_cap
-            if market_cap is None or market_cap < config.min_market_cap:
+            if getattr(fundamentals, "error", None):
+                _reject(symbol, "fundamentals_error", rejections, examples)
+                if symbol in explain_symbols:
+                    explanations[symbol] = _format_explanation(
+                        "fundamentals_error", metric, config, market_cap=market_cap
+                    )
+                continue
+            if market_cap is None:
+                _reject(symbol, "market_cap_unknown", rejections, examples)
+                if symbol in explain_symbols:
+                    explanations[symbol] = _format_explanation(
+                        "market_cap_unknown", metric, config, market_cap=None
+                    )
+                continue
+            if market_cap < config.min_market_cap:
                 _reject(symbol, "market_cap", rejections, examples)
                 if symbol in explain_symbols:
                     explanations[symbol] = _format_explanation(
@@ -253,11 +268,40 @@ def scan_candidates(
                     )
                 continue
             fitness = assess_fitness(fundamentals, RSI_PROFILE)
-            if fitness.solvency_ok is not True or fitness.error:
-                _reject(symbol, "solvency", rejections, examples)
+            if fitness.error:
+                _reject(symbol, "fundamentals_error", rejections, examples)
                 if symbol in explain_symbols:
                     explanations[symbol] = _format_explanation(
+                        "fundamentals_error", metric, config, market_cap=market_cap
+                    )
+                continue
+            if fitness.solvency_ok is None:
+                _reject(symbol, "solvency_unknown", rejections, examples)
+                if symbol in explain_symbols:
+                    explanation = _format_explanation(
+                        "solvency_unknown", metric, config, market_cap=market_cap
+                    )
+                    reason = getattr(fitness, "solvency_reason", None) or "unknown"
+                    source = (
+                        getattr(fundamentals, "net_income_source", None)
+                        or "no approved row"
+                    )
+                    explanations[symbol] = (
+                        f"{explanation} Solvency detail: {reason}; "
+                        f"net-income source={source}."
+                    )
+                continue
+            if fitness.solvency_ok is False:
+                _reject(symbol, "solvency", rejections, examples)
+                if symbol in explain_symbols:
+                    explanation = _format_explanation(
                         "solvency", metric, config, market_cap=market_cap
+                    )
+                    runway = getattr(fundamentals, "cash_runway_months", None)
+                    explanations[symbol] = (
+                        f"{explanation} Cash runway={runway:.1f} months."
+                        if runway is not None
+                        else explanation
                     )
                 continue
 

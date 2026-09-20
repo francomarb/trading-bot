@@ -7,6 +7,12 @@
 **Target:** 100 ranked opportunity candidates, plus any temporarily protected
 symbols with open Donchian positions.
 
+**Pending review:**
+`docs/reports/donchian_watchlist_scan_11_72_candidate.md` reflects the shared
+fundamentals-parser correction but is not active configuration. ISRG now
+qualifies at rank 84 and moves LIN to rank 101. Promotion requires separate
+operator approval and private lifecycle-protection reconciliation.
+
 ## Purpose
 
 The Donchian watchlist is a stable opportunity pool for the active 30/15
@@ -64,6 +70,13 @@ The scanner requires:
 - market capitalization of at least $2 billion; and
 - affirmatively established solvency: profitable, or at least 12 months of
   cash runway when unprofitable.
+
+Fundamentals fail closed per field. The shared parser uses Yahoo's exact
+`Net Income` row first and `Net Income Common Stockholders` as the only approved
+fallback. Provider errors, unavailable market cap, unavailable solvency facts,
+and a known sub-12-month runway are reported separately. A missing fact excludes
+the company from a promotion scan but is not labeled as a negative financial
+fact.
 
 Eligible companies are ordered by 50-day average dollar volume. Liquidity is a
 durable execution priority, not a prediction of return. `GOOGL` is excluded;

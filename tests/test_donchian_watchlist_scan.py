@@ -250,8 +250,8 @@ class TestDonchianSelection:
         )
 
         assert candidates == []
-        assert rejections["solvency"] == 1
-        assert "12-month-runway" in explanations["UNKNOWN"]
+        assert rejections == {"solvency_unknown": 1}
+        assert "required data is unavailable" in explanations["UNKNOWN"]
 
     def test_unknown_market_cap_has_truthful_reason_and_explanation(
         self, monkeypatch
@@ -277,6 +277,68 @@ class TestDonchianSelection:
         assert candidates == []
         assert rejections == {"market_cap_unknown": 1}
         assert "could not be established" in explanations["UNKNOWN"]
+
+    def test_fundamentals_request_error_has_distinct_reason(self, monkeypatch):
+        monkeypatch.setattr(
+            "scripts.donchian_watchlist_scan._compute_metrics",
+            lambda _frame, _config: _metric(),
+        )
+        monkeypatch.setattr(
+            "scripts.donchian_watchlist_scan.fetch_fundamentals",
+            lambda _symbol: SimpleNamespace(
+                market_cap=20_000_000_000.0,
+                error="timeout",
+            ),
+        )
+
+        candidates, rejections, _examples, explanations = scan_candidates(
+            [AssetInfo("ERROR", "Provider Error", "NYSE")],
+            {"ERROR": pd.DataFrame({"close": [120.0]})},
+            config=ScanConfig(),
+            include_fundamentals=True,
+            top=1,
+            explain_symbols={"ERROR"},
+        )
+
+        assert candidates == []
+        assert rejections == {"fundamentals_error": 1}
+        assert "provider request failed" in explanations["ERROR"]
+
+    def test_known_short_runway_is_distinct_from_unknown(self, monkeypatch):
+        monkeypatch.setattr(
+            "scripts.donchian_watchlist_scan._compute_metrics",
+            lambda _frame, _config: _metric(),
+        )
+        fundamentals = SimpleNamespace(
+            market_cap=20_000_000_000.0,
+            cash_runway_months=7.5,
+            error=None,
+        )
+        monkeypatch.setattr(
+            "scripts.donchian_watchlist_scan.fetch_fundamentals",
+            lambda _symbol: fundamentals,
+        )
+        monkeypatch.setattr(
+            "scripts.donchian_watchlist_scan.assess_fitness",
+            lambda _fundamentals, _profile: SimpleNamespace(
+                solvency_ok=False,
+                solvency_reason="runway_insufficient",
+                error=None,
+            ),
+        )
+
+        candidates, rejections, _examples, explanations = scan_candidates(
+            [AssetInfo("SHORT", "Short Runway", "NYSE")],
+            {"SHORT": pd.DataFrame({"close": [120.0]})},
+            config=ScanConfig(),
+            include_fundamentals=True,
+            top=1,
+            explain_symbols={"SHORT"},
+        )
+
+        assert candidates == []
+        assert rejections == {"solvency": 1}
+        assert "calculated runway=7.5 months" in explanations["SHORT"]
 
     def test_preferred_share_class_and_open_position_protection(self, monkeypatch):
         metrics = {

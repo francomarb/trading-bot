@@ -31,6 +31,7 @@ from scripts.watchlist_review import (
     StrategyFitness,
     SymbolFundamentals,
     _row_latest,
+    _row_latest_with_source,
     assess_fitness,
     fetch_fundamentals,
     format_report,
@@ -129,6 +130,16 @@ class TestRowLatest:
     def test_no_keys_returns_none(self):
         df = _df({"Free Cash Flow": [1_000_000.0]})
         assert _row_latest(df) is None
+
+    def test_non_finite_value_falls_through_to_next_approved_row(self):
+        df = _df({
+            "Net Income": [float("inf")],
+            "Net Income Common Stockholders": [25_000_000.0],
+        })
+
+        assert _row_latest_with_source(
+            df, "Net Income", "Net Income Common Stockholders"
+        ) == (25_000_000.0, "Net Income Common Stockholders")
 
 
 # ── TestFetchFundamentals ─────────────────────────────────────────────────────
@@ -252,6 +263,46 @@ class TestFetchFundamentals:
         with patch("scripts.watchlist_review.yf.Ticker", return_value=t):
             r = fetch_fundamentals("AAPL")
         assert r.is_profitable is True
+        assert r.net_income_annual == pytest.approx(100_000_000_000.0)
+        assert r.net_income_source == "Net Income"
+
+    def test_net_income_common_stockholders_is_narrow_fallback(self):
+        t = _mock_ticker(
+            income_stmt=_df({"Net Income Common Stockholders": [2_856_000_000.0]}),
+        )
+        with patch("scripts.watchlist_review.yf.Ticker", return_value=t):
+            r = fetch_fundamentals("ISRG")
+
+        assert r.net_income_annual == pytest.approx(2_856_000_000.0)
+        assert r.net_income_source == "Net Income Common Stockholders"
+        assert r.is_profitable is True
+
+    def test_exact_net_income_wins_when_approved_rows_differ(self):
+        t = _mock_ticker(
+            income_stmt=_df({
+                "Net Income": [-100_000_000.0],
+                "Net Income Common Stockholders": [200_000_000.0],
+            }),
+            balance_sheet=_df({"Cash And Cash Equivalents": [1_000_000_000.0]}),
+        )
+        with patch("scripts.watchlist_review.yf.Ticker", return_value=t):
+            r = fetch_fundamentals("DIFF")
+
+        assert r.net_income_annual == pytest.approx(-100_000_000.0)
+        assert r.net_income_source == "Net Income"
+        assert r.is_profitable is False
+
+    def test_negative_common_stockholder_fallback_drives_runway(self):
+        t = _mock_ticker(
+            income_stmt=_df({"Net Income Common Stockholders": [-1_000_000_000.0]}),
+            balance_sheet=_df({"Cash And Cash Equivalents": [2_000_000_000.0]}),
+        )
+        with patch("scripts.watchlist_review.yf.Ticker", return_value=t):
+            r = fetch_fundamentals("LOSS")
+
+        assert r.net_income_source == "Net Income Common Stockholders"
+        assert r.is_profitable is False
+        assert r.cash_runway_months == pytest.approx(24.0)
 
     def test_cash_runway_computed_when_unprofitable(self):
         # Unprofitable: $2B cash, $1B/yr loss → 24 months
@@ -418,10 +469,9 @@ class TestStrategyFitnessVerdict:
         f = _make_fitness(SMA_PROFILE, fcf_ok=True, revenue_ok=True, solvency_ok=True)
         assert f.verdict == "✅ GOOD FIT"
 
-    def test_good_fit_with_na_data(self):
-        # None checks are not penalised
+    def test_unknown_when_required_data_is_missing(self):
         f = _make_fitness(SMA_PROFILE, fcf_ok=True, revenue_ok=None, solvency_ok=None)
-        assert f.verdict == "✅ GOOD FIT"
+        assert f.verdict == "⚠️  UNKNOWN"
 
     def test_poor_fit_required_fcf_fails(self):
         # SMA profile: FCF is required
@@ -561,15 +611,25 @@ class TestAssessFitness:
         for profile in ALL_PROFILES:
             fitness = assess_fitness(fund, profile)
             assert fitness.solvency_ok is True
+            assert fitness.solvency_reason == "profitable"
 
-    def test_none_data_not_penalised(self):
-        # No data available → all checks remain None → GOOD FIT
+    def test_none_required_data_is_unknown(self):
         fund = SymbolFundamentals(symbol="X")
         fitness = assess_fitness(fund, SMA_PROFILE)
         assert fitness.fcf_ok is None
         assert fitness.revenue_ok is None
         assert fitness.solvency_ok is None
-        assert fitness.verdict == "✅ GOOD FIT"
+        assert fitness.solvency_reason == "profitability_unknown"
+        assert fitness.verdict == "⚠️  UNKNOWN"
+
+    def test_unprofitable_company_without_cash_has_unknown_solvency(self):
+        fund = SymbolFundamentals(symbol="X", is_profitable=False)
+
+        fitness = assess_fitness(fund, RSI_PROFILE)
+
+        assert fitness.solvency_ok is None
+        assert fitness.solvency_reason == "cash_unknown_for_unprofitable_company"
+        assert fitness.verdict == "⚠️  UNKNOWN"
 
 
 # ── TestFormatReport ─────────────────────────────────────────────────────────
@@ -675,6 +735,16 @@ class TestFormatReport:
         report = format_report(results)
         assert "BAD" in report
         assert "no data" in report
+
+    def test_report_flags_unknown_required_data(self):
+        fund = SymbolFundamentals(symbol="UNKNOWN")
+        results = [(fund, [assess_fitness(fund, SMA_PROFILE)])]
+
+        report = format_report(results)
+
+        assert "⚠️  UNKNOWN" in report
+        assert "profitability_unknown" in report
+        assert "investigate provider coverage" in report
 
 
 # ── TestRunReview ─────────────────────────────────────────────────────────────

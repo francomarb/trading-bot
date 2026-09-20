@@ -4,7 +4,7 @@
 
 **Audit date:** 2026-09-20
 
-**Status:** Proposal ready; no runtime or configured-universe change made
+**Status:** Implementation complete on the PR branch; universe decision pending
 
 ## Decision Summary
 
@@ -286,3 +286,46 @@ Use Phase C to produce an operator decision rather than treating parser-correct
 membership changes as automatic. Close `11.72` only after the shared behavior,
 all consumers, regenerated reports, and any explicitly approved universe
 changes are synchronized.
+
+## Implementation And Candidate-Report Result
+
+The approved contract was implemented on 2026-09-20 without changing either
+configured universe:
+
+- the shared parser now uses exact `Net Income` first, then the narrow
+  `Net Income Common Stockholders` fallback, and records both value and source;
+- assessment exposes explicit solvency provenance and the standalone review
+  uses a non-passing `UNKNOWN` verdict for unavailable required facts;
+- RSI, Donchian, and SMA now separate provider errors, unavailable facts, and
+  affirmative threshold failures;
+- SMA eligibility no longer depends on a display verdict string; and
+- the historical RSI builder now requires affirmative solvency.
+
+Review-only candidate artifacts:
+
+- [`reports/rsi_watchlist_scan_11_72_candidate.md`](reports/rsi_watchlist_scan_11_72_candidate.md)
+- [`reports/donchian_watchlist_scan_11_72_candidate.md`](reports/donchian_watchlist_scan_11_72_candidate.md)
+
+Current candidate differences, not yet promoted:
+
+| Strategy | Proposed additions | Proposed removals | Attribution |
+|---|---|---|---|
+| Donchian | ISRG (rank 84) | LIN (moves to 101) | Isolated parser correction on an otherwise unchanged weekend market-data window |
+| RSI | BRK.B, COHR, JNJ | COST, GLW, TXN | Combined effect of the earlier BRK.B provider fix and liquidity drift since the 2026-09-09 promoted report |
+
+The sanitized reports intentionally omit account state. A private ledger check
+confirmed that the current configurations cover every open RSI and Donchian
+position. If the candidate pools are promoted, two RSI holdings and one
+Donchian holding would need to remain as lifecycle-protection additions outside
+the ranked pools. Their identities must remain in the private promotion check,
+not the committed report.
+
+Validation:
+
+- focused fundamentals/scanner tests: 175 passed, one existing warning;
+- full suite: 3,855 passed, five existing numerical warnings; and
+- generated reports contain no `solvency_unknown` or `fundamentals_error`
+  rejection in this successful provider run. AZO remains honestly reported as
+  `market_cap_unknown`.
+
+No bot recycle, strategy setting, or active watchlist change was performed.

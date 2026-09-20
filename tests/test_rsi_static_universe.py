@@ -8,6 +8,7 @@ then rank them by long-run trade density and profitability.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -296,6 +297,48 @@ class TestApplyFundamentalGate:
 
         assert filtered == []
         assert rejections["market_cap"] == 1
+
+    def test_unknown_cached_solvency_fails_closed(self, tmp_path):
+        recent = [
+            PrefilterCandidate(
+                "UNKNOWN", 100.0, 800_000.0, 80_000_000.0, 0, 50.0, None, "UNKNOWN"
+            )
+        ]
+        ranked = rank_static_universe(
+            recent,
+            [
+                _validation(
+                    "UNKNOWN",
+                    trade_count=6.0,
+                    total_return=0.40,
+                    sharpe=1.0,
+                    max_drawdown=-0.20,
+                    profit_factor=2.0,
+                )
+            ],
+            config=StaticUniverseConfig(top=10),
+        )
+        cache_path = tmp_path / "fundamentals.json"
+        cache_path.write_text(
+            json.dumps(
+                {
+                    "UNKNOWN": {
+                        "market_cap": 5_000_000_000.0,
+                        "sector": "TECHNOLOGY",
+                        "solvency_ok": None,
+                    }
+                }
+            )
+        )
+
+        filtered, rejections = apply_fundamental_gate(
+            ranked,
+            config=StaticUniverseConfig(),
+            cache_path=cache_path,
+        )
+
+        assert filtered == []
+        assert rejections == {"solvency_unknown": 1}
 
     def test_enriches_sector_and_uses_cache(self, monkeypatch, tmp_path):
         recent = [

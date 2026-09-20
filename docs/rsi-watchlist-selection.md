@@ -7,6 +7,12 @@
 **Target:** 50 ranked opportunity candidates, plus any temporarily protected
 symbols with open RSI positions.
 
+**Pending review:** `docs/reports/rsi_watchlist_scan_11_72_candidate.md` reflects
+the shared fundamentals-parser correction but is not active configuration. It
+proposes BRK.B, COHR, and JNJ in place of COST, GLW, and TXN. The diff combines
+the earlier BRK.B provider fix with liquidity drift since the 2026-09-09
+promotion and requires separate operator approval.
+
 The current runtime list is the report's 50 candidates plus ABNB and CCK,
 which were open at promotion time and remain only until flat and terminal.
 
@@ -74,6 +80,12 @@ The scanner requires only:
 - 50-day average dollar volume at least $50 million;
 - market capitalization at least $2 billion and affirmatively established
   solvency when `--include-fundamentals` is used.
+
+Fundamentals fail closed per field. The shared parser uses Yahoo's exact
+`Net Income` row first and `Net Income Common Stockholders` as the only approved
+fallback. Provider errors, unavailable market cap, unavailable solvency facts,
+and a known sub-12-month runway are reported as distinct rejection reasons;
+missing data is never described as a failed financial threshold.
 
 Eligible companies are ordered by 50-day average dollar volume. This is an
 execution-quality priority, not a return forecast. To keep Yahoo lookups

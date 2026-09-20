@@ -133,6 +133,9 @@ REJECTION_LABELS: dict[str, str] = {
     "atr_too_high": "ATR14 / close is too high; the name may be too unstable for SMA trend following.",
     "relative_strength": "12-month momentum excluding the latest month is below the top-30% cutoff.",
     "market_cap": "Market capitalization is below the SMA minimum size threshold.",
+    "market_cap_unknown": "Market capitalization could not be established.",
+    "fundamentals_error": "The fundamentals provider request failed.",
+    "fundamental_unknown": "One or more required SMA fundamental facts were unavailable.",
     "fundamental_sanity": "SMA fundamental sanity check failed.",
     "etf_quotetype": "yfinance quoteType is ETF; SMA crossover applies to single-name trends, not basket products.",
     "biotech_industry": "Industry is biotech / specialty pharma / diagnostics; binary-catalyst risk is a poor fit for SMA trend-following.",
@@ -494,10 +497,31 @@ def scan_candidates(
 
         if include_fundamentals:
             fundamentals = fetch_fundamentals(symbol)
-            if (
-                fundamentals.market_cap is None
-                or fundamentals.market_cap < config.min_market_cap
-            ):
+            if getattr(fundamentals, "error", None):
+                _reject(symbol, "fundamentals_error", rejections, examples)
+                if symbol in explain_symbols:
+                    explanations[symbol] = _format_explanation(
+                        symbol,
+                        "fundamentals_error",
+                        metric,
+                        relative_strength_pct,
+                        config,
+                        market_cap=fundamentals.market_cap,
+                    )
+                continue
+            if fundamentals.market_cap is None:
+                _reject(symbol, "market_cap_unknown", rejections, examples)
+                if symbol in explain_symbols:
+                    explanations[symbol] = _format_explanation(
+                        symbol,
+                        "market_cap_unknown",
+                        metric,
+                        relative_strength_pct,
+                        config,
+                        market_cap=None,
+                    )
+                continue
+            if fundamentals.market_cap < config.min_market_cap:
                 _reject(symbol, "market_cap", rejections, examples)
                 if symbol in explain_symbols:
                     explanations[symbol] = _format_explanation(
@@ -510,12 +534,45 @@ def scan_candidates(
                     )
                 continue
             fitness = assess_fitness(fundamentals, SMA_PROFILE)
-            if fitness.verdict != "✅ GOOD FIT":
+            if fitness.error:
+                _reject(symbol, "fundamentals_error", rejections, examples)
+                if symbol in explain_symbols:
+                    explanations[symbol] = _format_explanation(
+                        symbol,
+                        "fundamentals_error",
+                        metric,
+                        relative_strength_pct,
+                        config,
+                        market_cap=fundamentals.market_cap,
+                    )
+                continue
+            required_checks = (
+                fitness.fcf_ok,
+                fitness.revenue_ok,
+                fitness.solvency_ok,
+            )
+            if any(check is None for check in required_checks):
+                _reject(symbol, "fundamental_unknown", rejections, examples)
+                if symbol in explain_symbols:
+                    explanations[symbol] = _format_explanation(
+                        symbol,
+                        "fundamental_unknown",
+                        metric,
+                        relative_strength_pct,
+                        config,
+                        market_cap=fundamentals.market_cap,
+                    )
+                continue
+            if any(check is False for check in required_checks):
                 _reject(symbol, "fundamental_sanity", rejections, examples)
                 if symbol in explain_symbols:
                     explanations[symbol] = _format_explanation(
-                    symbol, "fundamental_sanity", metric, relative_strength_pct, config
-                )
+                        symbol,
+                        "fundamental_sanity",
+                        metric,
+                        relative_strength_pct,
+                        config,
+                    )
                 continue
 
         asset = asset_by_symbol.get(symbol, AssetInfo(symbol, symbol, "UNKNOWN"))
