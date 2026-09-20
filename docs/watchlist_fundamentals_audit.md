@@ -4,7 +4,7 @@
 
 **Audit date:** 2026-09-20
 
-**Status:** Implementation complete on the PR branch; universe decision pending
+**Status:** Implementation and narrow universe corrections approved on the PR branch
 
 ## Decision Summary
 
@@ -306,26 +306,42 @@ Review-only candidate artifacts:
 - [`reports/rsi_watchlist_scan_11_72_candidate.md`](reports/rsi_watchlist_scan_11_72_candidate.md)
 - [`reports/donchian_watchlist_scan_11_72_candidate.md`](reports/donchian_watchlist_scan_11_72_candidate.md)
 
-Current candidate differences, not yet promoted:
+Candidate-report differences reviewed by the operator:
 
-| Strategy | Proposed additions | Proposed removals | Attribution |
+| Strategy | Candidate additions | Candidate removals | Attribution |
 |---|---|---|---|
 | Donchian | ISRG (rank 84) | LIN (moves to 101) | Isolated parser correction on an otherwise unchanged weekend market-data window |
 | RSI | BRK.B, COHR, JNJ | COST, GLW, TXN | Combined effect of the earlier BRK.B provider fix and liquidity drift since the 2026-09-09 promoted report |
 
-The sanitized reports intentionally omit account state. A private ledger check
-confirmed that the current configurations cover every open RSI and Donchian
-position. If the candidate pools are promoted, two RSI holdings and one
-Donchian holding would need to remain as lifecycle-protection additions outside
-the ranked pools. Their identities must remain in the private promotion check,
-not the committed report.
+Operator decision on 2026-09-20:
+
+- approve the isolated Donchian correction: ISRG replaces LIN at the ranked
+  100 boundary;
+- approve the isolated frozen-window RSI correction: BRK.B replaces BAC in the
+  ranked 50, with required lifecycle protection retained outside the ranked
+  pool; and
+- reject the additional current-snapshot RSI turnover. COHR/JNJ versus
+  COST/GLW/TXN is ordinary liquidity drift and does not justify changing a
+  recently promoted stable pool.
+
+The sanitized reports intentionally omit account state. Private ledger and
+broker checks confirmed that the approved configuration covers every open RSI
+and Donchian position and does not drop a symbol with an unresolved order.
+Three RSI and one Donchian lifecycle-protection additions remain outside the
+ranked pools. Their current ownership state stays in the private promotion
+check, not the committed report.
 
 Validation:
 
-- focused fundamentals/scanner tests: 175 passed, one existing warning;
-- full suite: 3,855 passed, five existing numerical warnings; and
+- focused fundamentals/scanner/watchlist tests after promotion: 198 passed,
+  one existing warning;
+- full suite after promotion: 3,857 passed, five existing numerical warnings;
+  and
 - generated reports contain no `solvency_unknown` or `fundamentals_error`
   rejection in this successful provider run. AZO remains honestly reported as
   `market_cap_unknown`.
 
-No bot recycle, strategy setting, or active watchlist change was performed.
+The active configuration is updated on the PR branch. Private ledger and broker
+checks confirmed that removed ranked membership does not orphan an owned
+position or unresolved order; required lifecycle-protection entries remain in
+configuration. No bot recycle was performed.

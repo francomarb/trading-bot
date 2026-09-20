@@ -1,17 +1,19 @@
 # Donchian Watchlist Selection And Refresh
 
-**Status:** Active procedure; v1 pool promoted 2026-09-19.
+**Status:** Active procedure; v1 pool promoted 2026-09-19 and narrowly
+corrected 2026-09-20.
 
 **Rule version:** `donchian_watchlist_v1_durable_liquid_pool`
 
 **Target:** 100 ranked opportunity candidates, plus any temporarily protected
 symbols with open Donchian positions.
 
-**Pending review:**
+**Approved correction:**
 `docs/reports/donchian_watchlist_scan_11_72_candidate.md` reflects the shared
-fundamentals-parser correction but is not active configuration. ISRG now
-qualifies at rank 84 and moves LIN to rank 101. Promotion requires separate
-operator approval and private lifecycle-protection reconciliation.
+fundamentals-parser correction. ISRG qualifies at rank 84 and replaces LIN,
+which moves to rank 101. The correction was approved after private position and
+open-order reconciliation; existing lifecycle-preservation membership remains
+unchanged.
 
 ## Purpose
 
@@ -98,15 +100,15 @@ under the v1 rule:
 
 ## Why 100 Names
 
-The 2026-09-19 delayed-SIP snapshot compared nested liquidity pools. The raw
-breakout counts use companies selected today, so they characterize opportunity
-coverage and contention; they are not a survivorship-free backtest.
+The corrected 2026-09-20 delayed-SIP snapshot compared nested liquidity pools.
+The raw breakout counts use companies selected today, so they characterize
+opportunity coverage and contention; they are not a survivorship-free backtest.
 
 | Pool | Breakouts over trailing 252 sessions | Active breakout days | Peak same-day signals | Days above 8-position capacity | Median ATR% | Conservatively cap-clipped |
 |---:|---:|---:|---:|---:|---:|---:|
 | 50 | 479 | 87 | 18 | 17 | 3.98% | 26 |
-| **100** | **896** | **89** | **27** | **42** | **3.79%** | **56** |
-| 200 | 1,727 | 90 | 41 | 79 | 3.23% | 136 |
+| **100** | **890** | **89** | **26** | **42** | **3.79%** | **56** |
+| 200 | 1,720 | 90 | 41 | 78 | 3.23% | 136 |
 
 Fifty names offered little breadth beyond the old 52-name pool. One hundred
 nearly doubled raw opportunity coverage while remaining operationally modest:

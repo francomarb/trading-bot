@@ -1,5 +1,11 @@
 # RSI Watchlist Scan - 2026-09-20T13:26:17+00:00
 
+> **Decision (2026-09-20):** This full current-snapshot refresh was not
+> promoted. Only the frozen-window provider correction was accepted: BRK.B
+> replaces BAC in the ranked 50, while required lifecycle protection remains
+> appended outside the ranked pool. The COHR/JNJ versus COST/GLW/TXN boundary
+> movement is ordinary liquidity drift.
+
 - Rule version: `rsi_watchlist_v3_durable_company_pool`
 - Alpaca feed: `sip`
 - Data window: 2025-07-27 to 2026-09-20

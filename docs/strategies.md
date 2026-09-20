@@ -125,8 +125,9 @@ SMA crossover is the simplest trend-following signal. It captures sustained dire
 | Watchlist | Curated static `RSI_WATCHLIST` |
 
 The active list is the 50-name v3 durable-company opportunity pool promoted on
-2026-09-09, plus temporary open-position retention entries. Pool size does not
-change the eight-position ceiling.
+2026-09-09 and narrowly provider-corrected on 2026-09-20, plus temporary
+open-position retention entries. Pool size does not change the eight-position
+ceiling.
 
 **Signal logic:**
 - **Entry:** RSI3 is below 15 while the symbol is flat
@@ -290,10 +291,11 @@ costs: 2022 worsens −9.1R → −16.1R, and entries rise ~40%, which `11.60`
 | ATR stop-loss | Price falls to `entry_price − (ATR × 2.0)` → broker stop fires | `risk/manager.py` |
 
 **Watchlist (`DONCHIAN_WATCHLIST` in `config/settings.py`):**
-100-name static snapshot from the durable-liquidity selector, plus any
-temporarily protected open Donchian holdings. Price, SIP dollar liquidity,
-company size, and affirmative solvency determine membership; current trend
-state and historical Donchian outcomes do not. See
+100-name static snapshot from the durable-liquidity selector, narrowly
+profitability-parser-corrected on 2026-09-20, plus any temporarily protected
+open Donchian holdings. Price, SIP dollar liquidity, company size, and
+affirmative solvency determine membership; current trend state and historical
+Donchian outcomes do not. See
 [`donchian-watchlist-selection.md`](donchian-watchlist-selection.md).
 
 **Why this strategy:**

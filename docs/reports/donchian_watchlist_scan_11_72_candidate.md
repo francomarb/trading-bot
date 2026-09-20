@@ -1,5 +1,9 @@
 # Donchian Watchlist Scan - 2026-09-20T13:31:36+00:00
 
+> **Decision (2026-09-20):** The isolated parser correction was approved.
+> ISRG replaces LIN in the ranked 100; existing lifecycle protection is
+> unchanged.
+
 - Rule version: `donchian_watchlist_v1_durable_liquid_pool`
 - Ranking: `liquidity`
 - Alpaca feed: `sip`

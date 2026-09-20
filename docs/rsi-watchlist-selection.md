@@ -1,20 +1,24 @@
 # RSI Watchlist Selection And Refresh
 
-**Status:** Active procedure; v3 pool promoted 2026-09-09.
+**Status:** Active procedure; v3 pool promoted 2026-09-09 and narrowly
+corrected 2026-09-20.
 
 **Rule version:** `rsi_watchlist_v3_durable_company_pool`
 
 **Target:** 50 ranked opportunity candidates, plus any temporarily protected
 symbols with open RSI positions.
 
-**Pending review:** `docs/reports/rsi_watchlist_scan_11_72_candidate.md` reflects
-the shared fundamentals-parser correction but is not active configuration. It
-proposes BRK.B, COHR, and JNJ in place of COST, GLW, and TXN. The diff combines
-the earlier BRK.B provider fix with liquidity drift since the 2026-09-09
-promotion and requires separate operator approval.
+**Approved correction:** BRK.B replaces BAC in the ranked 50. On the frozen
+2026-09-09 promotion window, resolving Yahoo's `BRK.B`/`BRK-B` boundary placed
+BRK.B around rank 42 and moved BAC from rank 50 to 51. The displaced boundary
+member remains temporarily after the ranked pool where required for lifecycle
+protection. The broader current-snapshot
+proposal in `docs/reports/rsi_watchlist_scan_11_72_candidate.md` was not
+promoted: COHR/JNJ versus COST/GLW/TXN was ordinary liquidity drift too soon
+after promotion.
 
-The current runtime list is the report's 50 candidates plus ABNB and CCK,
-which were open at promotion time and remain only until flat and terminal.
+The current runtime list is the corrected 50-candidate pool plus temporary
+lifecycle-preservation members, which remain only until flat and terminal.
 
 ## Purpose
 

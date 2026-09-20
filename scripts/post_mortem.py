@@ -43,7 +43,7 @@ SECTOR_MAP = {
     "TXN": "XLK",
     # Financials
     "ALLY": "XLF", "TFC": "XLF", "V": "XLF", "JPM": "XLF",
-    "HOOD": "XLF", "GS": "XLF", "BAC": "XLF",
+    "HOOD": "XLF", "GS": "XLF", "BAC": "XLF", "BRK.B": "XLF",
     # Communication services
     "META": "XLC", "GOOG": "XLC", "NFLX": "XLC",
     # Consumer discretionary
