@@ -77,7 +77,11 @@ class TestScanCandidates:
         )
         monkeypatch.setattr(
             "scripts.rsi_watchlist_scan.fetch_fundamentals",
-            lambda _symbol: SimpleNamespace(market_cap=25_000_000_000.0),
+            lambda _symbol: SimpleNamespace(
+                market_cap=25_000_000_000.0,
+                net_income_source=None,
+                error=None,
+            ),
         )
         monkeypatch.setattr(
             "scripts.rsi_watchlist_scan.assess_fitness",
@@ -176,12 +180,17 @@ class TestScanCandidates:
         )
         monkeypatch.setattr(
             "scripts.rsi_watchlist_scan.fetch_fundamentals",
-            lambda _symbol: SimpleNamespace(market_cap=25_000_000_000.0),
+            lambda _symbol: SimpleNamespace(
+                market_cap=25_000_000_000.0,
+                net_income_source=None,
+                error=None,
+            ),
         )
         monkeypatch.setattr(
             "scripts.rsi_watchlist_scan.assess_fitness",
             lambda _fundamentals, _profile: SimpleNamespace(
                 solvency_ok=None,
+                solvency_reason=None,
                 error=None,
             ),
         )

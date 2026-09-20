@@ -246,7 +246,7 @@ def scan_candidates(
         if include_fundamentals:
             fundamentals = fetch_fundamentals(symbol)
             market_cap = fundamentals.market_cap
-            if getattr(fundamentals, "error", None):
+            if fundamentals.error:
                 _reject(symbol, "fundamentals_error", rejections, examples)
                 if symbol in explain_symbols:
                     explanations[symbol] = _format_explanation(
@@ -281,11 +281,8 @@ def scan_candidates(
                     explanation = _format_explanation(
                         "solvency_unknown", metric, config, market_cap=market_cap
                     )
-                    reason = getattr(fitness, "solvency_reason", None) or "unknown"
-                    source = (
-                        getattr(fundamentals, "net_income_source", None)
-                        or "no approved row"
-                    )
+                    reason = fitness.solvency_reason or "unknown"
+                    source = fundamentals.net_income_source or "no approved row"
                     explanations[symbol] = (
                         f"{explanation} Solvency detail: {reason}; "
                         f"net-income source={source}."
@@ -297,7 +294,7 @@ def scan_candidates(
                     explanation = _format_explanation(
                         "solvency", metric, config, market_cap=market_cap
                     )
-                    runway = getattr(fundamentals, "cash_runway_months", None)
+                    runway = fundamentals.cash_runway_months
                     explanations[symbol] = (
                         f"{explanation} Cash runway={runway:.1f} months."
                         if runway is not None

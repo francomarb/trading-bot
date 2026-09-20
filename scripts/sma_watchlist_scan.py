@@ -497,7 +497,7 @@ def scan_candidates(
 
         if include_fundamentals:
             fundamentals = fetch_fundamentals(symbol)
-            if getattr(fundamentals, "error", None):
+            if fundamentals.error:
                 _reject(symbol, "fundamentals_error", rejections, examples)
                 if symbol in explain_symbols:
                     explanations[symbol] = _format_explanation(
@@ -551,6 +551,17 @@ def scan_candidates(
                 fitness.revenue_ok,
                 fitness.solvency_ok,
             )
+            if any(check is False for check in required_checks):
+                _reject(symbol, "fundamental_sanity", rejections, examples)
+                if symbol in explain_symbols:
+                    explanations[symbol] = _format_explanation(
+                        symbol,
+                        "fundamental_sanity",
+                        metric,
+                        relative_strength_pct,
+                        config,
+                    )
+                continue
             if any(check is None for check in required_checks):
                 _reject(symbol, "fundamental_unknown", rejections, examples)
                 if symbol in explain_symbols:
@@ -561,17 +572,6 @@ def scan_candidates(
                         relative_strength_pct,
                         config,
                         market_cap=fundamentals.market_cap,
-                    )
-                continue
-            if any(check is False for check in required_checks):
-                _reject(symbol, "fundamental_sanity", rejections, examples)
-                if symbol in explain_symbols:
-                    explanations[symbol] = _format_explanation(
-                        symbol,
-                        "fundamental_sanity",
-                        metric,
-                        relative_strength_pct,
-                        config,
                     )
                 continue
 

@@ -298,7 +298,7 @@ def scan_candidates(
         if include_fundamentals:
             fundamentals = fetch_fundamentals(symbol)
             market_cap = fundamentals.market_cap
-            if getattr(fundamentals, "error", None):
+            if fundamentals.error:
                 _reject(symbol, "fundamentals_error", rejections, examples)
                 if symbol in explain_symbols:
                     explanations[symbol] = (
@@ -332,11 +332,8 @@ def scan_candidates(
             if fitness.solvency_ok is None:
                 _reject(symbol, "solvency_unknown", rejections, examples)
                 if symbol in explain_symbols:
-                    reason = getattr(fitness, "solvency_reason", None) or "unknown"
-                    source = (
-                        getattr(fundamentals, "net_income_source", None)
-                        or "no approved row"
-                    )
+                    reason = fitness.solvency_reason or "unknown"
+                    source = fundamentals.net_income_source or "no approved row"
                     explanations[symbol] = (
                         "Rejected: solvency could not be established because "
                         f"required data is unavailable ({reason}; "
@@ -346,7 +343,7 @@ def scan_candidates(
             if fitness.solvency_ok is False:
                 _reject(symbol, "solvency", rejections, examples)
                 if symbol in explain_symbols:
-                    runway = getattr(fundamentals, "cash_runway_months", None)
+                    runway = fundamentals.cash_runway_months
                     detail = (
                         f"; calculated runway={runway:.1f} months"
                         if runway is not None

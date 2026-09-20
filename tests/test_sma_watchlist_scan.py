@@ -37,6 +37,7 @@ from scripts.sma_watchlist_scan import (
     get_open_sma_positions,
     scan_candidates,
 )
+from scripts.watchlist_review import SymbolFundamentals
 
 
 class TestCallWithRetry:
@@ -284,6 +285,35 @@ class TestFundamentalGate:
         assert candidates == []
         assert rejections == {"fundamental_unknown": 1}
         assert "fundamental_unknown" in explanations["UNKNOWN"]
+
+    def test_known_failure_takes_precedence_over_unknown_fact(self, monkeypatch):
+        monkeypatch.setattr(
+            "scripts.sma_watchlist_scan._compute_metrics",
+            lambda _symbol, _df, _config: _metric(),
+        )
+        monkeypatch.setattr(
+            "scripts.sma_watchlist_scan.fetch_fundamentals",
+            lambda _symbol: SymbolFundamentals(
+                symbol="FAILED",
+                market_cap=25_000_000_000.0,
+                fcf_annual=-1.0,
+                revenue_growth_pct=None,
+                is_profitable=True,
+            ),
+        )
+
+        candidates, rejections, _examples, explanations = scan_candidates(
+            [AssetInfo("FAILED", "Known Failure", "NYSE")],
+            {"FAILED": pd.DataFrame({"close": [100.0]})},
+            config=ScanConfig(),
+            include_fundamentals=True,
+            top=1,
+            explain_symbols={"FAILED"},
+        )
+
+        assert candidates == []
+        assert rejections == {"fundamental_sanity": 1}
+        assert "fundamental_sanity" in explanations["FAILED"]
 
 
 # ── Open-position protection (trade-DB query) ────────────────────────────────

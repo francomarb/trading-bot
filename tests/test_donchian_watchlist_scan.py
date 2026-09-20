@@ -231,12 +231,18 @@ class TestDonchianSelection:
         )
         monkeypatch.setattr(
             "scripts.donchian_watchlist_scan.fetch_fundamentals",
-            lambda _symbol: SimpleNamespace(market_cap=20_000_000_000.0),
+            lambda _symbol: SimpleNamespace(
+                market_cap=20_000_000_000.0,
+                net_income_source=None,
+                error=None,
+            ),
         )
         monkeypatch.setattr(
             "scripts.donchian_watchlist_scan.assess_fitness",
             lambda _fundamentals, _profile: SimpleNamespace(
-                solvency_ok=None, error=None
+                solvency_ok=None,
+                solvency_reason=None,
+                error=None,
             ),
         )
 
@@ -262,7 +268,7 @@ class TestDonchianSelection:
         )
         monkeypatch.setattr(
             "scripts.donchian_watchlist_scan.fetch_fundamentals",
-            lambda _symbol: SimpleNamespace(market_cap=None),
+            lambda _symbol: SimpleNamespace(market_cap=None, error=None),
         )
 
         candidates, rejections, _examples, explanations = scan_candidates(

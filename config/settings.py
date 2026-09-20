@@ -593,8 +593,8 @@ DONCHIAN_WATCHLIST = [
     "TXN", "IREN", "CVX", "GLW", "MA", "SMCI", "COIN", "SNOW", "VRT", "C",
     "MRK", "ADI", "KO", "GE", "UBER", "ADBE", "CRDO", "RKLB", "INTU", "PG",
     "HD", "ALAB", "ABBV", "WFC", "T", "SHOP", "BA", "ANET", "TMO", "MCD",
-    "NU", "BKNG", "CRCL", "AAL", "AAOI", "HPE", "TER", "MS", "AMGN", "PEP",
-    "DDOG", "VZ", "ABT", "ACN", "RDDT", "PATH", "SOFI", "NET", "ISRG",
+    "NU", "BKNG", "ISRG", "CRCL", "AAL", "AAOI", "HPE", "TER", "MS", "AMGN",
+    "PEP", "DDOG", "VZ", "ABT", "ACN", "RDDT", "PATH", "SOFI", "NET",
     # Temporary lifecycle-preservation member from the pre-refresh universe.
     "SPCX",
 ]

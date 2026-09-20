@@ -279,6 +279,13 @@ approval.
   design remains under `11.71`.
 - No automatic watchlist promotion or bot recycle.
 
+Known non-blocking provenance limitation: `net_income_source` records the
+selected Yahoo statement row but not the fiscal-period column. The helper can
+use an older finite annual value when the newest column is unavailable, so a
+future provenance-only enhancement should carry that period alongside the row.
+This does not alter the current profitability result or scanner eligibility and
+does not block closing `11.72` after operational verification.
+
 ## Acceptance Recommendation
 
 Approve the contract above, then implement Phases A and B in one focused PR.
@@ -298,6 +305,8 @@ configured universe:
   uses a non-passing `UNKNOWN` verdict for unavailable required facts;
 - RSI, Donchian, and SMA now separate provider errors, unavailable facts, and
   affirmative threshold failures;
+- SMA gives an affirmative required-check failure precedence over a concurrent
+  unavailable fact, matching the standalone verdict contract;
 - SMA eligibility no longer depends on a display verdict string; and
 - the historical RSI builder now requires affirmative solvency.
 
@@ -333,9 +342,9 @@ check, not the committed report.
 
 Validation:
 
-- focused fundamentals/scanner/watchlist tests after promotion: 198 passed,
+- focused fundamentals/scanner/watchlist tests after review fixes: 199 passed,
   one existing warning;
-- full suite after promotion: 3,857 passed, five existing numerical warnings;
+- full suite after review fixes: 3,858 passed, five existing numerical warnings;
   and
 - generated reports contain no `solvency_unknown` or `fundamentals_error`
   rejection in this successful provider run. AZO remains honestly reported as

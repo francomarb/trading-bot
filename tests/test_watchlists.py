@@ -108,7 +108,7 @@ class TestDonchianWatchlistPromotion:
             : settings.DONCHIAN_TARGET_POOL_SIZE
         ]
 
-        assert "ISRG" in ranked_pool
+        assert ranked_pool.index("ISRG") == 83
         assert "LIN" not in ranked_pool
 
     def test_post_mortem_uses_dynamic_sector_resolution_for_generated_names(self):
