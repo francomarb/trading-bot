@@ -39,7 +39,10 @@ Recommendation: approve a staged implementation that first establishes safety
 ordering and telemetry, then adds atomic cache contracts and explicit prewarming,
 then changes scheduling and eliminates redundant daily/API work. Keep execution
 settlement latency as a separately measured subproblem rather than hiding it in a
-generic cache change.
+generic cache change. The implementation should reuse Alpaca's native multi-symbol
+bar requests, its official trade-update stream, Python's atomic file replacement,
+and established TTL/locking utilities rather than creating parallel versions of
+those facilities.
 
 ## 2. Evidence and baseline
 
@@ -136,7 +139,7 @@ No production cache was altered for these probes.
 |---|---|---|---|---|
 | Broker snapshot, orders, positions | Alpaca trading API; broker identifiers | Startup and every cycle; broker client semantics | Broker is authoritative; failures skip decisions | Correct safety source, but it is reached only after pre-engine sector hydration during startup |
 | Sector classification | Yahoo metadata; JSON keyed only by broker symbol, with manual overrides first | No TTL or provider/schema version; two nominal retries; configured timeout unused | Whole JSON written directly after full loop; corrupt JSON becomes empty cache; missing sector degrades filters to unmapped/neutral behavior | Unbounded startup dependency, stale forever, and loses partial progress |
-| OHLCV bars | Alpaca data API; `(feed, symbol, timeframe, adjustment)` Parquet plus coverage JSON | Latest interval deliberately re-fetched; five attempts for 429/5xx/built-in connection/timeout errors; 30 s HTTP default | Per-symbol progress survives; Parquet then metadata are direct writes; no lock; bad metadata triggers refetch, bad Parquet raises | Provenance key is good; atomicity, retry budget, exception coverage, and refresh policy need work |
+| OHLCV bars | Alpaca data API; `(feed, symbol, timeframe, adjustment)` Parquet plus coverage JSON | Latest interval deliberately re-fetched; a local five-attempt wrapper sits outside alpaca-py's own 429/504 retry loop; 30 s HTTP default | Per-symbol progress survives; Parquet then metadata are direct writes; no lock; bad metadata triggers refetch, bad Parquet raises | Provenance key is good; nested retries can multiply latency, while native multi-symbol requests are unused |
 | Regime SPY | OHLCV cache plus in-memory SPY/regime result | 600 s TTL; failure advances TTL and reuses stale data; cold failure blocks entries | Memory only; restart cold; no maximum stale age | Safe cold posture, but stale age and retry suppression are not explicit enough |
 | Sector ETF gauge | OHLCV cache plus per-ETF and per-score memory caches | 600 s TTL; stale reused after failure and TTL reset | Memory only; cold failure returns neutral | Lazy calls can enter the symbol loop; no age ceiling or provenance in the decision record |
 | Earnings blackout | Yahoo `info`, `calendar`, and `earnings_dates`; per-filter-instance symbol/date cache | Once per calendar day per strategy instance; no explicit timeout/retry | Memory only; duplicate work across SMA/Donchian; failure allows entry | A large synchronous daily burst is proven in logs; restart repeats it |
@@ -197,7 +200,11 @@ Introduce a run-scoped market-data coordinator keyed by
 `(feed, symbol, timeframe, adjustment, decision_cutoff)`:
 
 - compute the latest *completed* decision bar once per timeframe/session;
-- prewarm all required keys in bounded batches before the entry scan;
+- prewarm required keys with Alpaca's native multi-symbol
+  `StockBarsRequest.symbol_or_symbols` in bounded chunks grouped by identical
+  feed, timeframe, adjustment, and missing range;
+- split each batch response back into the existing per-symbol cache keys so one
+  missing/bad symbol cannot invalidate the other symbols' durable progress;
 - return one immutable frame/snapshot to every consumer during that cycle;
 - share SPY, sector ETFs, leveraged signal assets, and overlapping symbols;
 - refresh daily strategies once when a new completed daily session is available,
@@ -205,10 +212,11 @@ Introduce a run-scoped market-data coordinator keyed by
 - continue refreshing the SPY 5-minute option signal on its five-minute boundary;
 - never reuse a live quote or option snapshot as historical decision truth.
 
-The coordinator should report cache hit, API range count, rows, age, provider
-latency, and stale/fallback status per key. Concurrency may be added only after
-per-key single-writer locks and atomic writes exist; begin with small bounded
-batches and an explicit Alpaca rate budget.
+The coordinator should report cache hit, API range count, batch size, rows, age,
+provider latency, and stale/fallback status per key. Do not build a parallel
+per-symbol HTTP worker fleet while Alpaca's batch request covers the use case.
+Additional concurrency may be considered only after batching is measured and
+per-key single-writer locks and atomic writes exist.
 
 ### 4.4 Durable cache contract
 
@@ -233,6 +241,14 @@ For small JSON caches:
 - move earnings and IV series to bounded durable caches so restart does not
   recreate a market-open Yahoo burst.
 
+Use established primitives for the generic pieces: Python `os.replace()` for
+same-filesystem atomic replacement, `cachetools.TTLCache` for uncomplicated
+in-memory TTL caches, and a maintained cross-process file-lock package if live
+and research processes must share a writable cache root. Any imported package
+must be declared directly and pinned; the current transitive availability of
+`cachetools` or `tenacity` is not a dependency contract. Prefer separate
+single-writer cache roots where that removes the need for locking entirely.
+
 Changing an entry gate's fail-open/fail-closed meaning is outside this work.
 Cache hardening must preserve current strategy semantics unless a separate
 strategy review approves a change.
@@ -251,6 +267,15 @@ Create one provider-policy layer rather than scattered timeout patches:
   the same provider failure;
 - cap a prewarm batch and carry unfinished flat symbols to a later cycle.
 
+Before adding any wrapper retry, account for the provider SDK's behavior. The
+installed alpaca-py client already retries HTTP 429 and 504 responses internally;
+the current outer five-attempt fetcher loop can therefore multiply attempts and
+elapsed time. Prefer the supported SDK retry contract, with one outer *elapsed
+deadline/circuit-breaker* boundary only where the SDK does not supply the needed
+failure behavior. A generic retry helper may be used for idempotent reads, but
+must never blindly retry order submission. Mutating broker calls continue to use
+`client_order_id` plus broker reconciliation.
+
 ### 4.6 Non-overlapping fixed-rate scheduling
 
 Retain a single engine thread and prohibit overlapping cycles. Replace the
@@ -264,6 +289,14 @@ post-cycle fixed delay with monotonic scheduled starts:
   `overrun`, `skipped_ticks`, and `next_scheduled_start`;
 - include post-cycle hook time in start-to-start telemetry even if it remains
   outside core cycle duration.
+
+These are standard scheduler semantics (`max_instances=1`, coalesce missed runs,
+and apply a misfire deadline), but the critical engine does not need a general
+job scheduler to obtain them. Prefer a small, directly tested monotonic-deadline
+loop so shutdown, operator commands, lifecycle state, and ordering stay on the
+existing engine thread. APScheduler is suitable for non-critical reports or
+prewarm jobs if persistent scheduling later becomes necessary; do not introduce
+it into the order-management path merely to replace a few deadline calculations.
 
 For example, a cycle starting at 09:30 and ending at 09:37 would skip the 09:35
 tick and next start at 09:40, not 09:42 and not immediately at 09:37.
@@ -295,9 +328,12 @@ This is the highest-value, lowest-semantic-change step.
 ### PR B — atomic caches and prewarm coordinator
 
 - Add atomic/versioned bar and JSON persistence plus corrupt-pair quarantine.
-- Add per-key single-writer protection.
+- Add per-key single-writer protection with a maintained lock primitive, or
+  isolate writable cache roots so cross-process locking is unnecessary.
 - Add durable sector, earnings, and IV freshness records.
-- Add completed-bar keys, shared run-scoped snapshots, and bounded prewarm.
+- Add completed-bar keys, shared run-scoped snapshots, and bounded Alpaca-native
+  multi-symbol prewarm.
+- Remove nested retry multiplication and enforce provider-level elapsed budgets.
 - Preserve every existing strategy gate and feed choice.
 
 ### PR C — cadence and redundant-request removal
@@ -333,3 +369,29 @@ Before enabling the completed behavior in regular paper hours:
 8. only then enable normal entry operation.
 
 The Donchian ranked pool remains capped at 100 throughout this work.
+
+## 7. Reuse boundaries and primary references
+
+The design intentionally distinguishes generic infrastructure from trading
+policy:
+
+- Alpaca `StockBarsRequest` supports a symbol or list of symbols:
+  <https://alpaca.markets/sdks/python/api_reference/data/stock/requests.html>.
+- Alpaca's official `TradingStream` supplies account trade updates:
+  <https://alpaca.markets/sdks/python/api_reference/trading/stream.html>.
+- Alpaca order requests expose `client_order_id` for caller identity and
+  reconciliation:
+  <https://alpaca.markets/sdks/python/api_reference/trading/requests.html>.
+- APScheduler documents single-instance jobs, missed-start deadlines, and
+  coalescing; these define the desired semantics even if the critical loop
+  remains local:
+  <https://apscheduler.readthedocs.io/en/master/userguide.html>.
+- Python documents same-filesystem `os.replace()` as atomic:
+  <https://docs.python.org/3.12/library/os.html#os.replace>.
+- Retry/backoff requires bounded attempts and idempotent operations:
+  <https://docs.aws.amazon.com/wellarchitected/latest/framework/rel_mitigate_interaction_failure_limit_retries.html>.
+
+The remaining custom logic is necessarily domain-specific: completed-market-bar
+cutoffs, IEX/SIP provenance, per-strategy stale/fallback policy, position-to-slot
+ownership, and lifecycle reconciliation. Those rules cannot be delegated to a
+generic cache or scheduler without losing trading semantics.
