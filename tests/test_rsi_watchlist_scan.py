@@ -77,7 +77,11 @@ class TestScanCandidates:
         )
         monkeypatch.setattr(
             "scripts.rsi_watchlist_scan.fetch_fundamentals",
-            lambda _symbol: SimpleNamespace(market_cap=25_000_000_000.0),
+            lambda _symbol: SimpleNamespace(
+                market_cap=25_000_000_000.0,
+                net_income_source=None,
+                error=None,
+            ),
         )
         monkeypatch.setattr(
             "scripts.rsi_watchlist_scan.assess_fitness",
@@ -176,26 +180,95 @@ class TestScanCandidates:
         )
         monkeypatch.setattr(
             "scripts.rsi_watchlist_scan.fetch_fundamentals",
-            lambda _symbol: SimpleNamespace(market_cap=25_000_000_000.0),
+            lambda _symbol: SimpleNamespace(
+                market_cap=25_000_000_000.0,
+                net_income_source=None,
+                error=None,
+            ),
         )
         monkeypatch.setattr(
             "scripts.rsi_watchlist_scan.assess_fitness",
             lambda _fundamentals, _profile: SimpleNamespace(
                 solvency_ok=None,
+                solvency_reason=None,
                 error=None,
             ),
         )
 
-        candidates, rejections, _examples, _explanations = scan_candidates(
+        candidates, rejections, _examples, explanations = scan_candidates(
             [AssetInfo("UNKNOWN", "Unknown Solvency", "NYSE")],
             {"UNKNOWN": pd.DataFrame({"close": [120.0]})},
             config=ScanConfig(),
             include_fundamentals=True,
             top=10,
+            explain_symbols={"UNKNOWN"},
         )
 
         assert candidates == []
-        assert rejections["solvency"] == 1
+        assert rejections == {"solvency_unknown": 1}
+        assert "required data is unavailable" not in explanations["UNKNOWN"]
+        assert "Solvency detail: unknown" in explanations["UNKNOWN"]
+
+    def test_unknown_market_cap_is_not_reported_as_below_threshold(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "scripts.rsi_watchlist_scan._compute_metrics",
+            lambda _df, _config: _passing_metric(),
+        )
+        monkeypatch.setattr(
+            "scripts.rsi_watchlist_scan.fetch_fundamentals",
+            lambda _symbol: SimpleNamespace(market_cap=None, error=None),
+        )
+
+        candidates, rejections, _examples, explanations = scan_candidates(
+            [AssetInfo("UNKNOWN", "Unknown Market Cap", "NYSE")],
+            {"UNKNOWN": pd.DataFrame({"close": [120.0]})},
+            config=ScanConfig(),
+            include_fundamentals=True,
+            top=10,
+            explain_symbols={"UNKNOWN"},
+        )
+
+        assert candidates == []
+        assert rejections == {"market_cap_unknown": 1}
+        assert "Rejected: market_cap_unknown" in explanations["UNKNOWN"]
+
+    def test_known_short_runway_is_solvency_failure(self, monkeypatch):
+        monkeypatch.setattr(
+            "scripts.rsi_watchlist_scan._compute_metrics",
+            lambda _df, _config: _passing_metric(),
+        )
+        fundamentals = SimpleNamespace(
+            market_cap=25_000_000_000.0,
+            cash_runway_months=6.0,
+            error=None,
+        )
+        monkeypatch.setattr(
+            "scripts.rsi_watchlist_scan.fetch_fundamentals",
+            lambda _symbol: fundamentals,
+        )
+        monkeypatch.setattr(
+            "scripts.rsi_watchlist_scan.assess_fitness",
+            lambda _fundamentals, _profile: SimpleNamespace(
+                solvency_ok=False,
+                solvency_reason="runway_insufficient",
+                error=None,
+            ),
+        )
+
+        candidates, rejections, _examples, explanations = scan_candidates(
+            [AssetInfo("SHORT", "Short Runway", "NYSE")],
+            {"SHORT": pd.DataFrame({"close": [120.0]})},
+            config=ScanConfig(),
+            include_fundamentals=True,
+            top=10,
+            explain_symbols={"SHORT"},
+        )
+
+        assert candidates == []
+        assert rejections == {"solvency": 1}
+        assert "Cash runway=6.0 months" in explanations["SHORT"]
 
     def test_alphabet_policy_preserves_goog_and_excludes_googl(self, monkeypatch):
         metrics = {

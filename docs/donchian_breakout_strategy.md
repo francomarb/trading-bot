@@ -3,7 +3,7 @@
 **Status:** ✅ **PAPER ACTIVE** — wired in `forward_test.py` since 2026-05-01.
 Built as the successor analysis to [bollinger_squeeze_universe_research.md](bollinger_squeeze_universe_research.md).
 
-**Last updated:** 2026-08-12
+**Last updated:** 2026-09-20
 
 ---
 
@@ -42,7 +42,7 @@ low exit only triggers when the trend genuinely fails.
 | Max positions | **8** (`STRATEGY_ALLOCATIONS["donchian_breakout"]["hard_max_positions"]`) — *doc said 5 until 2026-08-18* |
 | ATR stop | 2× ATR (engine's `ATR_STOP_MULTIPLIER`) |
 | HWM drawdown gate | Live (and opt-in mature paper): entries pause if cumulative realized P&L drops >15% of sleeve budget below peak; default paper reports the breach without pausing |
-| Universe | `DONCHIAN_WATCHLIST` — 100 durable-liquidity candidates plus protected open holdings; refreshed 2026-09-19 |
+| Universe | `DONCHIAN_WATCHLIST` — 100 durable-liquidity candidates plus protected open holdings; refreshed 2026-09-19 and parser-corrected 2026-09-20 |
 
 **Capital math at $100k equity** *(from `config/settings.py`, 2026-08-29):*
 
@@ -72,10 +72,12 @@ low exit only triggers when the trend genuinely fails.
 ## Watchlist selection
 
 The active procedure is [`donchian-watchlist-selection.md`](donchian-watchlist-selection.md).
-As of 2026-09-19, the paper universe is the first 100 companies produced by the
-durable-liquidity selector plus any protected open holdings. Membership uses
-price, delayed-SIP dollar liquidity, company size, and affirmative solvency;
-temporary trend state and historical Donchian outcomes are diagnostics only.
+The paper universe is the first 100 companies produced by the 2026-09-19
+durable-liquidity selector plus any protected open holdings. On 2026-09-20,
+the shared profitability-row correction admitted ISRG at rank 84 and displaced
+LIN at rank 101. Membership uses price, delayed-SIP dollar liquidity, company
+size, and affirmative solvency; temporary trend state and historical Donchian
+outcomes are diagnostics only.
 
 The material below preserves the **retired manual-universe research** that
 selected the original 32-name AI/Big-Tech basket. It remains necessary for
@@ -118,7 +120,9 @@ thin. Reconsider in 2026 Q1.*
 This table preserves the universe used for the original research results below;
 it is not the active runtime list. The active generated snapshot lives in
 `config/settings.py` as `DONCHIAN_WATCHLIST` and its auditable source report is
-`docs/reports/donchian_watchlist_scan_latest.md`.
+`docs/reports/donchian_watchlist_scan_11_72_candidate.md` for the corrected
+ranked boundary (the pre-correction snapshot remains in
+`docs/reports/donchian_watchlist_scan_latest.md`).
 
 #### Category 1 — AI / Semiconductors (primary, 9 names)
 The core thesis: AI training and inference hardware; highest-conviction names.

@@ -1,14 +1,24 @@
 # RSI Watchlist Selection And Refresh
 
-**Status:** Active procedure; v3 pool promoted 2026-09-09.
+**Status:** Active procedure; v3 pool promoted 2026-09-09 and narrowly
+corrected 2026-09-20.
 
 **Rule version:** `rsi_watchlist_v3_durable_company_pool`
 
 **Target:** 50 ranked opportunity candidates, plus any temporarily protected
 symbols with open RSI positions.
 
-The current runtime list is the report's 50 candidates plus ABNB and CCK,
-which were open at promotion time and remain only until flat and terminal.
+**Approved correction:** BRK.B replaces BAC in the ranked 50. On the frozen
+2026-09-09 promotion window, resolving Yahoo's `BRK.B`/`BRK-B` boundary placed
+BRK.B around rank 42 and moved BAC from rank 50 to 51. The displaced boundary
+member remains temporarily after the ranked pool where required for lifecycle
+protection. The broader current-snapshot
+proposal in `docs/reports/rsi_watchlist_scan_11_72_candidate.md` was not
+promoted: COHR/JNJ versus COST/GLW/TXN was ordinary liquidity drift too soon
+after promotion.
+
+The current runtime list is the corrected 50-candidate pool plus temporary
+lifecycle-preservation members, which remain only until flat and terminal.
 
 ## Purpose
 
@@ -74,6 +84,12 @@ The scanner requires only:
 - 50-day average dollar volume at least $50 million;
 - market capitalization at least $2 billion and affirmatively established
   solvency when `--include-fundamentals` is used.
+
+Fundamentals fail closed per field. The shared parser uses Yahoo's exact
+`Net Income` row first and `Net Income Common Stockholders` as the only approved
+fallback. Provider errors, unavailable market cap, unavailable solvency facts,
+and a known sub-12-month runway are reported as distinct rejection reasons;
+missing data is never described as a failed financial threshold.
 
 Eligible companies are ordered by 50-day average dollar volume. This is an
 execution-quality priority, not a return forecast. To keep Yahoo lookups

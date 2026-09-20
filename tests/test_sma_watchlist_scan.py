@@ -16,8 +16,10 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import pandas as pd
 import pytest
 from requests.exceptions import ReadTimeout
 
@@ -26,13 +28,16 @@ from scripts.sma_watchlist_scan import (
     REJECTION_LABELS,
     RULE_VERSION,
     ScanConfig,
+    AssetInfo,
     _call_with_retry,
     _first_technical_rejection,
     _hydrate_industry_cache,
     _is_biotech_industry,
     _normalize_company_name,
     get_open_sma_positions,
+    scan_candidates,
 )
+from scripts.watchlist_review import SymbolFundamentals
 
 
 class TestCallWithRetry:
@@ -240,6 +245,75 @@ class TestFirstTechnicalRejectionV2:
 
     def test_atr_too_high_gate(self):
         assert _first_technical_rejection(_metric(atr_pct=0.10), self.cfg) == "atr_too_high"
+
+
+class TestFundamentalGate:
+    def test_unknown_required_fact_is_rejected_without_using_verdict(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "scripts.sma_watchlist_scan._compute_metrics",
+            lambda _symbol, _df, _config: _metric(),
+        )
+        monkeypatch.setattr(
+            "scripts.sma_watchlist_scan.fetch_fundamentals",
+            lambda _symbol: SimpleNamespace(
+                market_cap=25_000_000_000.0,
+                error=None,
+            ),
+        )
+        monkeypatch.setattr(
+            "scripts.sma_watchlist_scan.assess_fitness",
+            lambda _fundamentals, _profile: SimpleNamespace(
+                fcf_ok=True,
+                revenue_ok=None,
+                solvency_ok=True,
+                verdict="✅ GOOD FIT",
+                error=None,
+            ),
+        )
+
+        candidates, rejections, _examples, explanations = scan_candidates(
+            [AssetInfo("UNKNOWN", "Unknown Fundamentals", "NYSE")],
+            {"UNKNOWN": pd.DataFrame({"close": [100.0]})},
+            config=ScanConfig(),
+            include_fundamentals=True,
+            top=1,
+            explain_symbols={"UNKNOWN"},
+        )
+
+        assert candidates == []
+        assert rejections == {"fundamental_unknown": 1}
+        assert "fundamental_unknown" in explanations["UNKNOWN"]
+
+    def test_known_failure_takes_precedence_over_unknown_fact(self, monkeypatch):
+        monkeypatch.setattr(
+            "scripts.sma_watchlist_scan._compute_metrics",
+            lambda _symbol, _df, _config: _metric(),
+        )
+        monkeypatch.setattr(
+            "scripts.sma_watchlist_scan.fetch_fundamentals",
+            lambda _symbol: SymbolFundamentals(
+                symbol="FAILED",
+                market_cap=25_000_000_000.0,
+                fcf_annual=-1.0,
+                revenue_growth_pct=None,
+                is_profitable=True,
+            ),
+        )
+
+        candidates, rejections, _examples, explanations = scan_candidates(
+            [AssetInfo("FAILED", "Known Failure", "NYSE")],
+            {"FAILED": pd.DataFrame({"close": [100.0]})},
+            config=ScanConfig(),
+            include_fundamentals=True,
+            top=1,
+            explain_symbols={"FAILED"},
+        )
+
+        assert candidates == []
+        assert rejections == {"fundamental_sanity": 1}
+        assert "fundamental_sanity" in explanations["FAILED"]
 
 
 # ── Open-position protection (trade-DB query) ────────────────────────────────

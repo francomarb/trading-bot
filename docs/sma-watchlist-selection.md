@@ -403,3 +403,10 @@ rule version, but should still be noted in implementation docs.
   returns tend to outperform over intermediate horizons.
 - Existing project rule: SMA requires positive FCF, revenue growth, and solvency
   checks from `scripts/watchlist_review.py`.
+
+Every required SMA fundamental must be affirmatively available and passing.
+The scanner evaluates the structured FCF, revenue, and solvency results rather
+than the standalone report's display verdict. Provider errors and unavailable
+required facts fail closed with distinct reasons. Profitability uses Yahoo's
+exact `Net Income` row first and `Net Income Common Stockholders` as the only
+approved fallback.

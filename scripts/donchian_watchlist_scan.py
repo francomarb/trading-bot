@@ -91,7 +91,9 @@ REJECTION_LABELS: dict[str, str] = {
     "dollar_volume": "50-day average dollar volume is below the threshold.",
     "market_cap": "Market capitalization is below the minimum size threshold.",
     "market_cap_unknown": "Market capitalization could not be established.",
-    "solvency": "Solvency was not affirmatively established.",
+    "fundamentals_error": "The fundamentals provider request failed.",
+    "solvency_unknown": "Profitability or required cash data was unavailable.",
+    "solvency": "Known cash runway is below the strategy minimum.",
     "nonpreferred_share_class": "Use GOOG for Alphabet exposure, never GOOGL.",
 }
 
@@ -296,6 +298,13 @@ def scan_candidates(
         if include_fundamentals:
             fundamentals = fetch_fundamentals(symbol)
             market_cap = fundamentals.market_cap
+            if fundamentals.error:
+                _reject(symbol, "fundamentals_error", rejections, examples)
+                if symbol in explain_symbols:
+                    explanations[symbol] = (
+                        "Rejected: the fundamentals provider request failed."
+                    )
+                continue
             if market_cap is None:
                 _reject(symbol, "market_cap_unknown", rejections, examples)
                 if symbol in explain_symbols:
@@ -313,12 +322,36 @@ def scan_candidates(
                     )
                 continue
             fitness = assess_fitness(fundamentals, DONCHIAN_PROFILE)
-            if fitness.solvency_ok is not True or fitness.error:
-                _reject(symbol, "solvency", rejections, examples)
+            if fitness.error:
+                _reject(symbol, "fundamentals_error", rejections, examples)
                 if symbol in explain_symbols:
                     explanations[symbol] = (
-                        "Rejected: solvency could not be affirmatively established "
-                        "under the profitable-or-12-month-runway rule."
+                        "Rejected: the fundamentals provider request failed."
+                    )
+                continue
+            if fitness.solvency_ok is None:
+                _reject(symbol, "solvency_unknown", rejections, examples)
+                if symbol in explain_symbols:
+                    reason = fitness.solvency_reason or "unknown"
+                    source = fundamentals.net_income_source or "no approved row"
+                    explanations[symbol] = (
+                        "Rejected: solvency could not be established because "
+                        f"required data is unavailable ({reason}; "
+                        f"net-income source={source})."
+                    )
+                continue
+            if fitness.solvency_ok is False:
+                _reject(symbol, "solvency", rejections, examples)
+                if symbol in explain_symbols:
+                    runway = fundamentals.cash_runway_months
+                    detail = (
+                        f"; calculated runway={runway:.1f} months"
+                        if runway is not None
+                        else ""
+                    )
+                    explanations[symbol] = (
+                        "Rejected: known cash runway is below the 12-month "
+                        f"minimum{detail}."
                     )
                 continue
         asset = asset_by_symbol.get(symbol, AssetInfo(symbol, symbol, "UNKNOWN"))

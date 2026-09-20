@@ -38,11 +38,12 @@ Data source:  Yahoo Finance via yfinance (annual financials, ~1-quarter lag).
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import pandas as pd
 import yfinance as yf
@@ -58,6 +59,20 @@ MIN_SMA_CASH_RUNWAY_MONTHS: int = 18
 
 MIN_RSI_CASH_RUNWAY_MONTHS: int = 12
 """Unprofitable companies must have at least this many months of cash runway for RSI."""
+
+NET_INCOME_ROWS: tuple[str, ...] = (
+    "Net Income",
+    "Net Income Common Stockholders",
+)
+"""Ordered Yahoo annual rows approved for the profitability fact."""
+
+SolvencyReason = Literal[
+    "profitable",
+    "runway_sufficient",
+    "runway_insufficient",
+    "profitability_unknown",
+    "cash_unknown_for_unprofitable_company",
+]
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -102,6 +117,8 @@ class SymbolFundamentals:
     market_cap: Optional[float] = None          # Market capitalization, $
     fcf_annual: Optional[float] = None          # Annual free cash flow, $
     revenue_growth_pct: Optional[float] = None  # YoY revenue growth, %
+    net_income_annual: Optional[float] = None   # Selected annual net income, $
+    net_income_source: Optional[str] = None     # Exact Yahoo row used
     is_profitable: Optional[bool] = None        # Net income > 0
     cash_runway_months: Optional[float] = None  # Only set when unprofitable
 
@@ -123,6 +140,7 @@ class StrategyFitness:
     fcf_ok: Optional[bool] = None
     revenue_ok: Optional[bool] = None
     solvency_ok: Optional[bool] = None
+    solvency_reason: Optional[SolvencyReason] = None
     error: Optional[str] = None
 
     @property
@@ -130,8 +148,8 @@ class StrategyFitness:
         """Compute verdict from check results and profile requirements."""
         if self.error:
             return "⚠️  ERROR"
-        # Determine if any required check fails or solvency fails
-        required_failed = False
+        required_failed = self.solvency_ok is False
+        required_unknown = self.solvency_ok is None
         optional_failed = False
 
         # FCF check
@@ -140,6 +158,8 @@ class StrategyFitness:
                 required_failed = True
             else:
                 optional_failed = True
+        elif self.fcf_ok is None and self.fcf_required:
+            required_unknown = True
 
         # Revenue check
         if self.revenue_ok is False:
@@ -147,13 +167,13 @@ class StrategyFitness:
                 required_failed = True
             else:
                 optional_failed = True
-
-        # Solvency is always required
-        if self.solvency_ok is False:
-            required_failed = True
+        elif self.revenue_ok is None and self.revenue_required:
+            required_unknown = True
 
         if required_failed:
             return "❌ POOR FIT"
+        if required_unknown:
+            return "⚠️  UNKNOWN"
         if optional_failed:
             return "⚠️  MARGINAL"
         return "✅ GOOD FIT"
@@ -203,15 +223,40 @@ def assess_fitness(
     # Solvency check
     if fundamentals.is_profitable is True:
         fitness.solvency_ok = True
+        fitness.solvency_reason = "profitable"
     elif fundamentals.cash_runway_months is not None:
         fitness.solvency_ok = (
             fundamentals.cash_runway_months >= profile.min_cash_runway_months
         )
+        fitness.solvency_reason = (
+            "runway_sufficient" if fitness.solvency_ok else "runway_insufficient"
+        )
+    elif fundamentals.is_profitable is False:
+        fitness.solvency_reason = "cash_unknown_for_unprofitable_company"
+    else:
+        fitness.solvency_reason = "profitability_unknown"
 
     return fitness
 
 
 # ── Data fetching ─────────────────────────────────────────────────────────────
+
+
+def _row_latest_with_source(
+    df: pd.DataFrame, *keys: str
+) -> tuple[Optional[float], Optional[str]]:
+    """Return the newest finite value and exact row selected from ordered keys."""
+    for key in keys:
+        if key not in df.index:
+            continue
+        for raw_value in df.loc[key].dropna():
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                return value, key
+    return None, None
 
 
 def _row_latest(df: pd.DataFrame, *keys: str) -> Optional[float]:
@@ -222,12 +267,8 @@ def _row_latest(df: pd.DataFrame, *keys: str) -> Optional[float]:
     ordered most-recent first.  Returns the raw float value (dollars) or None
     if no matching key is found or all values are NaN.
     """
-    for key in keys:
-        if key in df.index:
-            series = df.loc[key].dropna()
-            if not series.empty:
-                return float(series.iloc[0])
-    return None
+    value, _source = _row_latest_with_source(df, *keys)
+    return value
 
 
 def fetch_fundamentals(symbol: str) -> SymbolFundamentals:
@@ -276,7 +317,11 @@ def fetch_fundamentals(symbol: str) -> SymbolFundamentals:
                     result.revenue_growth_pct = (r_now - r_prior) / abs(r_prior) * 100
 
         # ── Solvency (cash runway for unprofitable companies) ─────────────────
-        net_income = _row_latest(inc, "Net Income")
+        net_income, net_income_source = _row_latest_with_source(
+            inc, *NET_INCOME_ROWS
+        )
+        result.net_income_annual = net_income
+        result.net_income_source = net_income_source
         cash = _row_latest(
             bs,
             "Cash Cash Equivalents And Short Term Investments",
@@ -307,9 +352,10 @@ def _mapping_float(obj, key: str) -> Optional[float]:
     if value is None or pd.isna(value):
         return None
     try:
-        return float(value)
+        parsed = float(value)
     except (TypeError, ValueError):
         return None
+    return parsed if math.isfinite(parsed) else None
 
 
 # ── Report formatting ─────────────────────────────────────────────────────────
@@ -477,7 +523,12 @@ def format_report(
                             sol_str = f"insufficient (≥ {fitness.min_cash_runway_months} required)"
                         lines.append(f"- Solvency: {StrategyFitness._chk(False)} {sol_str}")
                     else:
-                        lines.append(f"- Solvency: {StrategyFitness._chk(None)} N/A")
+                        reason = fitness.solvency_reason or "unknown"
+                        source = fundamentals.net_income_source or "no approved row"
+                        lines.append(
+                            f"- Solvency: {StrategyFitness._chk(None)} N/A "
+                            f"({reason}; net-income source: {source})"
+                        )
 
                 lines.append("")
 
@@ -486,6 +537,7 @@ def format_report(
     good_count = sum(1 for f in all_fitness if f.verdict == "✅ GOOD FIT")
     poor_count = sum(1 for f in all_fitness if f.verdict == "❌ POOR FIT")
     marginal_count = sum(1 for f in all_fitness if f.verdict == "⚠️  MARGINAL")
+    unknown_count = sum(1 for f in all_fitness if f.verdict == "⚠️  UNKNOWN")
     error_count = sum(1 for f in all_fitness if f.verdict == "⚠️  ERROR")
 
     lines += [
@@ -498,6 +550,7 @@ def format_report(
         f"({len(symbol_results)} symbols × {len(profiles_seen)} strategies)",
         f"- ✅ GOOD FIT: {good_count}",
         f"- ⚠️  MARGINAL: {marginal_count}",
+        f"- ⚠️  UNKNOWN: {unknown_count}",
         f"- ❌ POOR FIT: {poor_count}",
         f"- ⚠️  ERROR: {error_count}",
         "",
@@ -505,6 +558,7 @@ def format_report(
         "",
         "- ✓ check passed  |  ✗ check failed  |  – data unavailable",
         "- ✅ GOOD FIT  = all required checks pass; optional failures are absent or N/A",
+        "- ⚠️  UNKNOWN   = at least one required check is unavailable",
         "- ⚠️  MARGINAL  = no required check fails, but an optional check is False",
         "- ❌ POOR FIT  = a required check fails, or solvency fails",
         "- ⚠️  ERROR     = data fetch failed entirely",
@@ -512,6 +566,7 @@ def format_report(
         "## Recommended Actions",
         "",
         "- ❌ POOR FIT: remove from that strategy's watchlist before Phase 10",
+        "- ⚠️  UNKNOWN: investigate provider coverage; do not treat as eligible",
         "- ⚠️  MARGINAL: acceptable for RSI reversion with reduced position size; "
         "do not add to SMA",
         "- ✅ GOOD FIT: no action required; recheck in 6 months",

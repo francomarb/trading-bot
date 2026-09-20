@@ -510,23 +510,24 @@ SMA_WATCHLIST = [
 # walk-forward, OOS-validated re-audit. See sma_crossover_optimizations.md
 # for the gating conditions before any cull is re-promoted.
 # RSI Reversion — 50-name durable-company opportunity pool promoted from the
-# 2026-09-09 v3 SIP scan. Selection uses price, dollar liquidity, company size,
+# 2026-09-09 v3 SIP scan, corrected 2026-09-20 for the previously unresolved
+# BRK.B provider symbol. Selection uses price, dollar liquidity, company size,
 # and affirmative solvency; technical state and historical RSI outcomes are
 # reference-only. Sector concentration is accepted. GOOG is the required
 # Alphabet share class; GOOGL is forbidden by the scanner contract.
 #
-# ABNB and CCK are temporarily retained after the ranked 50 because the trade
-# ledger showed open RSI positions immediately before promotion. Remove each
-# only after it is flat and terminal; they do not consume the 8-position cap.
+# Symbols after the ranked 50 are temporary lifecycle-preservation members.
+# Remove each only after it is flat and terminal; they do not consume the
+# 8-position cap.
 RSI_WATCHLIST = [
     "MU", "NVDA", "SNDK", "AAPL", "TSLA", "MSFT", "AMD", "META", "INTC",
     "AMZN", "AVGO", "GOOG", "PLTR", "MRVL", "TSM", "NBIS", "ORCL", "AMAT",
     "STX", "WDC", "BE", "DELL", "LRCX", "LLY", "ASML", "CRM", "NFLX",
     "WMT", "V", "JPM", "GEV", "CAT", "NOW", "CRWV", "KLAC", "APP", "CSCO",
-    "MRNA", "PANW", "HOOD", "XOM", "IBM", "QCOM", "UNH", "GS", "GLW",
-    "COST", "TXN", "CRWD", "BAC",
-    # Protected open-position additions outside the ranked 50.
-    "ABNB", "CCK",
+    "MRNA", "PANW", "HOOD", "XOM", "BRK.B", "IBM", "QCOM", "UNH", "GS",
+    "GLW", "COST", "TXN", "CRWD",
+    # Temporary lifecycle-preservation additions outside the ranked 50.
+    "ABNB", "CCK", "BAC",
 ]
 # Legacy/reference RSI macro-gate tolerance used by the historical
 # `scripts/rsi_filter_variant_backtest.py` SPY50 study. The active RSI3
@@ -570,8 +571,9 @@ BOLLINGER_WATCHLIST = [
     "XLC",   # Communications
 ]
 # Donchian Breakout (Turtle System 1) — IMPLEMENTED.
-# 2026-09-19 durable-liquidity refresh (`donchian_watchlist_v1`): the first
-# 100 promotion-grade candidates from the delayed-SIP report, ordered by
+# 2026-09-19 durable-liquidity refresh (`donchian_watchlist_v1`), corrected
+# 2026-09-20 for the shared profitability-row parser: the first 100
+# promotion-grade candidates from the delayed-SIP report, ordered by
 # 50-day average dollar volume. Membership uses price, liquidity, company
 # size, and affirmative solvency only. Trend state and historical Donchian
 # outcomes do not include, exclude, or rank a company. The generated cohort is
@@ -591,8 +593,8 @@ DONCHIAN_WATCHLIST = [
     "TXN", "IREN", "CVX", "GLW", "MA", "SMCI", "COIN", "SNOW", "VRT", "C",
     "MRK", "ADI", "KO", "GE", "UBER", "ADBE", "CRDO", "RKLB", "INTU", "PG",
     "HD", "ALAB", "ABBV", "WFC", "T", "SHOP", "BA", "ANET", "TMO", "MCD",
-    "NU", "BKNG", "CRCL", "AAL", "AAOI", "HPE", "TER", "MS", "AMGN", "PEP",
-    "DDOG", "VZ", "ABT", "ACN", "RDDT", "PATH", "SOFI", "NET", "LIN",
+    "NU", "BKNG", "ISRG", "CRCL", "AAL", "AAOI", "HPE", "TER", "MS", "AMGN",
+    "PEP", "DDOG", "VZ", "ABT", "ACN", "RDDT", "PATH", "SOFI", "NET",
     # Temporary lifecycle-preservation member from the pre-refresh universe.
     "SPCX",
 ]

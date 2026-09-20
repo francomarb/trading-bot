@@ -370,11 +370,17 @@ def apply_fundamental_gate(
         if snapshot is None:
             rejections["fundamental_fetch_error"] += 1
             continue
-        if snapshot.market_cap is None or snapshot.market_cap < config.min_market_cap:
+        if snapshot.market_cap is None:
+            rejections["market_cap_unknown"] += 1
+            continue
+        if snapshot.market_cap < config.min_market_cap:
             rejections["market_cap"] += 1
             continue
         if snapshot.solvency_ok is False:
             rejections["solvency"] += 1
+            continue
+        if snapshot.solvency_ok is None:
+            rejections["solvency_unknown"] += 1
             continue
 
         filtered.append(

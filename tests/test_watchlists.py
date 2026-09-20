@@ -83,6 +83,13 @@ class TestRSIWatchlistPromotion:
         assert len(settings.RSI_WATCHLIST) == len(set(settings.RSI_WATCHLIST))
         assert set(settings.RSI_WATCHLIST) <= set(SECTOR_MAP)
 
+    def test_ranked_pool_contains_provider_correction(self):
+        ranked_pool = settings.RSI_WATCHLIST[:50]
+
+        assert "BRK.B" in ranked_pool
+        assert "BAC" not in ranked_pool
+        assert SECTOR_MAP["BRK.B"] == "XLF"
+
 
 class TestDonchianWatchlistPromotion:
     def test_generated_pool_precedes_any_lifecycle_preservation_members(self):
@@ -95,6 +102,14 @@ class TestDonchianWatchlistPromotion:
         )
         assert "GOOG" in settings.DONCHIAN_WATCHLIST
         assert "GOOGL" not in settings.DONCHIAN_WATCHLIST
+
+    def test_ranked_pool_contains_profitability_parser_correction(self):
+        ranked_pool = settings.DONCHIAN_WATCHLIST[
+            : settings.DONCHIAN_TARGET_POOL_SIZE
+        ]
+
+        assert ranked_pool.index("ISRG") == 83
+        assert "LIN" not in ranked_pool
 
     def test_post_mortem_uses_dynamic_sector_resolution_for_generated_names(self):
         class _Resolver:
