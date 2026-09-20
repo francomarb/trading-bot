@@ -152,6 +152,23 @@ class TestSectorResolverYFinanceLookup:
         assert result["industry"] == "Semiconductors"
         assert result["sector"] == "Technology"
 
+    def test_normalizes_dot_class_symbol_for_yahoo(self, tmp_path):
+        resolver = SectorResolver(
+            cache_path=tmp_path / "cache.json",
+            valid_sectors=VALID_SECTORS,
+        )
+        info = self._make_info(
+            industry="Insurance - Diversified",
+            sector="Financial Services",
+        )
+        with patch("yfinance.Ticker") as ticker_cls:
+            ticker_cls.return_value.info = info
+            result = resolver._lookup_yfinance("BRK.B")
+
+        ticker_cls.assert_called_once_with("BRK-B")
+        assert result is not None
+        assert result["normalized"] == "financials"
+
     def test_tech_stock_with_no_industry_match(self, tmp_path):
         r = SectorResolver(
             cache_path=tmp_path / "cache.json",

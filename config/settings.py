@@ -579,17 +579,20 @@ BOLLINGER_WATCHLIST = [
 # See docs/donchian-watchlist-selection.md.
 DONCHIAN_WATCHLIST_RULE_VERSION = "donchian_watchlist_v1_durable_liquid_pool"
 DONCHIAN_TARGET_POOL_SIZE = 100
+DONCHIAN_ENTRY_WINDOW = 30
+DONCHIAN_EXIT_WINDOW = 15
 DONCHIAN_WATCHLIST = [
     "MU", "NVDA", "SNDK", "AAPL", "MSFT", "TSLA", "AMD", "META", "INTC", "AMZN",
     "AVGO", "GOOG", "PLTR", "MRVL", "TSM", "NBIS", "ORCL", "STX", "DELL", "AMAT",
     "BE", "WDC", "CRM", "LLY", "LRCX", "NFLX", "ASML", "WMT", "JPM", "V",
-    "CRWV", "MRNA", "GEV", "NOW", "CAT", "XOM", "HOOD", "PANW", "CSCO", "APP",
+    "CRWV", "MRNA", "GEV", "NOW", "CAT", "XOM", "HOOD", "PANW", "CSCO", "BRK.B",
+    "APP",
     "QCOM", "CRWD", "GS", "KLAC", "UNH", "BAC", "IBM", "COHR", "JNJ", "COST",
     "TXN", "IREN", "CVX", "GLW", "MA", "SMCI", "COIN", "SNOW", "VRT", "C",
     "MRK", "ADI", "KO", "GE", "UBER", "ADBE", "CRDO", "RKLB", "INTU", "PG",
     "HD", "ALAB", "ABBV", "WFC", "T", "SHOP", "BA", "ANET", "TMO", "MCD",
     "NU", "BKNG", "CRCL", "AAL", "AAOI", "HPE", "TER", "MS", "AMGN", "PEP",
-    "DDOG", "VZ", "ABT", "ACN", "RDDT", "PATH", "SOFI", "NET", "LIN", "APH",
+    "DDOG", "VZ", "ABT", "ACN", "RDDT", "PATH", "SOFI", "NET", "LIN",
     # Temporary lifecycle-preservation member from the pre-refresh universe.
     "SPCX",
 ]

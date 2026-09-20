@@ -47,6 +47,7 @@ bars and fundamentals:
 ```bash
 /Users/franco/trading-bot/venv/bin/python scripts/donchian_watchlist_scan.py \
   --pool-sizes 50 100 200 \
+  --promotion-size 100 \
   --feed sip \
   --end-delay-minutes 60 \
   --include-fundamentals \
@@ -67,7 +68,10 @@ The scanner requires:
 Eligible companies are ordered by 50-day average dollar volume. Liquidity is a
 durable execution priority, not a prediction of return. `GOOGL` is excluded;
 `GOOG` is the eligible Alphabet share class but must rank into the pool on the
-same durable rule as every other company.
+same durable rule as every other company. Broker dot-class symbols are
+translated to Yahoo's hyphen form only at the fundamentals/metadata provider
+boundary, so an unavailable lookup is not mislabeled as a sub-$2 billion
+company.
 
 The following remain visible but do not include, exclude, or rank a company
 under the v1 rule:
@@ -87,9 +91,9 @@ coverage and contention; they are not a survivorship-free backtest.
 
 | Pool | Breakouts over trailing 252 sessions | Active breakout days | Peak same-day signals | Days above 8-position capacity | Median ATR% | Conservatively cap-clipped |
 |---:|---:|---:|---:|---:|---:|---:|
-| 50 | 474 | 87 | 18 | 17 | 3.98% | 26 |
-| **100** | **894** | **89** | **27** | **42** | **3.79%** | **56** |
-| 200 | 1,735 | 90 | 40 | 79 | 3.24% | 135 |
+| 50 | 479 | 87 | 18 | 17 | 3.98% | 26 |
+| **100** | **896** | **89** | **27** | **42** | **3.79%** | **56** |
+| 200 | 1,727 | 90 | 41 | 79 | 3.23% | 136 |
 
 Fifty names offered little breadth beyond the old 52-name pool. One hundred
 nearly doubled raw opportunity coverage while remaining operationally modest:
@@ -107,7 +111,7 @@ but no claim is made that earlier names will outperform later names.
 
 ## Ranking Experiments
 
-The scanner exposes `momentum`, `high52`, and `combined` modes for research.
+The scanner exposes `momentum` and `high52` modes for research.
 They are not the active membership rule.
 
 In the same current-universe snapshot:
@@ -140,9 +144,11 @@ recalibration belongs to the separate long-term risk-target maintenance item.
 
 A static watchlist is also the strategy's signal-exit evaluation universe.
 Every ledger-confirmed open Donchian position outside the refreshed top 100 is
-appended as protected until flat and terminal. Protected symbols do not consume
-one of the 100 opportunity slots and cannot be removed merely because they fail
-the new eligibility rule.
+listed in the report's protected section and must be appended to the promoted
+configuration until flat and terminal—even when it still ranks inside a larger
+50/100/200 comparison pool. Protected symbols do not consume one of the 100
+opportunity slots and cannot be removed merely because they fail the new
+eligibility rule.
 
 The committed research report uses `--ignore-open-positions` so account state is
 not written to source control. Before promotion, run a private copy without
@@ -158,6 +164,8 @@ Remove each lifecycle-preservation member only after it is flat and terminal.
 4. Preserve the rule and target size unless a separately documented review
    authorizes a change; do not hand-rerank sectors or themes.
 5. Check unresolved Donchian entry orders separately from open positions.
+   A missing trade database is an error; only the sanitized committed report
+   may use `--ignore-open-positions`.
 6. Obtain explicit operator approval before promotion.
 7. Update `DONCHIAN_WATCHLIST`, this document, the strategy documentation, and
    `PLAN.md`; run the full suite; recycle only with `./recycle_bot.sh`.

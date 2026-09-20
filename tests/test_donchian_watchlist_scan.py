@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from config import settings
 from scripts.donchian_watchlist_scan import (
     Candidate,
     ScanConfig,
@@ -53,6 +54,12 @@ def _metric(**overrides: object) -> dict[str, object]:
 
 
 class TestDonchianMetrics:
+    def test_scanner_parameters_match_runtime_configuration(self):
+        config = ScanConfig()
+
+        assert config.entry_window == settings.DONCHIAN_ENTRY_WINDOW
+        assert config.atr_window == settings.ATR_LENGTH
+
     def test_computes_reference_metrics_without_using_them_as_gates(self):
         metrics = _compute_metrics(_bars(), ScanConfig())
 
@@ -72,6 +79,10 @@ class TestDonchianMetrics:
 
 
 class TestDonchianSelection:
+    def test_missing_trade_database_fails_closed(self, tmp_path):
+        with pytest.raises(FileNotFoundError, match="--ignore-open-positions"):
+            get_open_donchian_positions(str(tmp_path / "missing.db"))
+
     def test_open_position_read_fails_closed(self, tmp_path, monkeypatch):
         db_path = tmp_path / "trades.db"
         db_path.touch()
@@ -229,16 +240,43 @@ class TestDonchianSelection:
             ),
         )
 
-        candidates, rejections, *_ = scan_candidates(
+        candidates, rejections, _examples, explanations = scan_candidates(
             [AssetInfo("UNKNOWN", "Unknown", "NYSE")],
             {"UNKNOWN": pd.DataFrame({"close": [120.0]})},
             config=ScanConfig(),
             include_fundamentals=True,
             top=1,
+            explain_symbols={"UNKNOWN"},
         )
 
         assert candidates == []
         assert rejections["solvency"] == 1
+        assert "12-month-runway" in explanations["UNKNOWN"]
+
+    def test_unknown_market_cap_has_truthful_reason_and_explanation(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "scripts.donchian_watchlist_scan._compute_metrics",
+            lambda _frame, _config: _metric(),
+        )
+        monkeypatch.setattr(
+            "scripts.donchian_watchlist_scan.fetch_fundamentals",
+            lambda _symbol: SimpleNamespace(market_cap=None),
+        )
+
+        candidates, rejections, _examples, explanations = scan_candidates(
+            [AssetInfo("UNKNOWN", "Unknown", "NYSE")],
+            {"UNKNOWN": pd.DataFrame({"close": [120.0]})},
+            config=ScanConfig(),
+            include_fundamentals=True,
+            top=1,
+            explain_symbols={"UNKNOWN"},
+        )
+
+        assert candidates == []
+        assert rejections == {"market_cap_unknown": 1}
+        assert "could not be established" in explanations["UNKNOWN"]
 
     def test_preferred_share_class_and_open_position_protection(self, monkeypatch):
         metrics = {
@@ -268,8 +306,52 @@ class TestDonchianSelection:
         assert [candidate.symbol for candidate in candidates] == ["LIQ", "HELD"]
         assert rejections["nonpreferred_share_class"] == 1
         assert candidates[1].notes == [
-            "PROTECTED: open Donchian position; outside refreshed pool"
+            "PROTECTED: open Donchian position; outside promoted pool"
         ]
+
+    def test_protects_holding_inside_scan_but_outside_promoted_pool(
+        self, monkeypatch
+    ):
+        liquidity = {
+            "AAA": 500_000_000.0,
+            "BBB": 400_000_000.0,
+            "CCC": 300_000_000.0,
+            "HELD": 200_000_000.0,
+            "EEE": 100_000_000.0,
+        }
+        monkeypatch.setattr(
+            "scripts.donchian_watchlist_scan._compute_metrics",
+            lambda frame, _config: _metric(
+                avg_dollar_volume_50=liquidity[frame.attrs["symbol"]]
+            ),
+        )
+        bars = {}
+        for symbol in liquidity:
+            frame = pd.DataFrame({"close": [120.0]})
+            frame.attrs["symbol"] = symbol
+            bars[symbol] = frame
+
+        candidates, *_ = scan_candidates(
+            [AssetInfo(symbol, symbol, "NYSE") for symbol in liquidity],
+            bars,
+            config=ScanConfig(),
+            include_fundamentals=False,
+            top=5,
+            promotion_size=3,
+            protected_symbols={"HELD"},
+        )
+
+        assert [candidate.symbol for candidate in candidates] == [
+            "AAA",
+            "BBB",
+            "CCC",
+            "HELD",
+            "EEE",
+        ]
+        held = next(candidate for candidate in candidates if candidate.symbol == "HELD")
+        assert held.in_ranked_pool is True
+        assert held.protected_for_promotion is True
+        assert "outside promoted pool" in held.notes[0]
 
     def test_invalid_top_and_ranking_are_rejected(self):
         with pytest.raises(ValueError, match="top must be positive"):
@@ -329,3 +411,5 @@ class TestDonchianReport:
         assert "| 3 |" in report
         assert "Risk sizing binds at ATR14/close" in report
         assert "not a point-in-time backtest" in report
+        assert "Current overlap" not in report
+        assert "| Current |" not in report

@@ -135,6 +135,17 @@ class TestRowLatest:
 
 
 class TestFetchFundamentals:
+    def test_normalizes_dot_class_symbol_for_yahoo(self):
+        t = _mock_ticker(fast_info={"market_cap": 900_000_000_000.0})
+        with patch(
+            "scripts.watchlist_review.yf.Ticker", return_value=t
+        ) as ticker_cls:
+            result = fetch_fundamentals("BRK.B")
+
+        ticker_cls.assert_called_once_with("BRK-B")
+        assert result.symbol == "BRK.B"
+        assert result.market_cap == pytest.approx(900_000_000_000.0)
+
     def test_market_cap_from_fast_info(self):
         t = _mock_ticker(fast_info={"market_cap": 2_500_000_000.0})
         with patch("scripts.watchlist_review.yf.Ticker", return_value=t):

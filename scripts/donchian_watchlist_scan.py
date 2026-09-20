@@ -58,8 +58,8 @@ class ScanConfig:
     min_market_cap: float = 2_000_000_000.0
     min_price: float = 10.0
     min_avg_dollar_volume_50: float = 50_000_000.0
-    entry_window: int = 30
-    atr_window: int = 14
+    entry_window: int = settings.DONCHIAN_ENTRY_WINDOW
+    atr_window: int = settings.ATR_LENGTH
 
 
 @dataclass
@@ -80,10 +80,8 @@ class Candidate:
     breakout_events_252: int
     breakout_dates_252: tuple[str, ...]
     latest_breakout: bool
-    liquidity_percentile: float = 0.0
-    momentum_percentile: float = 0.0
-    high_52w_percentile: float = 0.0
-    combined_percentile: float = 0.0
+    in_ranked_pool: bool = True
+    protected_for_promotion: bool = False
     notes: list[str] = field(default_factory=list)
 
 
@@ -92,6 +90,7 @@ REJECTION_LABELS: dict[str, str] = {
     "price": "Latest close is below the minimum price threshold.",
     "dollar_volume": "50-day average dollar volume is below the threshold.",
     "market_cap": "Market capitalization is below the minimum size threshold.",
+    "market_cap_unknown": "Market capitalization could not be established.",
     "solvency": "Solvency was not affirmatively established.",
     "nonpreferred_share_class": "Use GOOG for Alphabet exposure, never GOOGL.",
 }
@@ -100,7 +99,10 @@ REJECTION_LABELS: dict[str, str] = {
 def get_open_donchian_positions(db_path: str) -> set[str]:
     """Return symbols currently owned by Donchian in the trade ledger."""
     if not Path(db_path).exists():
-        return set()
+        raise FileNotFoundError(
+            f"trade database does not exist: {db_path}; pass "
+            "--ignore-open-positions only for a sanitized research report"
+        )
     try:
         from reporting.logger import TradeLogger
 
@@ -176,27 +178,6 @@ def _first_rejection(
     return None
 
 
-def _percentiles(values: list[float]) -> list[float]:
-    """Return stable 0-100 ascending percentile ranks."""
-    if not values:
-        return []
-    series = pd.Series(values, dtype=float)
-    return (series.rank(method="average", pct=True) * 100.0).tolist()
-
-
-def _apply_percentiles(candidates: list[Candidate]) -> None:
-    liquidity = _percentiles([c.avg_dollar_volume_50 for c in candidates])
-    momentum = _percentiles([c.momentum_12m_skip_1m for c in candidates])
-    high_52w = _percentiles([c.high_52w_ratio for c in candidates])
-    for candidate, liq, mom, high in zip(
-        candidates, liquidity, momentum, high_52w, strict=True
-    ):
-        candidate.liquidity_percentile = liq
-        candidate.momentum_percentile = mom
-        candidate.high_52w_percentile = high
-        candidate.combined_percentile = (mom + high) / 2.0
-
-
 def _rank_candidates(
     candidates: list[Candidate],
     ranking: str,
@@ -206,7 +187,6 @@ def _rank_candidates(
         "liquidity": lambda c: (c.avg_dollar_volume_50, c.symbol),
         "momentum": lambda c: (c.momentum_12m_skip_1m, c.symbol),
         "high52": lambda c: (c.high_52w_ratio, c.symbol),
-        "combined": lambda c: (c.combined_percentile, c.symbol),
     }
     return sorted(candidates, key=key_by_ranking[ranking], reverse=True)
 
@@ -256,6 +236,7 @@ def scan_candidates(
     config: ScanConfig,
     include_fundamentals: bool,
     top: int,
+    promotion_size: int | None = None,
     ranking: str = "liquidity",
     explain_symbols: set[str] | None = None,
     protected_symbols: set[str] | None = None,
@@ -263,7 +244,10 @@ def scan_candidates(
     """Apply durable eligibility and return ranked plus protected candidates."""
     if top <= 0:
         raise ValueError("top must be positive")
-    if ranking not in {"liquidity", "momentum", "high52", "combined"}:
+    promotion_size = top if promotion_size is None else promotion_size
+    if promotion_size <= 0 or promotion_size > top:
+        raise ValueError("promotion_size must be positive and no greater than top")
+    if ranking not in {"liquidity", "momentum", "high52"}:
         raise ValueError(f"unsupported ranking: {ranking}")
 
     asset_by_symbol = {asset.symbol: asset for asset in assets}
@@ -297,27 +281,45 @@ def scan_candidates(
         "liquidity": lambda item: float(item[1]["avg_dollar_volume_50"]),
         "momentum": lambda item: float(item[1]["momentum_12m_skip_1m"]),
         "high52": lambda item: float(item[1]["high_52w_ratio"]),
-        "combined": lambda item: (
-            float(item[1]["momentum_12m_skip_1m"])
-            + float(item[1]["high_52w_ratio"])
-        ),
     }[ranking]
     prequalified.sort(key=metric_key, reverse=True)
     review_goal = max(top + 25, math.ceil(top * 1.25))
     eligible: list[Candidate] = []
     for symbol, metric in prequalified:
-        if include_fundamentals and len(eligible) >= review_goal:
-            break
+        if (
+            include_fundamentals
+            and len(eligible) >= review_goal
+            and symbol not in explain_symbols
+        ):
+            continue
         market_cap: float | None = None
         if include_fundamentals:
             fundamentals = fetch_fundamentals(symbol)
             market_cap = fundamentals.market_cap
-            if market_cap is None or market_cap < config.min_market_cap:
+            if market_cap is None:
+                _reject(symbol, "market_cap_unknown", rejections, examples)
+                if symbol in explain_symbols:
+                    explanations[symbol] = (
+                        "Rejected: market capitalization could not be established "
+                        "from the fundamentals provider."
+                    )
+                continue
+            if market_cap < config.min_market_cap:
                 _reject(symbol, "market_cap", rejections, examples)
+                if symbol in explain_symbols:
+                    explanations[symbol] = (
+                        f"Rejected: market capitalization ${market_cap:,.0f} is "
+                        f"below the ${config.min_market_cap:,.0f} minimum."
+                    )
                 continue
             fitness = assess_fitness(fundamentals, DONCHIAN_PROFILE)
             if fitness.solvency_ok is not True or fitness.error:
                 _reject(symbol, "solvency", rejections, examples)
+                if symbol in explain_symbols:
+                    explanations[symbol] = (
+                        "Rejected: solvency could not be affirmatively established "
+                        "under the profitable-or-12-month-runway rule."
+                    )
                 continue
         asset = asset_by_symbol.get(symbol, AssetInfo(symbol, symbol, "UNKNOWN"))
         eligible.append(
@@ -328,17 +330,26 @@ def scan_candidates(
         if symbol in explain_symbols:
             explanations[symbol] = "Passed all enabled durable eligibility gates."
 
-    _apply_percentiles(eligible)
     ranked_all = _rank_candidates(eligible, ranking)
     selected = ranked_all[:top]
 
     # GOOGL is excluded above; GOOG remains eligible on the same durable rules
     # as every other company and is not manually forced into the selected pool.
-    selected_symbols = {candidate.symbol for candidate in selected}
+    promotion_symbols = {
+        candidate.symbol for candidate in ranked_all[:promotion_size]
+    }
 
     # The watchlist is also the exit-evaluation universe. Never orphan a held
     # Donchian position merely because it fell outside a refreshed pool.
-    for symbol in sorted(protected_symbols - selected_symbols):
+    selected_by_symbol = {candidate.symbol: candidate for candidate in selected}
+    for symbol in sorted(protected_symbols - promotion_symbols):
+        selected_candidate = selected_by_symbol.get(symbol)
+        if selected_candidate is not None:
+            selected_candidate.protected_for_promotion = True
+            selected_candidate.notes.append(
+                "PROTECTED: open Donchian position; outside promoted pool"
+            )
+            continue
         metric = _compute_metrics(bars_by_symbol.get(symbol, pd.DataFrame()), config)
         asset = asset_by_symbol.get(symbol, AssetInfo(symbol, symbol, "UNKNOWN"))
         if metric is None:
@@ -358,6 +369,8 @@ def scan_candidates(
                     breakout_events_252=0,
                     breakout_dates_252=(),
                     latest_breakout=False,
+                    in_ranked_pool=False,
+                    protected_for_promotion=True,
                     notes=["PROTECTED: open Donchian position; metrics unavailable"],
                 )
             )
@@ -369,18 +382,16 @@ def scan_candidates(
                     asset,
                     market_cap=None,
                     notes=[
-                        "PROTECTED: open Donchian position; outside refreshed pool"
+                        "PROTECTED: open Donchian position; outside promoted pool"
                     ],
                 )
             )
+            selected[-1].in_ranked_pool = False
+            selected[-1].protected_for_promotion = True
 
     for symbol in explain_symbols - set(explanations):
         explanations[symbol] = "No qualifying bars returned or symbol was rejected."
     return selected, rejections, examples, explanations
-
-
-def _is_protected(candidate: Candidate) -> bool:
-    return any(note.startswith("PROTECTED:") for note in candidate.notes)
 
 
 def _nearest_rank(values: list[float], percentile: float) -> float:
@@ -390,7 +401,9 @@ def _nearest_rank(values: list[float], percentile: float) -> float:
     return ordered[round((len(ordered) - 1) * percentile)]
 
 
-def _contention_summary(pool: list[Candidate], capacity: int = 8) -> tuple[int, int, int]:
+def _contention_summary(
+    pool: list[Candidate], capacity: int
+) -> tuple[int, int, int]:
     """Return active days, peak same-day breakouts, and days above capacity."""
     counts: Counter[str] = Counter()
     for candidate in pool:
@@ -410,6 +423,7 @@ def render_report(
     *,
     ranking: str,
     pool_sizes: tuple[int, ...],
+    promotion_size: int | None = None,
     feed: str,
     assets_seen: int,
     bars_seen: int,
@@ -419,8 +433,11 @@ def render_report(
 ) -> str:
     """Render a reviewable markdown report."""
     generated = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    regular = [c for c in candidates if not _is_protected(c)]
-    protected = [c for c in candidates if _is_protected(c)]
+    promotion_size = max(pool_sizes) if promotion_size is None else promotion_size
+    regular = [c for c in candidates if c.in_ranked_pool]
+    protected = [c for c in candidates if c.protected_for_promotion]
+    allocation = settings.STRATEGY_ALLOCATIONS["donchian_breakout"]
+    capacity = int(allocation["hard_max_positions"])
     lines = [
         f"# Donchian Watchlist Scan - {generated}",
         "",
@@ -432,6 +449,7 @@ def render_report(
         f"- Assets with bars: {bars_seen}",
         f"- Fundamentals enforced: {include_fundamentals}",
         f"- Largest requested pool: {max(pool_sizes)}",
+        f"- Promoted pool size: {promotion_size}",
         "",
         "## Selection Contract",
         "",
@@ -445,13 +463,11 @@ def render_report(
         "",
         "## Nested Pool Comparison",
         "",
-        "| Pool | Current overlap | Breakouts (252d) | Active days | "
-        "Peak same-day | Days >8 | Zero-breakout names | Median ATR % | "
+        "| Pool | Breakouts (252d) | Active days | "
+        f"Peak same-day | Days >{capacity} | Zero-breakout names | Median ATR % | "
         "Cap-clipped |",
-        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    current = set(settings.DONCHIAN_WATCHLIST)
-    allocation = settings.STRATEGY_ALLOCATIONS["donchian_breakout"]
     baseline_cap = (
         settings.MAX_GROSS_EXPOSURE_PCT
         * float(allocation["target_pct"])
@@ -464,10 +480,11 @@ def render_report(
     for size in pool_sizes:
         pool = regular[:size]
         atr_values = [c.atr_pct for c in pool if math.isfinite(c.atr_pct)]
-        active_days, peak_same_day, days_over_capacity = _contention_summary(pool)
+        active_days, peak_same_day, days_over_capacity = _contention_summary(
+            pool, capacity
+        )
         lines.append(
-            f"| {size} | {sum(c.symbol in current for c in pool)} | "
-            f"{sum(c.breakout_events_252 for c in pool)} | "
+            f"| {size} | {sum(c.breakout_events_252 for c in pool)} | "
             f"{active_days} | {peak_same_day} | {days_over_capacity} | "
             f"{sum(c.breakout_events_252 == 0 for c in pool)} | "
             f"{_nearest_rank(atr_values, 0.50):.2%} | "
@@ -484,8 +501,8 @@ def render_report(
             "## Ranked Candidates",
             "",
             "| Rank | Symbol | Close | $Vol50 | Mom 12-1 | 52w % | ATR % | "
-            ">SMA200 | Breakouts | Current |",
-            "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+            ">SMA200 | Breakouts |",
+            "|---:|---|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for rank, candidate in enumerate(regular, start=1):
@@ -495,8 +512,7 @@ def render_report(
             f"{candidate.momentum_12m_skip_1m:.1%} | "
             f"{candidate.high_52w_ratio:.1%} | {candidate.atr_pct:.1%} | "
             f"{'yes' if candidate.close > candidate.sma200 else 'no'} | "
-            f"{candidate.breakout_events_252} | "
-            f"{'yes' if candidate.symbol in current else 'no'} |"
+            f"{candidate.breakout_events_252} |"
         )
 
     if protected:
@@ -581,7 +597,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--ranking",
-        choices=["liquidity", "momentum", "high52", "combined"],
+        choices=["liquidity", "momentum", "high52"],
         default="liquidity",
     )
     parser.add_argument("--lookback-days", type=int, default=420)
@@ -590,6 +606,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--feed", choices=["iex", "sip"], default="sip")
     parser.add_argument("--end-delay-minutes", type=int, default=60)
     parser.add_argument("--include-fundamentals", action="store_true")
+    parser.add_argument(
+        "--promotion-size",
+        type=int,
+        default=settings.DONCHIAN_TARGET_POOL_SIZE,
+        help="Pool size being promoted; open-position protection is relative to it.",
+    )
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--explain-symbols", nargs="+", default=[])
     parser.add_argument("--ignore-open-positions", action="store_true")
@@ -606,6 +628,10 @@ def main() -> None:
     if not args.pool_sizes or any(size <= 0 for size in args.pool_sizes):
         raise ValueError("--pool-sizes must contain positive integers")
     pool_sizes = tuple(sorted(set(args.pool_sizes)))
+    if args.promotion_size <= 0 or args.promotion_size > max(pool_sizes):
+        raise ValueError(
+            "--promotion-size must be positive and no greater than the largest pool"
+        )
     end = datetime.now(timezone.utc) - timedelta(minutes=args.end_delay_minutes)
     start = end - timedelta(days=args.lookback_days)
 
@@ -631,6 +657,7 @@ def main() -> None:
         config=ScanConfig(),
         include_fundamentals=args.include_fundamentals,
         top=max(pool_sizes),
+        promotion_size=args.promotion_size,
         ranking=args.ranking,
         explain_symbols={symbol.upper() for symbol in args.explain_symbols},
         protected_symbols=protected,
@@ -642,6 +669,7 @@ def main() -> None:
         explanations,
         ranking=args.ranking,
         pool_sizes=pool_sizes,
+        promotion_size=args.promotion_size,
         feed=args.feed,
         assets_seen=len(assets),
         bars_seen=len(bars),
