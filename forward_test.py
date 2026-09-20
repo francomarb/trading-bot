@@ -295,7 +295,8 @@ def main() -> None:
         ),
         StrategySlot(
             strategy=DonchianBreakout(
-                entry_window=30, exit_window=15,
+                entry_window=settings.DONCHIAN_ENTRY_WINDOW,
+                exit_window=settings.DONCHIAN_EXIT_WINDOW,
                 edge_filter=CompositeEdgeFilter([
                     DonchianEdgeFilter(),
                     SectorMomentumFilter(

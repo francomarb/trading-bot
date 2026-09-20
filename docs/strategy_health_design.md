@@ -84,7 +84,13 @@ Note: rigorous-statistics replacements (PSR/DSR/MinTRL, CUSUM, block bootstrap) 
 
 The original 11.10 entry read: *"rolling expectancy + rolling Sharpe per strategy; automatic capital reduction or disable when performance degrades beyond a threshold."* Rejected for three reasons:
 
-1. **Sample size.** With per-strategy trade rates of 10–50 trades/year (SMA crossover lowest, Donchian batchy on 32 names highest), a rolling-window Sharpe is statistical noise on the time horizons that matter. A strategy with perfect edge will hit rolling Sharpe < 0.3 for multi-month stretches just from variance.
+1. **Sample size.** With per-strategy trade rates ranging from sparse SMA
+   crossovers to batchy Donchian breakouts, a rolling-window Sharpe is
+   statistical noise on the time horizons that matter. A strategy with perfect
+   edge will hit rolling Sharpe < 0.3 for multi-month stretches just from
+   variance. Donchian moved from the historical 32-name research basket to a
+   100-name durable-liquidity pool on 2026-09-19, so pre/post-refresh evidence
+   must remain separate.
 2. **Auto-disable ratchet.** Killing a strategy on a noisy metric is irreversible (gated by 11.11 manual re-enable). One bad month kills the strategy for one good month back. Over time the bot loses every strategy.
 3. **Health/Edge conflation.** "Performance degrades" mixes operational issues, execution issues, and statistical underperformance into one number, hiding the most important diagnostic information — whether the strategy is bleeding because it broke or because the edge is gone.
 
@@ -687,7 +693,7 @@ Mitigation: every CONCLUSIVE verdict in the report includes a footer line like:
 These need answers before implementation starts. Follow-up open questions live in [strategy_health_future.md](strategy_health_future.md).
 
 1. **`min_trades_for_verdict` per strategy.** Suggested starting points in §8 (30/50/50/40/50) are conservative defaults — confirm or adjust.
-2. **~~Benchmark recompute cost~~** — **RESOLVED.** `data/fetcher.py` already implements per-symbol Parquet caching with merge-on-fetch over arbitrary ranges; daily bars don't change retroactively so cache warms once and stays warm. Total benchmark universe ~40–50 unique symbols across SMA/RSI/Donchian watchlists. First-time fetch ~30s; subsequent runs near-zero. `strategies/health/benchmarks.py` is a thin `equal_weight_bh_return(symbols, start, end)` helper over `fetch_symbol()`. No fetcher changes needed.
+2. **~~Benchmark recompute cost~~** — **RESOLVED.** `data/fetcher.py` already implements per-symbol Parquet caching with merge-on-fetch over arbitrary ranges; daily bars don't change retroactively so cache warms once and stays warm. The Donchian durable-pool refresh increased the active benchmark universe materially, so a first cold fetch is no longer assumed to take ~30 seconds; subsequent runs remain cache-backed. `strategies/health/benchmarks.py` is a thin `equal_weight_bh_return(symbols, start, end)` helper over `fetch_symbol()`. No fetcher changes needed, but the first post-refresh report should be treated as a cache-warming run.
 3. **~~Health WATCH vs DEGRADED vs BROKEN per check~~** — **RESOLVED.** v1 ships with sensible engineering defaults per check in `strategies/health/thresholds.py` erring toward WATCH (noisy but harmless) rather than BROKEN (cries wolf). Each default carries a `# TODO: calibrate after 4 weeks of paper` comment. A companion `scripts/calibrate_health_thresholds.py` reads N weeks of paper data and prints suggested values per check; operator runs after 4+ weeks and adjusts inline. Safe because v1 invariant is advisory-only — mis-tuned thresholds cause dashboard noise, not capital action. Per-strategy overrides for archetype-specific cases (e.g., RSI's limit-order fill rate stricter than market-order strategies').
 4. **~~Dashboard layout~~** — **RESOLVED.** Compact summary table (one row per strategy, columns: Verdict / Confidence / Sample / Key metrics / Top failure reasons / Recommendation) + expandable per-strategy detail. Matches the markdown report layout exactly so operators see the same shape in both formats.
 5. **~~Quarantine mechanics in v1~~** — **RESOLVED.** Operator edits `STRATEGY_ALLOCATIONS[strategy] = 0.0` in `config/settings.py` and runs `recycle_bot.sh`. Zero new code, honest about being manual. 11.11 will ship the proper re-enable workflow with hot-reload and review state machine.

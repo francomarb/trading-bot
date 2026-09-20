@@ -569,57 +569,39 @@ BOLLINGER_WATCHLIST = [
     "XLRE",  # Real Estate
     "XLC",   # Communications
 ]
-# Donchian Breakout (Turtle System 1) — IMPLEMENTED
-# Trend-continuation strategy designed to capture relentless
-# uptrends in AI / Big-Tech / Semis / NRG / Space (the user's directional thesis universe).
-# Activation gate: Sharpe ≥ +0.4, ≥ 50 trades, MeanDD ≤ 25% on AI/BigTech
-# backtest with 2× ATR stops. Until that gate passes, strategy is parked
-# (same pattern as BollingerSqueeze).
-#
-# This list is the PROPOSED initial universe; user will review/edit before
-# any backtest is run. See docs/donchian_breakout_strategy.md once written.
+# Donchian Breakout (Turtle System 1) — IMPLEMENTED.
+# 2026-09-19 durable-liquidity refresh (`donchian_watchlist_v1`): the first
+# 100 promotion-grade candidates from the delayed-SIP report, ordered by
+# 50-day average dollar volume. Membership uses price, liquidity, company
+# size, and affirmative solvency only. Trend state and historical Donchian
+# outcomes do not include, exclude, or rank a company. The generated cohort is
+# followed by any temporary lifecycle-preservation names from the prior list.
+# See docs/donchian-watchlist-selection.md.
+DONCHIAN_WATCHLIST_RULE_VERSION = "donchian_watchlist_v1_durable_liquid_pool"
+DONCHIAN_TARGET_POOL_SIZE = 100
+DONCHIAN_ENTRY_WINDOW = 30
+DONCHIAN_EXIT_WINDOW = 15
 DONCHIAN_WATCHLIST = [
-    # AI / Semis (primary)
-    "NVDA", "AMD", "AVGO", "SMCI", "TSM", "MU", "QCOM", "ARM", "MRVL",
-    # AI infrastructure / data-centre buildout
-    "ANET", "VRT",
-    # Big Tech
-    "MSFT", "AAPL", "GOOG", "META", "AMZN", "ORCL", "TSLA",
-    # AI software (secondary)
-    "PLTR", "CRWD", "PANW", "NOW", "ALAB", "CRWV", "NBIS",
-    # Platforms
-    "DASH", "UBER",
-    # AI compute / quantum (post-IPO names with full 4y history)
-    "IREN", "IONQ",
-    # AI-adjacent: semiconductor equipment, networking, data-centre power,
-    # quantum computing — highly correlated with AI core but add breadth
-    "ASML",   # Semiconductor lithography — only supplier of EUV, AI capex pick-and-shovel
-    "CRDO",   # Credo Technology — high-speed connectivity for AI data-centre networks
-    "LITE",   # Lumentum — optical components for data-centre interconnects
-    "CLS",    # Celestica — contract mfg for hyperscaler AI networking hardware
-    "CIEN",   # Ciena — optical networking; direct beneficiary of AI data-centre traffic
-    "CEG",    # Constellation Energy — nuclear power for AI data-centre load growth
-    "VST",    # Vistra — power generation; same AI-electricity demand thesis as CEG
-    "BE",     # Bloom Energy — fuel-cell backup power; AI data-centre resilience play
-    "PWR",    # Quanta Services — electrical infrastructure buildout for AI campuses
-    "OKLO",   # Oklo — advanced nuclear power; AI data-centre electricity demand thesis
-    "SMR",    # NuScale Power — small modular reactors; AI power infrastructure thesis
-    "ONDS",   # Ondas — autonomous systems and industrial wireless; AI/defense adjacency
-    "PL",     # Planet Labs — satellite imagery/data platform; space and AI data adjacency
-    "RGTI",   # Rigetti Computing — quantum hardware; early-stage AI compute adjacency
-    "QBTS",   # D-Wave Quantum — quantum annealing; same early-stage bet as RGTI
-    "RKLB",   # Development of rocket launch and control systems for the space and defense industries
-    "RDW",    # Redwire — space infrastructure and defense-adjacent systems
-    "ASTS",   # Space-based broadband cellular network
-    "SPCX",   # SPAC and new-issue ETF — diversified emerging-growth trend exposure
-    # Leopold Aschenbrenner picks
-    "APLD", "RIOT", "WYFI", "CORZ",
+    "MU", "NVDA", "SNDK", "AAPL", "MSFT", "TSLA", "AMD", "META", "INTC", "AMZN",
+    "AVGO", "GOOG", "PLTR", "MRVL", "TSM", "NBIS", "ORCL", "STX", "DELL", "AMAT",
+    "BE", "WDC", "CRM", "LLY", "LRCX", "NFLX", "ASML", "WMT", "JPM", "V",
+    "CRWV", "MRNA", "GEV", "NOW", "CAT", "XOM", "HOOD", "PANW", "CSCO", "BRK.B",
+    "APP",
+    "QCOM", "CRWD", "GS", "KLAC", "UNH", "BAC", "IBM", "COHR", "JNJ", "COST",
+    "TXN", "IREN", "CVX", "GLW", "MA", "SMCI", "COIN", "SNOW", "VRT", "C",
+    "MRK", "ADI", "KO", "GE", "UBER", "ADBE", "CRDO", "RKLB", "INTU", "PG",
+    "HD", "ALAB", "ABBV", "WFC", "T", "SHOP", "BA", "ANET", "TMO", "MCD",
+    "NU", "BKNG", "CRCL", "AAL", "AAOI", "HPE", "TER", "MS", "AMGN", "PEP",
+    "DDOG", "VZ", "ABT", "ACN", "RDDT", "PATH", "SOFI", "NET", "LIN",
+    # Temporary lifecycle-preservation member from the pre-refresh universe.
+    "SPCX",
 ]
 # Full engine universe — union of all lists; preserves paper-run continuity.
 #
-# IMPORTANT: When adding new symbols to any of these watchlists, remember to also
-# map them to their corresponding Sector ETF in `scripts/post_mortem.py`'s
-# SECTOR_MAP dictionary to ensure proper Relative Strength diagnostic reporting.
+# The runtime and post-mortem paths resolve sector ETFs through SectorResolver's
+# persistent metadata cache. Manual overrides belong in SYMBOL_SECTOR_OVERRIDES;
+# broad generated watchlists must not require one hand-maintained map entry per
+# company.
 WATCHLIST = list(dict.fromkeys(
     SMA_WATCHLIST + RSI_WATCHLIST + BOLLINGER_WATCHLIST + DONCHIAN_WATCHLIST
 ))
@@ -790,7 +772,10 @@ STRATEGY_ALLOCATIONS: dict[str, dict] = {
         "can_stretch": True,
         "hard_max_positions": 8,
         "max_position_pct_of_sleeve": 0.40,
-        "risk_per_trade_pct": 0.004,   # 0.40% — covers watchlist ATR% ≥ 2.5 (full list; AAPL 2.6 is the floor)
+        # 0.40% target; the 2026-09-19 durable-liquidity refresh found that
+        # ATR14/close must be >=4.17% to bind under the current 15% sleeve and
+        # baseline concentration cap. Calmer names clip safely below target.
+        "risk_per_trade_pct": 0.004,
     },
     # Paper-only leveraged-index sleeve: 25% of deployable capital = 20% of
     # account equity at the 80% gross ceiling. Four equal pair slots request

@@ -239,7 +239,11 @@ def fetch_fundamentals(symbol: str) -> SymbolFundamentals:
     """
     result = SymbolFundamentals(symbol=symbol)
     try:
-        ticker = yf.Ticker(symbol)
+        # Alpaca uses dot-class symbols (for example BRK.B), while Yahoo
+        # Finance uses the equivalent hyphen form (BRK-B). Keep the broker
+        # symbol in our result but normalize the provider lookup boundary.
+        provider_symbol = symbol.replace(".", "-")
+        ticker = yf.Ticker(provider_symbol)
         cf = ticker.cashflow
         inc = ticker.income_stmt
         bs = ticker.balance_sheet

@@ -256,14 +256,11 @@ SWEEP_GRID: list[tuple[str, dict]] = [
 # symbol lists between markdown and CLI invocations).
 
 UNIVERSES: dict[str, list[str]] = {
-    # AI / Big-Tech / Semis — the user's directional thesis universe.
-    # Kept in sync with config.settings.DONCHIAN_WATCHLIST (the deployment
-    # universe candidate for the Donchian Breakout strategy). Updated 2026-05-01
-    # to 32 names: original 23 AI core + 9 AI-adjacent names restored per user
-    # direction. AI-adjacent names (ASML, CLS, CIEN, CEG, VST, BE, PWR, RGTI,
-    # QBTS) capture AI infrastructure, data-centre power, quantum computing, and
-    # semiconductor-equipment themes. RGTI and QBTS have <4y history; backtest
-    # runs on available bars.
+    # Historical AI / Big-Tech / Semis research universe. It is deliberately
+    # frozen at the 32-name 2026-05-01 snapshot so the original Donchian and
+    # Bollinger results remain reproducible. It is no longer kept in sync with
+    # the active generated DONCHIAN_WATCHLIST; see
+    # docs/donchian-watchlist-selection.md.
     "ai_bigtech": [
         # AI / Semis (primary)
         "NVDA", "AMD", "AVGO", "SMCI", "TSM", "MU", "QCOM", "ARM", "MRVL",

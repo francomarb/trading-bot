@@ -171,7 +171,10 @@ class SectorResolver:
         """Fetch sector/industry from yfinance and normalize."""
         import yfinance as yf
 
-        ticker = yf.Ticker(symbol)
+        # Alpaca uses dot-class symbols while Yahoo uses hyphens (BRK.B vs
+        # BRK-B). Normalize only at the provider boundary; cache keys and all
+        # runtime ownership continue to use the broker symbol.
+        ticker = yf.Ticker(symbol.replace(".", "-"))
         with open(os.devnull, "w") as devnull:
             with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
                 info = ticker.info

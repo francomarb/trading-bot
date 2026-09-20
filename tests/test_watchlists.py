@@ -6,7 +6,7 @@ import pytest
 
 from config import settings
 from data.watchlists import StaticWatchlistSource, WatchlistSource
-from scripts.post_mortem import SECTOR_MAP
+from scripts.post_mortem import SECTOR_MAP, _sector_etf_for
 from strategies.base import StrategySlot
 
 
@@ -82,6 +82,27 @@ class TestRSIWatchlistPromotion:
     def test_symbols_are_unique_and_have_post_mortem_sector_mapping(self):
         assert len(settings.RSI_WATCHLIST) == len(set(settings.RSI_WATCHLIST))
         assert set(settings.RSI_WATCHLIST) <= set(SECTOR_MAP)
+
+
+class TestDonchianWatchlistPromotion:
+    def test_generated_pool_precedes_any_lifecycle_preservation_members(self):
+        assert settings.DONCHIAN_TARGET_POOL_SIZE == 100
+        assert len(settings.DONCHIAN_WATCHLIST) >= settings.DONCHIAN_TARGET_POOL_SIZE
+
+    def test_symbols_are_unique_and_use_preferred_alphabet_share_class(self):
+        assert len(settings.DONCHIAN_WATCHLIST) == len(
+            set(settings.DONCHIAN_WATCHLIST)
+        )
+        assert "GOOG" in settings.DONCHIAN_WATCHLIST
+        assert "GOOGL" not in settings.DONCHIAN_WATCHLIST
+
+    def test_post_mortem_uses_dynamic_sector_resolution_for_generated_names(self):
+        class _Resolver:
+            def resolve(self, symbol):
+                return "healthcare" if symbol == "NEW" else None
+
+        assert _sector_etf_for("NEW", _Resolver()) == "XLV"
+        assert _sector_etf_for("NVDA", _Resolver()) == SECTOR_MAP["NVDA"]
 
 
 # ── StrategySlot with watchlist_source ──────────────────────────────────────
