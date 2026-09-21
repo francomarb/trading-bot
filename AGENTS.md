@@ -129,6 +129,33 @@ sensitive values.
 6. **Complete, runnable code** — every code artifact generated in this project must be fully runnable with no placeholders.
 7. **Incremental builds** — each phase produces working, testable code before moving to the next.
 
+### Evidence hierarchy for strategy decisions
+
+Actual forward evidence has substantially higher decision weight than a
+backtest. Apply this order when assessing whether a strategy works:
+
+1. matched-configuration paper or live trades and broker/trade-ledger outcomes;
+2. forward-test reconciliation plus verified execution and operational evidence;
+3. backtests, simulations, and reconstructed counterfactuals as supporting
+   context only.
+
+Backtests are required before deployment because they can expose impossible,
+unsafe, or plainly weak ideas and can generate hypotheses for paper testing.
+They do **not** promote a strategy, prove a live edge, or defend a strategy
+against contradictory forward evidence. A favorable backtest cannot outweigh
+persistent losses in clean current-configuration paper/live evidence. An
+unfavorable backtest can justify declining to begin or expand an experiment,
+but once forward evidence exists it must be discussed as the lower-fidelity
+model, not as the authority over observed outcomes.
+
+Configuration eras matter: compare evidence only after separating material
+changes to universe, signals, regime permissions, sizing, stops, and execution.
+A small current-era sample means the conclusion remains uncertain; it does not
+cause historical backtests to become higher-priority evidence. Explanations
+such as unlucky timing, market regime, or early implementation bugs remain
+hypotheses until forward evidence distinguishes them. Never use them to excuse
+continued poor performance merely because a historical simulation was good.
+
 ---
 
 ## Coding Conventions

@@ -3,7 +3,7 @@
 **Status:** ✅ **PAPER ACTIVE** — wired in `forward_test.py` since 2026-05-01.
 Built as the successor analysis to [bollinger_squeeze_universe_research.md](bollinger_squeeze_universe_research.md).
 
-**Last updated:** 2026-09-20
+**Last updated:** 2026-09-21
 
 ---
 
@@ -25,6 +25,29 @@ low exit only triggers when the trend genuinely fails.
 2. ATR stops *help* trend-followers — empirically confirmed vs. trailing-stop tests
 3. No "missing practitioner edge" — the entire Donchian edge is in price + ATR, both
    available on daily IEX bars with no capability gap
+
+## Evidence authority
+
+The statements above are the strategy thesis, not proof that the paper sleeve
+has a durable edge. Donchian decisions follow the project evidence hierarchy:
+
+1. current-configuration paper/live trades and broker/trade-ledger outcomes;
+2. forward reconciliation and verified execution/operational evidence;
+3. backtests and reconstructed counterfactuals as supporting context only.
+
+Backtests can reject an unsafe proposal or motivate a paper experiment, but
+they cannot promote Donchian, overrule observed losses, or serve as a defense
+when clean forward evidence contradicts them. In particular, the historical
+result that allowed RANGING and VOLATILE entries is a hypothesis being tested
+on paper. If matched-configuration trades continue to perform poorly in those
+regimes, the observed evidence outranks that result and the regime permission
+must be reconsidered.
+
+Universe changes, regime changes, sizing fixes, stop anchoring, and entry-order
+changes define separate evidence cohorts. A small post-change cohort warrants
+an uncertain verdict; it does not restore backtests to the top of the
+hierarchy. "Unlucky timing" and "initial bugs" are possible explanations to
+test, not reasons to dismiss continued poor forward performance.
 
 ---
 
