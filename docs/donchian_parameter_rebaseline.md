@@ -2,7 +2,7 @@
 
 **Roadmap item:** `11.73`
 
-**Status:** PRE-REGISTERED — design frozen before the comparison is run
+**Status:** COMPLETE — retain 30/15; no production-setting change authorized
 
 **Pre-registration date:** 2026-09-21
 
@@ -109,3 +109,17 @@ evidence under the new configuration hash.
 
 These limitations must accompany the result; they are not footnotes that can
 be dropped from a favorable summary.
+
+## Result
+
+The frozen run is published in
+[`reports/donchian_parameter_rebaseline_latest.md`](reports/donchian_parameter_rebaseline_latest.md).
+The strongest challenger was 55/20: its stitched held-out Sharpe was 1.03
+versus 0.82 for 30/15, with a shallower modeled maximum drawdown. It nevertheless
+beat the control's return in only three of five held-out years, short of the
+pre-registered four-of-five requirement. The expanding-history selector chose
+30/15 for four folds and 55/20 for one.
+
+The conjunctive decision rule therefore retains 30/15. The result does not
+show that 55/20 is poor; it shows that the evidence was not stable enough to
+replace the current control. No live or paper configuration changed.
