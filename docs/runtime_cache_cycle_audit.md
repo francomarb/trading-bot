@@ -14,10 +14,14 @@ bounded, provenance-aware sector-classification refresh.
 The local Parquet cache is not the main latency problem. It is small, intact,
 and fast to read. The material risks are orchestration and network boundaries:
 
-1. Sector hydration runs before the stream, broker reconciliation, ownership
-   restore, and protective-stop repair. Its advertised per-symbol timeout is
-   not enforced, so an unrelated Yahoo metadata lookup can indefinitely delay
-   safety-critical startup work.
+1. At audit time, sector hydration ran before the stream, broker reconciliation,
+   ownership restore, and protective-stop repair. This PR moves classification
+   refresh and the sector-ETF heat snapshot after that safety bootstrap. The
+   resolver's advertised ten-second timeout is still not enforced; yfinance 1.3
+   applies a 30-second timeout to each of its underlying requests and no network
+   retries by default, but one lookup can make multiple requests and the resolver
+   can make two attempts, so metadata work can still take minutes after safety is
+   restored.
 2. The five-minute setting is a post-cycle sleep. A seven-minute cycle therefore
    starts the next cycle about twelve minutes after the prior start.
 3. Daily strategies re-request the newest daily interval on every five-minute
@@ -43,9 +47,9 @@ authoritative, a failed refresh preserves the last known classification, and eve
 attempt is atomically persisted before continuing. Legacy rows without provenance
 are treated as stale and migrate gradually through the same bounded budget.
 
-The remaining narrow implementation should move and hard-bound sector hydration
-behind broker safety bootstrap, remove nested bar retries and the final-failure
-sleep, recover from unreadable Parquet, and add phase/request/order-wait telemetry.
+The remaining narrow implementation should hard-bound sector hydration with an
+enforced elapsed deadline, remove nested bar retries and the final-failure sleep,
+recover from unreadable Parquet, and add phase/request/order-wait telemetry.
 The measured normal case does not justify pre-approving a coordinator, generalized
 locks, fixed-rate scheduling, or owned-position reordering. Event evidence from
 that implementation must decide those follow-ups.
@@ -81,8 +85,9 @@ At audit time:
   the newly deployed universe members and will otherwise become cold work during
   the first market-open sweep.
 - The latest warm-ish sector startup hydrated 31 missing classifications in about
-  nine seconds with no failures. That is a healthy observation, not a bound: the
-  code does not enforce the configured ten-second per-symbol timeout.
+  nine seconds with no failures. That is a healthy observation, not the configured
+  bound: yfinance bounds each underlying request at 30 seconds, but the resolver's
+  ten-second per-symbol timeout remains unused.
 
 ### 2.2 Observed cycle latency
 
@@ -161,8 +166,8 @@ No production cache was altered for these probes.
 
 | Path | Source of truth and key | Current freshness / retry contract | Durability and failure posture | Assessment |
 |---|---|---|---|---|
-| Broker snapshot, orders, positions | Alpaca trading API; broker identifiers | Startup and every cycle; broker client semantics | Broker is authoritative; failures skip decisions | Correct safety source, but it is reached only after pre-engine sector hydration during startup |
-| Sector classification | Yahoo metadata; JSON keyed by broker symbol, with manual overrides first | 90-day TTL with provider/schema/fetch provenance; ten missing/stale attempts per startup; two nominal retries; configured timeout still unused | Each result is atomically persisted; failed refresh retains the last known value; corrupt JSON still becomes an empty cache; missing sector degrades filters to unmapped/neutral behavior | Staleness and interrupted-progress defects fixed in this PR; pre-safety placement and hard deadlines remain open |
+| Broker snapshot, orders, positions | Alpaca trading API; broker identifiers | Startup and every cycle; broker client semantics | Broker is authoritative; failures skip decisions | Safety bootstrap now completes before optional sector metadata and heat work |
+| Sector classification | Yahoo metadata; JSON keyed by broker symbol, with manual overrides first | 90-day TTL with provider/schema/fetch provenance; ten missing/stale attempts per startup; two resolver attempts; configured timeout still unused | Each result is atomically persisted; failed refresh retains the last known value; corrupt JSON still becomes an empty cache; missing sector degrades filters to unmapped/neutral behavior | Staleness, interrupted progress, fair retry rotation, and pre-safety placement fixed in this PR; an enforced elapsed deadline remains open |
 | OHLCV bars | Alpaca data API; `(feed, symbol, timeframe, adjustment)` Parquet plus coverage JSON | Latest interval deliberately re-fetched; a local five-attempt wrapper sits outside alpaca-py's own 429/504 retry loop; 30 s HTTP default | Per-symbol progress survives; Parquet then metadata are direct writes; no lock; bad metadata triggers refetch, bad Parquet raises | Provenance key is good; nested retries can multiply latency, while native multi-symbol requests are unused |
 | Regime SPY | OHLCV cache plus in-memory SPY/regime result | 600 s TTL; failure advances TTL and reuses stale data; cold failure blocks entries | Memory only; restart cold; no maximum stale age | Safe cold posture, but stale age and retry suppression are not explicit enough |
 | Sector ETF gauge | OHLCV cache plus per-ETF and per-score memory caches | 600 s TTL; stale reused after failure and TTL reset | Memory only; cold failure returns neutral | Lazy calls can enter the symbol loop; no age ceiling or provenance in the decision record |
@@ -185,10 +190,11 @@ Startup must have two explicit stages:
    option and stop state, and repair missing protective stops. No Yahoo or
    historical prewarm work may run before this completes.
 2. **Sector hydration (bounded):** after safety bootstrap, resolve missing sector
-   classifications under real per-symbol and total deadlines and atomically
-   persist each success. A missed hydration deadline must not undo broker safety
-   bootstrap or prevent ongoing position management. Broader bars/earnings/IV/ETF
-   prewarming remains event-gated.
+   classifications under the implemented lookup-count budget and atomically
+   persist each attempt. Add real per-symbol and total elapsed deadlines in the
+   remaining narrow implementation. A metadata failure cannot undo completed
+   broker safety bootstrap. Broader bars/earnings/IV prewarming remains
+   event-gated; the sector-ETF heat snapshot is part of this post-safety hook.
 
 Emit distinct `safety_ready_at`, `entry_data_ready_at`, and degraded-component
 states. “Engine started” must not conflate broker safety with optional entry-data
@@ -272,6 +278,9 @@ For small JSON caches:
   retains the last known classification and records the attempt so failures cannot
   monopolize every later refresh budget;
 - manual overrides remain the highest-priority layer and are not provider-refreshed;
+- the budget intentionally makes recovery from an empty/corrupt cache or a large
+  watchlist addition gradual across restarts; unresolved mappings fail open under
+  the current strategy policy while old valid mappings remain usable;
 - consider durable earnings and IV series only if telemetry shows their daily
   refresh burst remains operationally material.
 
@@ -351,9 +360,10 @@ part of caching work. First split its latency from data/evaluation timing:
 
 - **Implemented in this PR:** refresh stale sector classifications under a bounded
   per-startup lookup budget; add provider/schema/fetched-at provenance; preserve
-  stale-on-error behavior; and atomically persist each attempt.
-- Move sector/Yahoo hydration behind broker reconciliation, ownership restore,
-  lifecycle reconciliation, and protective-stop repair.
+  stale-on-error behavior; fairly rotate failed missing/stale entries; atomically
+  persist each attempt; and move classification plus heat refresh behind broker
+  reconciliation, ownership restore, lifecycle reconciliation, and protective-stop
+  repair.
 - Enforce a real per-symbol and total hydration deadline. The lookup-count budget
   now bounds volume, but the configured per-symbol timeout is still not enforced.
 - Remove retry multiplication between the local fetcher and alpaca-py, and never
@@ -393,8 +403,9 @@ multi-symbol requests and the explicit settled-session overlap rule in §4.3.
 ## 6. Verification and rollout gates
 
 The implemented sector slice includes offline deterministic tests for freshness,
-legacy migration, bounded oldest-first selection, stale-on-error behavior, manual
-override precedence, and interrupted persistence. The remaining narrow
+legacy migration, bounded fair selection, stale-on-error behavior, manual override
+precedence, interrupted persistence, post-safety ordering, and hook failure
+isolation. The remaining narrow
 implementation must add tests for timeout, 429/504, connection reset, corrupt
 Parquet/JSON, no sleep after the final retry, phase/request counter accuracy, and
 slow order confirmation. Event-gated follow-ups add tests for their own newly

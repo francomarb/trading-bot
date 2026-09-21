@@ -350,6 +350,34 @@ class TestSectorResolverHydrate:
 
         assert [call.args[0] for call in lookup.call_args_list] == ["MISSING", "OLD"]
 
+    def test_failed_missing_symbol_rotates_behind_older_stale_entry(self, tmp_path):
+        cache_file = tmp_path / "cache.json"
+        cache_file.write_text(json.dumps({
+            "STALE": self._entry(
+                fetched_at="2026-01-01T00:00:00Z",
+                last_attempted_at="2026-01-01T00:00:00Z",
+            ),
+        }))
+        r = SectorResolver(
+            cache_path=cache_file,
+            valid_sectors=VALID_SECTORS,
+            max_refreshes_per_hydrate=1,
+            clock=lambda: self.NOW,
+        )
+
+        with patch.object(r, "_lookup_with_retry", return_value=None) as lookup:
+            r.hydrate(["MISSING", "STALE"])
+            assert lookup.call_args.args[0] == "MISSING"
+
+        refreshed = {
+            "sector": "Technology",
+            "industry": "Semiconductors",
+            "normalized": "semiconductors",
+        }
+        with patch.object(r, "_lookup_with_retry", return_value=refreshed) as lookup:
+            r.hydrate(["MISSING", "STALE"])
+            assert lookup.call_args.args[0] == "STALE"
+
     def test_manual_override_is_not_refreshed(self, tmp_path):
         r = SectorResolver(
             cache_path=tmp_path / "cache.json",

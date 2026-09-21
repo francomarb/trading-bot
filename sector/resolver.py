@@ -86,7 +86,8 @@ class SectorResolver:
         refresh.  Legacy entries without provenance are immediately stale.
     max_refreshes_per_hydrate
         Maximum provider lookups attempted by one ``hydrate()`` call.  Missing
-        symbols are prioritized, then the least-recently-attempted stale ones.
+        symbols with no prior attempt are prioritized, then all due symbols are
+        ordered by their least-recent provider attempt.
     clock
         UTC clock injection used by deterministic tests.
     """
@@ -141,8 +142,10 @@ class SectorResolver:
     def hydrate(self, symbols: list[str]) -> None:
         """Refresh a bounded set of missing or stale symbols at startup.
 
-        Missing classifications are attempted first.  Successful cache entries
-        older than ``max_age_days`` are then refreshed from oldest to newest.
+        Never-attempted missing classifications are attempted first.  After an
+        attempt, missing and stale entries share one oldest-attempt-first queue,
+        preventing permanently unmappable symbols from starving usable stale
+        classifications.
         Each result is atomically persisted before the next lookup, so an
         interrupted run retains all prior progress.  A failed refresh preserves
         the last known classification and records the attempt for fair rotation
@@ -223,13 +226,14 @@ class SectorResolver:
         return self._now() - fetched_at >= self._max_age
 
     def _refresh_priority(self, symbol: str) -> tuple[int, datetime, str]:
-        """Prioritize missing values, then the least recently attempted entry."""
+        """Prioritize never-attempted missing values, then oldest attempts."""
         entry = self._cache.get(symbol, {})
-        missing_rank = 0 if not entry.get("normalized") else 1
         attempted = self._parse_timestamp(entry.get("last_attempted_at"))
         fetched = self._parse_timestamp(entry.get("fetched_at"))
+        missing = not entry.get("normalized")
+        never_attempted_missing_rank = 0 if missing and attempted is None else 1
         oldest = attempted or fetched or datetime.min.replace(tzinfo=timezone.utc)
-        return missing_rank, oldest, symbol
+        return never_attempted_missing_rank, oldest, symbol
 
     def _now(self) -> datetime:
         """Return an aware UTC timestamp from the configured clock."""
