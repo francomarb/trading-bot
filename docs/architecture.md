@@ -285,7 +285,7 @@ Each `StrategySlot` declares `allowed_regimes: frozenset[MarketRegime] | None`. 
 
 **TTL caching:** ETF bars and score results are cached per `cache_ttl_seconds` (default 600s). Called once per cycle via edge filters — not per symbol.
 
-`sector/resolver.py` — `SectorResolver` maps stock tickers to sector labels using yfinance metadata cached in `data/cache/sector_map.json`. Hydrated once at startup (`resolver.hydrate(all_symbols)`) so no API calls occur during the live trading loop. Industry takes priority over sector in normalization (NVDA → industry="Semiconductors" → `"semiconductors"`, not `"technology"`). ETFs return `None`. Unknown symbols fail open.
+`sector/resolver.py` — `SectorResolver` maps stock tickers to sector labels using yfinance metadata cached in `data/cache/sector_map.json`. At startup, `resolver.hydrate(all_symbols)` refreshes at most ten missing or 90-day-old classifications, prioritizing missing and least-recently-attempted symbols; no provider calls occur during the live trading loop. Cache rows include provider, schema, fetched-at, and last-attempted provenance. Each attempt is written through a same-directory temporary file and atomic replacement. A failed refresh preserves the last known classification, while manual overrides remain authoritative. Industry takes priority over sector in normalization (NVDA → industry="Semiconductors" → `"semiconductors"`, not `"technology"`). ETFs return `None`. Unknown symbols fail open.
 
 **Sector ETF registry** (`SECTOR_ETFS` in `config/settings.py`): 12 sectors mapped to ETFs (SMH for semiconductors, XLK for technology, XLF for financials, etc.).
 

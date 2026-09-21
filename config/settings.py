@@ -639,6 +639,13 @@ SYMBOL_SECTOR_OVERRIDES: dict[str, str] = {
     "TSLA":  "technology",   # AI, autonomous driving, software-defined vehicle; GICS maps to Consumer Discretionary
 }
 
+# Provider classifications are durable but not permanent. Refresh at most ten
+# missing/stale symbols per startup so GICS/provider corrections converge without
+# turning a bot restart into an unbounded Yahoo metadata sweep. Legacy cache rows
+# have no fetched_at provenance and therefore migrate through this same budget.
+SECTOR_CACHE_MAX_AGE_DAYS: int = 90
+SECTOR_CACHE_REFRESH_LIMIT: int = 10
+
 SECTOR_ETFS: dict[str, str] = {
     "technology":     "XLK",
     "semiconductors": "SMH",

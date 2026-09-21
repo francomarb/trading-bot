@@ -5,9 +5,9 @@
 **Audit date:** 2026-09-20
 
 **Scope:** current paper engine startup, market-data caches, synchronous runtime
-lookups, cycle scheduling, and open-position evaluation order. This document is
-an audit and proposed design only; it does not authorize or implement runtime
-changes.
+lookups, cycle scheduling, and open-position evaluation order. This document
+records the audit, the approved target design, and the first implemented slice:
+bounded, provenance-aware sector-classification refresh.
 
 ## 1. Decision summary
 
@@ -35,13 +35,20 @@ and fast to read. The material risks are orchestration and network boundaries:
    loses the whole batch, while an interrupted bar write can leave Parquet and its
    coverage sidecar out of sync.
 
-Recommendation: merge this audit, but authorize only a narrow first implementation:
-move and bound sector hydration behind broker safety bootstrap, persist each sector
-success atomically, remove nested bar retries and the final-failure sleep, recover
-from unreadable Parquet, and add phase/request/order-wait telemetry. The measured
-normal case does not justify pre-approving a coordinator, generalized locks,
-fixed-rate scheduling, or owned-position reordering. Event evidence from the
-narrow implementation must decide those follow-ups.
+The first approved slice now fixes sector-classification staleness and durability:
+successful Yahoo results carry provider/schema/fetch provenance, become eligible
+for refresh after 90 days, and are refreshed oldest-first under a ten-attempt
+startup budget. Missing classifications take priority, manual overrides remain
+authoritative, a failed refresh preserves the last known classification, and every
+attempt is atomically persisted before continuing. Legacy rows without provenance
+are treated as stale and migrate gradually through the same bounded budget.
+
+The remaining narrow implementation should move and hard-bound sector hydration
+behind broker safety bootstrap, remove nested bar retries and the final-failure
+sleep, recover from unreadable Parquet, and add phase/request/order-wait telemetry.
+The measured normal case does not justify pre-approving a coordinator, generalized
+locks, fixed-rate scheduling, or owned-position reordering. Event evidence from
+that implementation must decide those follow-ups.
 
 This first implementation will **not** fix the largest observed overruns: several
 were dominated by synchronous order-confirmation waits. Those waits must become a
@@ -155,7 +162,7 @@ No production cache was altered for these probes.
 | Path | Source of truth and key | Current freshness / retry contract | Durability and failure posture | Assessment |
 |---|---|---|---|---|
 | Broker snapshot, orders, positions | Alpaca trading API; broker identifiers | Startup and every cycle; broker client semantics | Broker is authoritative; failures skip decisions | Correct safety source, but it is reached only after pre-engine sector hydration during startup |
-| Sector classification | Yahoo metadata; JSON keyed only by broker symbol, with manual overrides first | No TTL or provider/schema version; two nominal retries; configured timeout unused | Whole JSON written directly after full loop; corrupt JSON becomes empty cache; missing sector degrades filters to unmapped/neutral behavior | Unbounded startup dependency, stale forever, and loses partial progress |
+| Sector classification | Yahoo metadata; JSON keyed by broker symbol, with manual overrides first | 90-day TTL with provider/schema/fetch provenance; ten missing/stale attempts per startup; two nominal retries; configured timeout still unused | Each result is atomically persisted; failed refresh retains the last known value; corrupt JSON still becomes an empty cache; missing sector degrades filters to unmapped/neutral behavior | Staleness and interrupted-progress defects fixed in this PR; pre-safety placement and hard deadlines remain open |
 | OHLCV bars | Alpaca data API; `(feed, symbol, timeframe, adjustment)` Parquet plus coverage JSON | Latest interval deliberately re-fetched; a local five-attempt wrapper sits outside alpaca-py's own 429/504 retry loop; 30 s HTTP default | Per-symbol progress survives; Parquet then metadata are direct writes; no lock; bad metadata triggers refetch, bad Parquet raises | Provenance key is good; nested retries can multiply latency, while native multi-symbol requests are unused |
 | Regime SPY | OHLCV cache plus in-memory SPY/regime result | 600 s TTL; failure advances TTL and reuses stale data; cold failure blocks entries | Memory only; restart cold; no maximum stale age | Safe cold posture, but stale age and retry suppression are not explicit enough |
 | Sector ETF gauge | OHLCV cache plus per-ETF and per-score memory caches | 600 s TTL; stale reused after failure and TTL reset | Memory only; cold failure returns neutral | Lazy calls can enter the symbol loop; no age ceiling or provenance in the decision record |
@@ -259,8 +266,12 @@ failure demonstrates the need.
 
 For small JSON caches:
 
-- persist each successful sector result immediately;
-- preserve manual overrides as the highest-priority layer;
+- sector results now carry provider/schema/fetch metadata, refresh after 90 days,
+  and migrate legacy rows through a ten-attempt oldest-first startup budget;
+- each sector lookup result is atomically persisted immediately; a failed refresh
+  retains the last known classification and records the attempt so failures cannot
+  monopolize every later refresh budget;
+- manual overrides remain the highest-priority layer and are not provider-refreshed;
 - consider durable earnings and IV series only if telemetry shows their daily
   refresh burst remains operationally material.
 
@@ -338,18 +349,23 @@ part of caching work. First split its latency from data/evaluation timing:
 
 ### Narrow implementation PR
 
+- **Implemented in this PR:** refresh stale sector classifications under a bounded
+  per-startup lookup budget; add provider/schema/fetched-at provenance; preserve
+  stale-on-error behavior; and atomically persist each attempt.
 - Move sector/Yahoo hydration behind broker reconciliation, ownership restore,
   lifecycle reconciliation, and protective-stop repair.
-- Enforce a real per-symbol and total hydration deadline, persist each successful
-  classification atomically, and correct the inaccurate `hydrate()` docstring.
+- Enforce a real per-symbol and total hydration deadline. The lookup-count budget
+  now bounds volume, but the configured per-symbol timeout is still not enforced.
 - Remove retry multiplication between the local fetcher and alpaca-py, and never
   sleep after the last failed attempt. Retain one explicitly bounded policy for
   idempotent reads.
 - Catch unreadable Parquet, quarantine the corrupt data/metadata pair, and refetch
   without changing feed or strategy semantics.
-- Emit phase durations, logical fetch ranges, actual HTTP requests per rolling
-  minute, retry counts, order-wait time, scheduled-start lag, and direct managed
-  position-to-evaluation latency.
+- Emit phase durations, logical fetch ranges, actual stock market-data HTTP
+  requests per rolling minute, retry counts, order-wait time, scheduled-start lag,
+  and direct managed position-to-evaluation latency. Count stock requests in
+  `data.fetcher._TimeoutAdapter.send()` so alpaca-py's internal retries are visible;
+  trading and option clients require separate counters if later brought in scope.
 - Add deterministic slow/hung Yahoo, 429/504, corrupt-Parquet, interruption, and
   slow-order tests.
 
@@ -376,11 +392,13 @@ multi-symbol requests and the explicit settled-session overlap rule in §4.3.
 
 ## 6. Verification and rollout gates
 
-The narrow implementation PR must include offline deterministic tests for timeout,
-429/504, connection reset, corrupt Parquet/JSON, interrupted sector persistence,
-no sleep after the final retry, phase/request counter accuracy, and slow order
-confirmation. Event-gated follow-ups add tests for their own newly authorized
-contracts rather than front-loading unused infrastructure.
+The implemented sector slice includes offline deterministic tests for freshness,
+legacy migration, bounded oldest-first selection, stale-on-error behavior, manual
+override precedence, and interrupted persistence. The remaining narrow
+implementation must add tests for timeout, 429/504, connection reset, corrupt
+Parquet/JSON, no sleep after the final retry, phase/request counter accuracy, and
+slow order confirmation. Event-gated follow-ups add tests for their own newly
+authorized contracts rather than front-loading unused infrastructure.
 
 Before enabling the narrow implementation in regular paper hours:
 

@@ -7,6 +7,7 @@ All tests are offline; yfinance and Alpaca API calls are mocked.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -62,6 +63,12 @@ class TestSectorResolverCache:
         cache_file.write_text("{ not valid json")
         r = SectorResolver(cache_path=cache_file)
         assert r._cache == {}
+
+    def test_ignores_structurally_invalid_cache_entries(self, tmp_path):
+        cache_file = tmp_path / "bad-entry.json"
+        cache_file.write_text(json.dumps({"NVDA": "not-an-entry", "AAPL": {}}))
+        r = SectorResolver(cache_path=cache_file)
+        assert r._cache == {"AAPL": {}}
 
 
 class TestSectorResolverNormalization:
@@ -201,22 +208,73 @@ class TestSectorResolverYFinanceLookup:
 
 
 class TestSectorResolverHydrate:
-    def test_hydrate_skips_already_cached(self, tmp_path):
-        cache_file = tmp_path / "cache.json"
-        cache_file.write_text(json.dumps({
-            "NVDA": {"sector": "Technology", "industry": "Semiconductors", "normalized": "semiconductors"},
-        }))
-        r = SectorResolver(cache_path=cache_file, valid_sectors=VALID_SECTORS)
+    NOW = datetime(2026, 9, 20, 12, 0, tzinfo=timezone.utc)
 
-        # hydrate should not call yfinance for already-cached NVDA
+    def _entry(
+        self,
+        *,
+        normalized="semiconductors",
+        fetched_at="2026-09-20T11:00:00Z",
+        last_attempted_at="2026-09-20T11:00:00Z",
+    ):
+        return {
+            "sector": "Technology",
+            "industry": "Semiconductors",
+            "normalized": normalized,
+            "provider": "yfinance",
+            "schema_version": 1,
+            "fetched_at": fetched_at,
+            "last_attempted_at": last_attempted_at,
+        }
+
+    def test_hydrate_skips_fresh_cached_entry(self, tmp_path):
+        cache_file = tmp_path / "cache.json"
+        cache_file.write_text(json.dumps({"NVDA": self._entry()}))
+        r = SectorResolver(
+            cache_path=cache_file,
+            valid_sectors=VALID_SECTORS,
+            clock=lambda: self.NOW,
+        )
+
+        # A fresh provider classification does not need another Yahoo call.
         with patch.object(r, "_lookup_yfinance") as mock_lookup:
             r.hydrate(["NVDA"])
             mock_lookup.assert_not_called()
+
+    def test_hydrate_refreshes_legacy_entry_without_provenance(self, tmp_path):
+        cache_file = tmp_path / "cache.json"
+        cache_file.write_text(json.dumps({
+            "NVDA": {
+                "sector": "Technology",
+                "industry": "Semiconductors",
+                "normalized": "semiconductors",
+            },
+        }))
+        r = SectorResolver(
+            cache_path=cache_file,
+            valid_sectors=VALID_SECTORS,
+            clock=lambda: self.NOW,
+        )
+        refreshed = {
+            "sector": "Technology",
+            "industry": "Consumer Electronics",
+            "normalized": "technology",
+        }
+
+        with patch.object(r, "_lookup_with_retry", return_value=refreshed):
+            r.hydrate(["NVDA"])
+
+        saved = json.loads(cache_file.read_text())["NVDA"]
+        assert saved["normalized"] == "technology"
+        assert saved["provider"] == "yfinance"
+        assert saved["schema_version"] == 1
+        assert saved["fetched_at"] == "2026-09-20T12:00:00Z"
 
     def test_hydrate_resolves_missing_symbols(self, tmp_path):
         r = SectorResolver(
             cache_path=tmp_path / "cache.json",
             valid_sectors=VALID_SECTORS,
+            clock=lambda: self.NOW,
         )
         entry = {"sector": "Financial Services", "industry": "Capital Markets", "normalized": "financials"}
 
@@ -228,10 +286,80 @@ class TestSectorResolverHydrate:
         assert r.resolve("GS") == "financials"
 
     def test_hydrate_fail_open_when_lookup_fails(self, tmp_path):
-        r = SectorResolver(cache_path=tmp_path / "cache.json")
+        r = SectorResolver(
+            cache_path=tmp_path / "cache.json",
+            clock=lambda: self.NOW,
+        )
         with patch.object(r, "_lookup_with_retry", return_value=None):
             r.hydrate(["WEIRD"])
         assert r.resolve("WEIRD") is None  # not cached, but no crash
+        saved = json.loads((tmp_path / "cache.json").read_text())["WEIRD"]
+        assert saved["last_attempted_at"] == "2026-09-20T12:00:00Z"
+        assert saved["fetched_at"] is None
+
+    def test_failed_stale_refresh_preserves_last_known_classification(self, tmp_path):
+        cache_file = tmp_path / "cache.json"
+        stale = self._entry(
+            fetched_at="2026-01-01T00:00:00Z",
+            last_attempted_at="2026-01-01T00:00:00Z",
+        )
+        cache_file.write_text(json.dumps({"NVDA": stale}))
+        r = SectorResolver(
+            cache_path=cache_file,
+            valid_sectors=VALID_SECTORS,
+            max_age_days=90,
+            clock=lambda: self.NOW,
+        )
+
+        with patch.object(r, "_lookup_with_retry", return_value=None):
+            r.hydrate(["NVDA"])
+
+        assert r.resolve("NVDA") == "semiconductors"
+        saved = json.loads(cache_file.read_text())["NVDA"]
+        assert saved["fetched_at"] == "2026-01-01T00:00:00Z"
+        assert saved["last_attempted_at"] == "2026-09-20T12:00:00Z"
+
+    def test_refresh_budget_prioritizes_missing_then_oldest_attempt(self, tmp_path):
+        cache_file = tmp_path / "cache.json"
+        cache_file.write_text(json.dumps({
+            "OLD": self._entry(
+                fetched_at="2026-01-01T00:00:00Z",
+                last_attempted_at="2026-01-01T00:00:00Z",
+            ),
+            "RECENT": self._entry(
+                fetched_at="2026-01-01T00:00:00Z",
+                last_attempted_at="2026-09-19T00:00:00Z",
+            ),
+        }))
+        r = SectorResolver(
+            cache_path=cache_file,
+            valid_sectors=VALID_SECTORS,
+            max_refreshes_per_hydrate=2,
+            clock=lambda: self.NOW,
+        )
+        refreshed = {
+            "sector": "Technology",
+            "industry": "Semiconductors",
+            "normalized": "semiconductors",
+        }
+
+        with patch.object(
+            r, "_lookup_with_retry", return_value=refreshed
+        ) as lookup:
+            r.hydrate(["RECENT", "MISSING", "OLD"])
+
+        assert [call.args[0] for call in lookup.call_args_list] == ["MISSING", "OLD"]
+
+    def test_manual_override_is_not_refreshed(self, tmp_path):
+        r = SectorResolver(
+            cache_path=tmp_path / "cache.json",
+            valid_sectors=VALID_SECTORS,
+            clock=lambda: self.NOW,
+        )
+        with patch.object(r, "_lookup_with_retry") as lookup:
+            r.hydrate(["GOOG"])
+        lookup.assert_not_called()
+        assert r.resolve("GOOG") == "technology"
 
     def test_hydrate_persists_cache_to_disk(self, tmp_path):
         cache_file = tmp_path / "cache.json"
@@ -244,6 +372,33 @@ class TestSectorResolverHydrate:
         assert cache_file.exists()
         saved = json.loads(cache_file.read_text())
         assert "NVDA" in saved
+        assert saved["NVDA"]["provider"] == "yfinance"
+        assert saved["NVDA"]["fetched_at"]
+
+    def test_hydrate_persists_each_success_before_interruption(self, tmp_path):
+        cache_file = tmp_path / "cache.json"
+        r = SectorResolver(
+            cache_path=cache_file,
+            valid_sectors=VALID_SECTORS,
+            clock=lambda: self.NOW,
+        )
+        entry = {
+            "sector": "Technology",
+            "industry": "Semiconductors",
+            "normalized": "semiconductors",
+        }
+
+        with patch.object(
+            r,
+            "_lookup_with_retry",
+            side_effect=[entry, KeyboardInterrupt()],
+        ):
+            with pytest.raises(KeyboardInterrupt):
+                r.hydrate(["AMD", "NVDA"])
+
+        saved = json.loads(cache_file.read_text())
+        assert saved["AMD"]["normalized"] == "semiconductors"
+        assert "NVDA" not in saved
 
     def test_hydrate_retries_on_failure(self, tmp_path):
         r = SectorResolver(
@@ -257,3 +412,16 @@ class TestSectorResolverHydrate:
             with patch("time.sleep"):  # don't actually sleep
                 result = r._lookup_with_retry("NVDA")
         assert result == entry
+
+
+class TestSectorResolverConfiguration:
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"max_age_days": 0}, "max_age_days"),
+            ({"max_refreshes_per_hydrate": 0}, "max_refreshes_per_hydrate"),
+        ],
+    )
+    def test_rejects_non_positive_refresh_controls(self, tmp_path, kwargs, message):
+        with pytest.raises(ValueError, match=message):
+            SectorResolver(cache_path=tmp_path / "cache.json", **kwargs)

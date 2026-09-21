@@ -240,6 +240,8 @@ def main() -> None:
     # how to act on the information via sector_entry_policy.
     sector_resolver = SectorResolver(
         valid_sectors=set(settings.SECTOR_ETFS),
+        max_age_days=settings.SECTOR_CACHE_MAX_AGE_DAYS,
+        max_refreshes_per_hydrate=settings.SECTOR_CACHE_REFRESH_LIMIT,
     )
     all_symbols = list(dict.fromkeys(
         settings.SMA_WATCHLIST + settings.RSI_WATCHLIST + settings.DONCHIAN_WATCHLIST
