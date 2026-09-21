@@ -1795,6 +1795,39 @@ class TestStartStop:
         engine.start(max_cycles=10)
         assert engine._cycle_count == 1
 
+    def test_post_safety_startup_hook_runs_after_stop_repair(
+        self, engine_factory
+    ):
+        engine, broker = engine_factory()
+        engine._repair_missing_protective_stops = MagicMock()
+        observed = {}
+
+        def _hook():
+            observed["startup_snapshot_calls"] = broker.sync_with_broker.call_count
+            observed["stop_repair_complete"] = (
+                engine._repair_missing_protective_stops.called
+            )
+
+        engine.start(max_cycles=1, post_safety_startup_hook=_hook)
+
+        assert observed == {
+            "startup_snapshot_calls": 1,
+            "stop_repair_complete": True,
+        }
+
+    def test_post_safety_startup_hook_failure_does_not_block_cycle(
+        self, engine_factory
+    ):
+        engine, broker = engine_factory()
+
+        def _hook():
+            raise RuntimeError("metadata provider unavailable")
+
+        engine.start(max_cycles=1, post_safety_startup_hook=_hook)
+
+        assert engine._cycle_count == 1
+        assert broker.sync_with_broker.call_count == 2
+
 
 # ── shutdown ─────────────────────────────────────────────────────────────────
 

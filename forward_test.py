@@ -240,11 +240,12 @@ def main() -> None:
     # how to act on the information via sector_entry_policy.
     sector_resolver = SectorResolver(
         valid_sectors=set(settings.SECTOR_ETFS),
+        max_age_days=settings.SECTOR_CACHE_MAX_AGE_DAYS,
+        max_refreshes_per_hydrate=settings.SECTOR_CACHE_REFRESH_LIMIT,
     )
     all_symbols = list(dict.fromkeys(
         settings.SMA_WATCHLIST + settings.RSI_WATCHLIST + settings.DONCHIAN_WATCHLIST
     ))
-    sector_resolver.hydrate(all_symbols)
 
     sector_gauge = SectorMomentumGauge(sector_etfs=settings.SECTOR_ETFS)
 
@@ -458,11 +459,15 @@ def main() -> None:
         allocator=allocator,
         sector_resolver=sector_resolver,
     )
-    engine._sector_heat = _build_sector_heat_snapshot(
-        gauge=sector_gauge,
-        resolver=sector_resolver,
-        slots=slots,
-    )
+
+    def _refresh_sector_context() -> None:
+        """Refresh sector metadata/heat only after broker safety is restored."""
+        sector_resolver.hydrate(all_symbols)
+        engine._sector_heat = _build_sector_heat_snapshot(
+            gauge=sector_gauge,
+            resolver=sector_resolver,
+            slots=slots,
+        )
 
     slot_desc = ", ".join(
         f"{s.strategy.name}({s.active_symbols()})" for s in slots
@@ -509,7 +514,10 @@ def main() -> None:
     )
 
     try:
-        engine.start(post_cycle_hook=health_scheduler)
+        engine.start(
+            post_safety_startup_hook=_refresh_sector_context,
+            post_cycle_hook=health_scheduler,
+        )
     finally:
         # Write a daily summary on shutdown.
         try:

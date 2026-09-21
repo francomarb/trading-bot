@@ -1062,12 +1062,18 @@ class TradingEngine:
         self,
         *,
         max_cycles: int | None = None,
+        post_safety_startup_hook: "Callable[[], None] | None" = None,
         post_cycle_hook: "Callable[[], None] | None" = None,
     ) -> None:
         """
         Run the loop until SIGINT, `stop()`, or `max_cycles` (if set).
         `max_cycles` is for tests / verify scripts; production calls leave
         it None and rely on signal-driven shutdown.
+
+        `post_safety_startup_hook` is an optional best-effort metadata/prewarm
+        callable invoked only after broker truth, ownership, lifecycle state,
+        and protective stops have been reconciled. It must not be used for
+        safety-critical recovery.
 
         `post_cycle_hook` (PLAN 11.10g) is an optional callable invoked
         after each completed cycle. The engine doesn't know what the
@@ -1203,6 +1209,20 @@ class TradingEngine:
         self._sync_managed_stop_legs(startup_snapshot)
         self._sync_option_trailing_stops(startup_snapshot)
         self._repair_missing_protective_stops(startup_snapshot)
+
+        # Optional provider metadata and prewarm work belongs after the complete
+        # broker-safety bootstrap. Failure is deliberately isolated: existing
+        # cache/fail-open semantics allow the first cycle to proceed, while a
+        # Yahoo or historical-data outage must never undo ownership restoration
+        # or protective-stop repair.
+        if post_safety_startup_hook is not None:
+            try:
+                post_safety_startup_hook()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "post_safety_startup_hook failed (trading continues): "
+                    f"{exc}"
+                )
 
         slot_desc = ", ".join(
             f"{s.strategy.name}({len(s.active_symbols())})"
