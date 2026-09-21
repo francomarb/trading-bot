@@ -114,12 +114,25 @@ be dropped from a favorable summary.
 
 The frozen run is published in
 [`reports/donchian_parameter_rebaseline_latest.md`](reports/donchian_parameter_rebaseline_latest.md).
-The strongest challenger was 55/20: its stitched held-out Sharpe was 1.03
-versus 0.82 for 30/15, with a shallower modeled maximum drawdown. It nevertheless
-beat the control's return in only three of five held-out years, short of the
-pre-registered four-of-five requirement. The expanding-history selector chose
-30/15 for four folds and 55/20 for one.
+Review found that the first result omitted production's pre-sizing
+`MIN_TRADE_NOTIONAL` rule: the allocator refuses a candidate when remaining
+sleeve capacity is below $100. The corrected harness applies that exact
+availability check—not the stricter and inaccurate rule that every completed
+order itself must exceed $100—and the entire study was rerun from the warmed
+100-name SIP cache. Execution mechanics and the explicit-universe boundary
+received focused regression coverage at the same time.
 
-The conjunctive decision rule therefore retains 30/15. The result does not
-show that 55/20 is poor; it shows that the evidence was not stable enough to
-replace the current control. No live or paper configuration changed.
+In the corrected run, 55/20 had stitched held-out Sharpe 1.02 versus 0.78 for
+30/15, a shallower modeled maximum drawdown, positive mean R, and higher return
+in four of five years. It therefore passed criteria 1–4. It failed the
+pre-registered concentration guard: after removing its best relative year,
+55/20 returned 10.0% versus 10.5% for 30/15; after removing PLTR, its largest
+realized contributor, it returned 12.1% versus 14.1%. The expanding-history
+selector chose 30/15 for three folds and 20/10 for two; it never selected
+55/20.
+
+The conjunctive decision rule therefore still retains 30/15, now because
+criterion 5 failed. The material movement after a small capacity-parity repair
+also means the modeled point estimates are fragile: they support a no-change
+decision, not a precise forecast of either variant's edge. No live or paper
+configuration changed, and forward paper evidence remains the higher authority.

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from config.settings import MIN_TRADE_NOTIONAL
 from indicators.technicals import add_atr, add_donchian_high, add_donchian_low
 
 
@@ -64,6 +65,39 @@ class _Position:
     quantity: int
 
 
+def stop_limit_fill(
+    *, open_price: float, high: float, low: float, trigger: float, limit: float
+) -> float | None:
+    """Return the production-style DAY stop-limit fill, or ``None`` if expired."""
+    if high < trigger or low > limit:
+        return None
+    return limit if open_price > limit else max(open_price, trigger)
+
+
+def entry_quantity(
+    *,
+    equity: float,
+    cash: float,
+    available: float,
+    fill: float,
+    sizing_limit: float,
+    atr: float,
+    risk_per_trade_pct: float,
+    position_notional_pct: float,
+    stop_atr: float,
+    min_trade_notional: float = MIN_TRADE_NOTIONAL,
+) -> int:
+    """Apply the production sleeve floor, then risk/notional/cash caps."""
+    if available < min_trade_notional:
+        return 0
+    risk_qty = int((equity * risk_per_trade_pct) // (stop_atr * atr))
+    position_qty = int((equity * position_notional_pct) // sizing_limit)
+    return max(
+        0,
+        min(risk_qty, position_qty, int(available // sizing_limit), int(cash // fill)),
+    )
+
+
 def _prepared(
     bars: dict[str, pd.DataFrame], entry_window: int, exit_window: int, atr_length: int
 ) -> dict[str, pd.DataFrame]:
@@ -105,9 +139,11 @@ def simulate_portfolio(
     max_chase_bps: float = 500.0,
     max_chase_atr: float = 2.0,
     exit_slippage_bps: float = 5.0,
+    min_trade_notional: float = MIN_TRADE_NOTIONAL,
 ) -> PortfolioResult:
     """Simulate one flat-start/flat-end evaluation fold using shared capital."""
-    data = _prepared(bars, entry_window, exit_window, atr_length)
+    requested_bars = {symbol: bars[symbol] for symbol in symbols if symbol in bars}
+    data = _prepared(requested_bars, entry_window, exit_window, atr_length)
     start, end = pd.Timestamp(trade_start), pd.Timestamp(trade_end)
     dates = sorted({d for df in data.values() for d in df.index if start <= d <= end})
     if not dates:
@@ -166,22 +202,28 @@ def simulate_portfolio(
             trigger = float(signal[f"donchian_high_{entry_window}"])
             atr = float(signal[f"atr_{atr_length}"])
             limit = trigger + min(trigger * max_chase_bps / 10_000.0, atr * max_chase_atr)
-            if float(row["high"]) < trigger or float(row["low"]) > limit:
+            fill = stop_limit_fill(
+                open_price=float(row["open"]), high=float(row["high"]),
+                low=float(row["low"]), trigger=trigger, limit=limit,
+            )
+            if fill is None:
                 expired_entries += 1
                 continue
             if len(positions) >= max_positions:
                 skipped_capacity += 1
                 continue
-            open_price = float(row["open"])
-            fill = limit if open_price > limit else max(open_price, trigger)
             equity_now = cash + sum(
                 p.quantity * last_close.get(s, p.entry_price) for s, p in positions.items()
             )
             used = sum(p.quantity * last_close.get(s, p.entry_price) for s, p in positions.items())
             available = max(0.0, equity_now * sleeve_notional_pct - used)
-            risk_qty = int((equity_now * risk_per_trade_pct) // (stop_atr * atr))
-            position_qty = int((equity_now * position_notional_pct) // limit)
-            qty = min(risk_qty, position_qty, int(available // limit), int(cash // fill))
+            qty = entry_quantity(
+                equity=equity_now, cash=cash, available=available,
+                fill=fill, sizing_limit=limit, atr=atr,
+                risk_per_trade_pct=risk_per_trade_pct,
+                position_notional_pct=position_notional_pct,
+                stop_atr=stop_atr, min_trade_notional=min_trade_notional,
+            )
             if qty <= 0:
                 skipped_capacity += 1
                 continue
