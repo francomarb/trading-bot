@@ -35,14 +35,19 @@ and fast to read. The material risks are orchestration and network boundaries:
    loses the whole batch, while an interrupted bar write can leave Parquet and its
    coverage sidecar out of sync.
 
-Recommendation: approve a staged implementation that first establishes safety
-ordering and telemetry, then adds atomic cache contracts and explicit prewarming,
-then changes scheduling and eliminates redundant daily/API work. Keep execution
-settlement latency as a separately measured subproblem rather than hiding it in a
-generic cache change. The implementation should reuse Alpaca's native multi-symbol
-bar requests, its official trade-update stream, Python's atomic file replacement,
-and established TTL/locking utilities rather than creating parallel versions of
-those facilities.
+Recommendation: merge this audit, but authorize only a narrow first implementation:
+move and bound sector hydration behind broker safety bootstrap, persist each sector
+success atomically, remove nested bar retries and the final-failure sleep, recover
+from unreadable Parquet, and add phase/request/order-wait telemetry. The measured
+normal case does not justify pre-approving a coordinator, generalized locks,
+fixed-rate scheduling, or owned-position reordering. Event evidence from the
+narrow implementation must decide those follow-ups.
+
+This first implementation will **not** fix the largest observed overruns: several
+were dominated by synchronous order-confirmation waits. Those waits must become a
+separate measured phase before any lifecycle-sensitive asynchronous design is
+considered. Any later request-reduction work should reuse Alpaca's native
+multi-symbol bar requests rather than create a parallel per-symbol HTTP fleet.
 
 ## 2. Evidence and baseline
 
@@ -100,10 +105,22 @@ Representative log inspection found:
 - A daily earnings-cache refresh produced 108 synchronous Yahoo refreshes and a
   roughly 164 s cycle.
 - Repeated SPY 504 responses produced market-closed cycles around 184 s. The
-  bar retry loop permits five 30-second HTTP attempts and also sleeps after the
-  final failed attempt, adding an unnecessary final backoff.
+  local bar wrapper understates its real retry count: each of its five outer
+  attempts can contain four alpaca-py attempts, with three SDK sleeps, and the
+  outer wrapper also sleeps after its final failure. With 30-second request
+  timeouts, the code-level upper bound is approximately 676 seconds (about
+  11 minutes) for one symbol. That is arithmetic from the installed retry
+  contracts, not a measured production duration.
 - Multiple extreme cycles contained 240-second order-confirmation waits. These
   waits, rather than cache reads, explain much of the worst tail.
+
+The request burst is also close to the account's provider ceiling. Alpaca's
+current free market-data plan documents 200 API calls per minute; a representative
+healthy cycle emitted approximately 172 bar API ranges in 17 seconds before
+quotes, option-chain requests, pagination, or retries. The deployed 217-evaluation
+universe can therefore self-induce 429 responses even while latency looks healthy.
+The narrow implementation must measure actual HTTP requests per rolling minute,
+not only logical fetch ranges. Source: <https://alpaca.markets/data>.
 
 ### 2.3 Position-to-evaluation latency
 
@@ -160,18 +177,17 @@ Startup must have two explicit stages:
    broker snapshot, restore/reconcile ownership and lifecycle state, synchronize
    option and stop state, and repair missing protective stops. No Yahoo or
    historical prewarm work may run before this completes.
-2. **Readiness/prewarm (bounded):** validate cache manifests, refresh required
-   completed bars, sector classifications, earnings, IV proxies, and sector ETFs
-   under explicit per-provider and total deadlines. Persist each successful key
-   immediately. A missed readiness deadline blocks only the entry capability
-   whose existing failure policy requires it; it must not undo broker safety
-   bootstrap or prevent ongoing position management.
+2. **Sector hydration (bounded):** after safety bootstrap, resolve missing sector
+   classifications under real per-symbol and total deadlines and atomically
+   persist each success. A missed hydration deadline must not undo broker safety
+   bootstrap or prevent ongoing position management. Broader bars/earnings/IV/ETF
+   prewarming remains event-gated.
 
 Emit distinct `safety_ready_at`, `entry_data_ready_at`, and degraded-component
 states. “Engine started” must not conflate broker safety with optional entry-data
 readiness.
 
-### 4.2 Two-pass cycle ordering
+### 4.2 Candidate two-pass cycle ordering — not yet authorized
 
 Keep the existing broker/lifecycle/stop-repair prelude. Then evaluate:
 
@@ -184,7 +200,8 @@ ownership identity must select the correct slot, and unmanaged positions must
 remain explicitly unmanaged. De-duplicate shared data fetches without merging
 strategy decisions.
 
-Target service levels to validate in paper testing:
+If telemetry shows flat work is delaying owned positions, initial service levels
+to evaluate would be:
 
 - broker reconciliation and stop repair complete within 15 s p95;
 - every managed open position begins evaluation within 30 s p95 and 60 s max
@@ -192,14 +209,19 @@ Target service levels to validate in paper testing:
 - flat-symbol work is shed or deferred before an open-position deadline is
   violated.
 
-These are proposed initial budgets, not claims about current behavior.
+These are hypotheses, not claims about current behavior and not acceptance
+criteria for the narrow first implementation. Normal observed position latency is
+already sub-second; order waits, rather than watchlist ordering, explain the tail.
 
-### 4.3 Completed-bar snapshot and prewarming
+### 4.3 Candidate completed-bar batching and prewarming — event-gated follow-up
 
-Introduce a run-scoped market-data coordinator keyed by
-`(feed, symbol, timeframe, adjustment, decision_cutoff)`:
+If the request-volume event gate is met, prefer a small run-scoped market-data
+batch keyed by `(feed, symbol, timeframe, adjustment, decision_cutoff)`:
 
-- compute the latest *completed* decision bar once per timeframe/session;
+- compute the latest *completed* decision bar once per timeframe/session. A daily
+  session becomes eligible only after the exchange calendar's close plus a
+  configured settlement buffer; the prior session must then be overlap-fetched
+  once at its first eligible refresh so late/revised bars remain repairable;
 - prewarm required keys with Alpaca's native multi-symbol
   `StockBarsRequest.symbol_or_symbols` in bounded chunks grouped by identical
   feed, timeframe, adjustment, and missing range;
@@ -212,11 +234,12 @@ Introduce a run-scoped market-data coordinator keyed by
 - continue refreshing the SPY 5-minute option signal on its five-minute boundary;
 - never reuse a live quote or option snapshot as historical decision truth.
 
-The coordinator should report cache hit, API range count, batch size, rows, age,
+That follow-up should report cache hit, API range count, batch size, rows, age,
 provider latency, and stale/fallback status per key. Do not build a parallel
 per-symbol HTTP worker fleet while Alpaca's batch request covers the use case.
 Additional concurrency may be considered only after batching is measured and
-per-key single-writer locks and atomic writes exist.
+per-key single-writer protection is proven necessary. Do not advance coverage
+when the settlement refresh returns an empty or partial response.
 
 ### 4.4 Durable cache contract
 
@@ -225,29 +248,29 @@ For bars:
 - write Parquet to a same-directory temporary file and atomically replace it;
 - write metadata last through its own temporary-file replacement, so metadata
   can never claim data that was not committed;
-- include schema version, feed/provider, adjustment, timeframe, written-at,
-  coverage, last complete bar, and a data fingerprint/generation identifier;
 - catch unreadable Parquet, quarantine the bad pair, and refetch instead of
   repeatedly failing the symbol;
-- use a per-key process/file lock or enforce a single cache-writer service;
 - retain backward-compatible reads and provide a rollback/quarantine procedure.
+
+Those atomic-write and quarantine changes are cheap and belong in the narrow
+implementation. Versioned manifests, generation fingerprints, and generalized
+cross-process locks are deferred unless a real concurrent-writer or migration
+failure demonstrates the need.
 
 For small JSON caches:
 
-- use schema-versioned atomic writes;
 - persist each successful sector result immediately;
-- record provider, fetched-at, and positive/negative TTLs;
 - preserve manual overrides as the highest-priority layer;
-- move earnings and IV series to bounded durable caches so restart does not
-  recreate a market-open Yahoo burst.
+- consider durable earnings and IV series only if telemetry shows their daily
+  refresh burst remains operationally material.
 
 Use established primitives for the generic pieces: Python `os.replace()` for
 same-filesystem atomic replacement, `cachetools.TTLCache` for uncomplicated
-in-memory TTL caches, and a maintained cross-process file-lock package if live
-and research processes must share a writable cache root. Any imported package
-must be declared directly and pinned; the current transitive availability of
-`cachetools` or `tenacity` is not a dependency contract. Prefer separate
-single-writer cache roots where that removes the need for locking entirely.
+in-memory TTL caches if a direct pinned dependency is justified, and a maintained
+cross-process file-lock package only if live and research processes must share a
+writable cache root. The current transitive availability of `cachetools` or
+`tenacity` is not a dependency contract. Prefer separate single-writer cache
+roots where that removes the need for locking entirely.
 
 Changing an entry gate's fail-open/fail-closed meaning is outside this work.
 Cache hardening must preserve current strategy semantics unless a separate
@@ -255,17 +278,12 @@ strategy review approves a change.
 
 ### 4.5 Bounded provider policy
 
-Create one provider-policy layer rather than scattered timeout patches:
-
-- explicit connect/read timeout, maximum attempts, total elapsed budget, jittered
-  backoff, and retryable exception/status list per provider;
-- never sleep after the last failed attempt;
-- distinguish `fresh`, `stale_usable`, `fallback`, and `unavailable` results;
-- retain the age of stale data rather than resetting its apparent freshness when
-  a refresh fails;
-- circuit-break repeated outages so 137 symbols do not independently discover
-  the same provider failure;
-- cap a prewarm batch and carry unfinished flat symbols to a later cycle.
+The narrow implementation needs two contained policies: a real per-symbol/total
+deadline for sector hydration, and one bounded retry layer for idempotent Alpaca
+bar reads. It must never sleep after the last failed attempt and must emit the
+actual attempt/request counts. A generic provider framework, stale-result type,
+circuit breaker, or flat-symbol carryover queue is deferred until an observed
+failure requires it.
 
 Before adding any wrapper retry, account for the provider SDK's behavior. The
 installed alpaca-py client already retries HTTP 429 and 504 responses internally;
@@ -276,7 +294,7 @@ failure behavior. A generic retry helper may be used for idempotent reads, but
 must never blindly retry order submission. Mutating broker calls continue to use
 `client_order_id` plus broker reconciliation.
 
-### 4.6 Non-overlapping fixed-rate scheduling
+### 4.6 Candidate non-overlapping fixed-rate scheduling — deferred
 
 Retain a single engine thread and prohibit overlapping cycles. Replace the
 post-cycle fixed delay with monotonic scheduled starts:
@@ -299,7 +317,10 @@ prewarm jobs if persistent scheduling later becomes necessary; do not introduce
 it into the order-management path merely to replace a few deadline calculations.
 
 For example, a cycle starting at 09:30 and ending at 09:37 would skip the 09:35
-tick and next start at 09:40, not 09:42 and not immediately at 09:37.
+tick and next start at 09:40, not 09:42 and not immediately at 09:37. This is not
+authorized by the audit: five strategy identities trade completed daily bars,
+and the one five-minute sleeve has not yet shown that schedule drift changes
+outcomes. First emit scheduled-start lag and overrun telemetry.
 
 ### 4.7 Execution latency separation
 
@@ -313,60 +334,73 @@ part of caching work. First split its latency from data/evaluation timing:
 - then decide in a separate reviewed change whether asynchronous lifecycle
   settlement can preserve all substrate/reconciliation guarantees.
 
-## 5. Proposed implementation sequence
+## 5. Authorized next implementation and event-gated follow-ups
 
-### PR A — telemetry and safety ordering
+### Narrow implementation PR
 
-- Move sector/Yahoo readiness behind broker safety bootstrap.
-- Add phase timers and direct managed-position evaluation latency.
-- Add two-pass owned-position-first ordering with deterministic tests.
-- Add scheduled-start/overrun metrics without changing cadence yet.
-- Add deterministic slow/failing-provider and slow-order tests.
+- Move sector/Yahoo hydration behind broker reconciliation, ownership restore,
+  lifecycle reconciliation, and protective-stop repair.
+- Enforce a real per-symbol and total hydration deadline, persist each successful
+  classification atomically, and correct the inaccurate `hydrate()` docstring.
+- Remove retry multiplication between the local fetcher and alpaca-py, and never
+  sleep after the last failed attempt. Retain one explicitly bounded policy for
+  idempotent reads.
+- Catch unreadable Parquet, quarantine the corrupt data/metadata pair, and refetch
+  without changing feed or strategy semantics.
+- Emit phase durations, logical fetch ranges, actual HTTP requests per rolling
+  minute, retry counts, order-wait time, scheduled-start lag, and direct managed
+  position-to-evaluation latency.
+- Add deterministic slow/hung Yahoo, 429/504, corrupt-Parquet, interruption, and
+  slow-order tests.
 
-This is the highest-value, lowest-semantic-change step.
+No cycle reordering, scheduler change, cache coordinator, generalized locking,
+earnings/IV persistence, or asynchronous order settlement belongs in this PR.
 
-### PR B — atomic caches and prewarm coordinator
+### Event gate: native batching and completed-daily refresh
 
-- Add atomic/versioned bar and JSON persistence plus corrupt-pair quarantine.
-- Add per-key single-writer protection with a maintained lock primitive, or
-  isolate writable cache roots so cross-process locking is unnecessary.
-- Add durable sector, earnings, and IV freshness records.
-- Add completed-bar keys, shared run-scoped snapshots, and bounded Alpaca-native
-  multi-symbol prewarm.
-- Remove nested retry multiplication and enforce provider-level elapsed budgets.
-- Preserve every existing strategy gate and feed choice.
+Proceed only after the new counter measures the true burst, or a 429 occurs. A
+rolling-minute request count approaching the documented 200/minute Basic-plan
+limit is sufficient evidence; latency need not be bad first. Use Alpaca-native
+multi-symbol requests and the explicit settled-session overlap rule in §4.3.
 
-### PR C — cadence and redundant-request removal
+### Other event-gated decisions
 
-- Enable daily-session-aware refresh instead of five-minute daily overlap calls.
-- Enable fixed-rate, skip-missed-tick scheduling.
-- Add bounded flat-candidate carryover when a provider budget is exhausted.
-- Calibrate alert thresholds from at least five market sessions.
-
-### Separate execution-latency decision
-
-- Use the new phase telemetry to assess synchronous order confirmation.
-- If material after cache/scheduler work, design asynchronous settlement against
-  the lifecycle substrate in its own PR and failure-injection review.
+- Consider owned-position-first ordering only when flat work—not an earlier order
+  wait—causes a managed-position latency breach.
+- Consider fixed-rate scheduling only when measured start lag misses a relevant
+  five-minute decision boundary.
+- Add locks/manifests only after a demonstrated concurrent-writer or migration
+  failure.
+- Consider asynchronous order settlement only after phase telemetry quantifies
+  its frequency and a separate design proves lifecycle/reconciliation safety.
 
 ## 6. Verification and rollout gates
 
-Each implementation PR must include offline deterministic tests for timeout,
-429/5xx, connection reset, corrupt Parquet/JSON, interruption between data and
-metadata commit, concurrent same-key requests, stale fallback, partial prewarm,
-cycle overrun, and slow order confirmation.
+The narrow implementation PR must include offline deterministic tests for timeout,
+429/504, connection reset, corrupt Parquet/JSON, interrupted sector persistence,
+no sleep after the final retry, phase/request counter accuracy, and slow order
+confirmation. Event-gated follow-ups add tests for their own newly authorized
+contracts rather than front-loading unused infrastructure.
 
-Before enabling the completed behavior in regular paper hours:
+Before enabling the narrow implementation in regular paper hours:
 
 1. snapshot/backup cache metadata and document rollback;
 2. run the full unit suite;
-3. run an off-hours cold-cache prewarm against a disposable cache root;
+3. run an off-hours cold-cache prewarm against a disposable cache root, then warm
+   the 34 missing deployed daily series under a bounded provider budget so the
+   first 217-evaluation baseline is not confounded by cold history;
 4. recycle only via `./recycle_bot.sh` and verify broker ownership/stops become
    ready before metadata hydration;
-5. verify one market-open session with entries paused;
-6. collect at least five sessions of phase and position-latency metrics;
-7. confirm no strategy signal/fill drift attributable to changed bar cutoffs;
-8. only then enable normal entry operation.
+5. prove with deterministic injection that an interrupted hydrate preserves every
+   prior success and that a persistent 504 exits within the configured total
+   deadline without a final sleep;
+6. prove corrupt Parquet is quarantined and recovered without feed drift;
+7. reconcile emitted HTTP-request/retry/order-wait counters to the injected calls;
+8. confirm no strategy signal or decision-bar semantics changed.
+
+Paper entries do not need to be paused for a calendar day, and there is no
+five-session bake requirement. Acceptance is tied to the named events and
+invariants; ordinary paper evidence collection should continue.
 
 The Donchian ranked pool remains capped at 100 throughout this work.
 
