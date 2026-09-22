@@ -35,17 +35,19 @@ Values: return | Sharpe | max drawdown | trades | win rate | mean R | capacity s
 | 30/15 | 7.6% | 32.7% | 48.4% | 11.3% |
 | 55/20 | 11.6% | 29.8% | 44.7% | 14.0% |
 
-## Pre-registered verdict
+## Frozen implemented verdict and metric ambiguity
 
-Every challenger is evaluated against the same conjunctive rule; the report does not choose one challenger after viewing the results.
+Every challenger is evaluated against the same conjunctive rule; the report does not choose one challenger after viewing the results. Criterion 5 was pre-registered as remaining `directionally favorable` but did not name return or Sharpe. The implementation used return before the corrected 30/10 result existed. Both readings are disclosed below rather than retroactively choosing one.
 
-| Challenger | Years won | Sharpe edge | DD difference | Mean R | Remove-best-year | Remove-best-symbol | Verdict |
+| Challenger | Years won | Sharpe edge | DD difference | Mean R | Remove-best-year (return; Sharpe) | Remove-best-symbol (return; Sharpe) | Return-rule verdict |
 |---|---:|---:|---:|---:|---|---|---|
-| 20/10 | 3/5 | +0.26 | +2.2pp | +0.41R | 2024: +10.1% vs +14.5% (FAIL) | ex NVDA: +10.6% vs +14.3% (FAIL) | C1 F, C2 P, C3 P, C4 P, C5 F |
-| 30/10 | 4/5 | +0.30 | +2.9pp | +0.54R | 2024: +13.4% vs +14.5% (FAIL) | ex SNDK: +14.2% vs +8.2% (PASS) | C1 P, C2 P, C3 P, C4 P, C5 F |
-| 55/20 | 4/5 | +0.22 | +3.8pp | +0.57R | 2024: +12.7% vs +14.5% (FAIL) | ex STX: +10.6% vs +18.5% (FAIL) | C1 P, C2 P, C3 P, C4 P, C5 F |
+| 20/10 | 3/5 | +0.26 | +2.2pp | +0.41R | 2024: +10.1% vs +14.5% (FAIL); +0.88 vs +0.76 (PASS) | ex NVDA: +10.6% vs +14.3% (FAIL); +0.75 vs +0.73 (PASS) | C1 F, C2 P, C3 P, C4 P, C5 F |
+| 30/10 | 4/5 | +0.30 | +2.9pp | +0.54R | 2024: +13.4% vs +14.5% (FAIL); +0.96 vs +0.76 (PASS) | ex SNDK: +14.2% vs +8.2% (PASS); +0.92 vs +0.52 (PASS) | C1 P, C2 P, C3 P, C4 P, C5 F |
+| 55/20 | 4/5 | +0.22 | +3.8pp | +0.57R | 2024: +12.7% vs +14.5% (FAIL); +0.94 vs +0.76 (PASS) | ex STX: +10.6% vs +18.5% (FAIL); +0.74 vs +0.83 (FAIL) | C1 P, C2 P, C3 P, C4 P, C5 F |
 
-**Decision: retain 30/15.** No challenger cleared every mandatory criterion; do not salvage a variant by changing the rule after seeing the result.
+**Implemented return-rule decision: retain 30/15.** No challenger cleared every mandatory criterion under the return reading used by the frozen implementation.
+
+Under a Sharpe reading of criterion 5, the full-rule passers would be: **30/10**. For 30/10 specifically, remove-2024 Sharpe is +0.96 versus +0.76 for the control and the ex-SNDK Sharpe is +0.92 versus +0.52. The metric ambiguity cannot be resolved after seeing the result, so production remains 30/15 pending forward evidence. The historical direction nevertheless makes close-based 30/10 the leading candidate if a separately pre-registered paper experiment is later authorized.
 
 ## Selection audit
 
@@ -65,7 +67,7 @@ Every challenger is evaluated against the same conjunctive rule; the report does
 ## Coverage and limitations
 
 - Frozen ranked pool: 100 symbols; lifecycle-only SPCX excluded.
-- Production parity includes the allocator's pre-sizing $100 minimum remaining-sleeve-capacity check and conservative STOP_LIMIT quantity from the worst permitted limit down to the pre-fill reference-anchored stop. Earlier drafts omitted the floor and then divided risk by only the post-fill 2 ATR protection distance; both corrections materially changed headline metrics, so these estimates support the no-change decision rather than precise expected returns.
+- Production parity includes the allocator's pre-sizing $100 minimum remaining-sleeve-capacity check and conservative STOP_LIMIT quantity from the worst permitted limit down to the pre-fill reference-anchored stop. Earlier drafts omitted the floor and then divided risk by only the post-fill 2 ATR protection distance; both corrections materially changed headline metrics, so these estimates are not precise forecasts of any variant's edge.
 - Coverage is listing/provider dependent; no pre-listing history is fabricated.
 - Earnings blackout is unmodeled; current-cohort survivorship and selection bias remain.
 - See `docs/donchian_parameter_rebaseline.md` for the frozen contract and decision rule.

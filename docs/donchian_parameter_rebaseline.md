@@ -94,6 +94,13 @@ all of the following hold on the five fixed held-out folds:
 5. the result is not dependent on one year or one symbol (remove-best-year and
    remove-best-symbol sensitivity remains directionally favorable).
 
+Criterion 5 did not pre-register which reported metric defined
+"directionally favorable." The frozen implementation used portfolio return;
+that choice was coded before the corrected 30/10 result existed. Because the
+choice now changes the outcome, the result must disclose both the return and
+Sharpe readings rather than retroactively declaring either one uniquely
+pre-registered.
+
 If no challenger clears every bar, retain 30/15. A good static-cohort result
 does not validate the watchlist selector and does not erase the need for paper
 evidence under the new configuration hash.
@@ -133,14 +140,22 @@ chose 30/10 in all five folds. Every challenger was evaluated against the same
 conjunctive rule rather than declaring whichever aggregate result looked best
 the "strongest" after inspection.
 
-No challenger cleared criterion 5. Removing its best relative year left
-20/10 at +10.1%, 30/10 at +13.4%, and 55/20 at +12.7%, each below the 30/15
-control at +14.5%. The remove-best-symbol rerun also failed for 20/10 and
-55/20; 30/10 passed that half of the concentration test but still failed the
-required year sensitivity. The decision therefore remains **retain 30/15**.
+Under the implemented return reading, no challenger cleared criterion 5.
+Removing its best relative year left 20/10 at +10.1%, 30/10 at +13.4%, and
+55/20 at +12.7%, each below the 30/15 control at +14.5%. The
+remove-best-symbol rerun also failed for 20/10 and 55/20; 30/10 passed that
+half of the return concentration test.
+
+The Sharpe reading changes that interpretation. For 30/10, removing 2024
+leaves Sharpe 0.96 versus 0.76 for 30/15, and removing SNDK leaves 0.92 versus
+0.52. It therefore clears all five proposal criteria if criterion 5 means
+Sharpe. That ambiguity cannot be resolved after viewing the result. Production
+and paper remain at **30/15 pending forward evidence**, but the historical
+direction favors close-based 30/10 and makes it the leading candidate if a
+separately pre-registered paper experiment is later authorized.
 
 The material movement after small-looking execution-parity repairs is itself
-evidence that the modeled point estimates are fragile. They support a
-no-change decision, not a precise forecast of any variant's edge. No live or
-paper configuration changed, and forward paper evidence remains the higher
-authority.
+evidence that the modeled point estimates are fragile. The return-based rule
+does not clear a change, while the result direction favors 30/10; neither is a
+precise forecast of durable edge. No live or paper configuration changed, and
+forward paper evidence remains the higher authority.

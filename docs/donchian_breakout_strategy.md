@@ -557,13 +557,23 @@ minimum-availability rules, concurrency, and deterministic candidate order.
 The follow-up also enforces the pre-registered 4R cap including pending DAY
 reservations.
 
-The final close-based rebaseline still retains 30/15: every challenger failed
-the mandatory remove-best-year sensitivity even though 30/10 was selected by
-expanding-history Sharpe in all five folds. A separate fixed-cohort diagnostic
-found classic high/low 20/10 improved Sharpe and drawdown on both the original
-32 and durable 100, while classic 55/20 had stronger aggregate return but more
-contributor concentration. Those classic variants are different execution
-families, not parameter substitutions for the deployed close-based strategy.
+The final close-based rebaseline retains 30/15 under the implemented return
+reading of criterion 5. That criterion was pre-registered only as remaining
+"directionally favorable," without naming return or Sharpe. Under a Sharpe
+reading, 30/10 clears all five proposal criteria; it was also selected by
+expanding-history Sharpe in all five folds. The ambiguity cannot be resolved
+after seeing the result, so production remains unchanged and close-based 30/10
+is the leading hypothesis for any later separately pre-registered paper
+experiment.
+
+A separate fixed-cohort diagnostic found classic high/low 20/10 improved
+Sharpe and drawdown on both the original 32 and durable 100, while classic
+55/20 had stronger aggregate return but more contributor concentration. Those
+classic variants are different execution families, not parameter substitutions
+for the deployed close-based strategy. Their modeled results enforce the 4R
+heat cap, while production currently observes but does not enforce it; any
+classic experiment would need a separate enforcement decision to match the
+model.
 
 No production or paper setting changed. The authoritative next gate is at
 least 25 trusted exits under the frozen configuration plus enough distinct

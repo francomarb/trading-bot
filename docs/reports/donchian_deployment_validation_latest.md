@@ -8,7 +8,7 @@ The 2021–2025 years were inspected by `11.73`; they are fixed comparison folds
 
 ## Common-period portfolio results (2017–2025)
 
-Every cell enforces the pre-registered 4R heat cap, including pending DAY-entry reservations.
+Every cell enforces the pre-registered 4R heat cap, including pending DAY-entry reservations. Production currently runs this cap in observation-only mode (`STRATEGY_HEAT_CAP_ENFORCED=False`), so the classic results are conditional on a separately approved enforcement change.
 
 | Universe | Variant | Return | Sharpe | Max DD | Trades | Entry clusters | Mean R | Capacity skips | Heat skips |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -73,5 +73,7 @@ The no-top-symbol column is a full rerun after removing that variant's largest r
 - Earnings blackout remains omitted because trustworthy point-in-time history is unavailable.
 - Daily OHLC cannot resolve every intraday path when several levels trade in one session; the simulator applies the documented deterministic ordering.
 - STOP_LIMIT quantity uses the production worst-limit-to-reference-stop distance; post-fill protection then re-anchors to fill minus 2 ATR.
+- The original pre-registration (`997e247`) named deterministic liquidity order and fill-anchored stops. The result commit (`becc25b`) amended those terms for parity: preserve each frozen universe's actual order and size from the worst limit to the reference-anchored stop. The amendments were applied uniformly, but were not part of the original frozen wording.
+- Production does not currently enforce the 4R heat cap. Because the cap rejected thousands of classic candidates while never binding current close-based 30/15 here, any classic paper experiment must separately authorize enforcement or these modeled classic results do not describe its behavior.
 - Allocator stretch and cross-sleeve competition are omitted. The 12% Donchian baseline is a conservative isolated deployment boundary.
 - These results can motivate a separately reviewed paper cohort. They cannot change the current 30/15 configuration, satisfy the 25-exit requirement, or authorize live graduation.

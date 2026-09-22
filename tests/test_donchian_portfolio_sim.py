@@ -7,7 +7,10 @@ from backtest.donchian_portfolio_sim import (
     simulate_portfolio,
     stop_limit_fill,
 )
-from scripts.donchian_parameter_rebaseline import select_variant
+from scripts.donchian_parameter_rebaseline import (
+    select_variant,
+    sensitivity_favorable,
+)
 
 
 def _bars(*, breakout: bool = True, base_price: float = 100.0) -> pd.DataFrame:
@@ -22,6 +25,21 @@ def _bars(*, breakout: bool = True, base_price: float = 100.0) -> pd.DataFrame:
 
 
 class TestSharedDonchianPortfolio:
+    def test_sensitivity_metric_choice_is_explicit(self) -> None:
+        sensitivity = {
+            "year_challenger_return": 0.13,
+            "year_control_return": 0.14,
+            "symbol_challenger_return": 0.14,
+            "symbol_control_return": 0.08,
+            "year_challenger_sharpe": 0.96,
+            "year_control_sharpe": 0.76,
+            "symbol_challenger_sharpe": 0.92,
+            "symbol_control_sharpe": 0.52,
+        }
+
+        assert not sensitivity_favorable(sensitivity, "return")
+        assert sensitivity_favorable(sensitivity, "sharpe")
+
     def test_shared_position_ceiling_counts_capacity_skips(self) -> None:
         bars = {f"S{i}": _bars() for i in range(3)}
         regime = pd.Series("TRENDING", index=next(iter(bars.values())).index)

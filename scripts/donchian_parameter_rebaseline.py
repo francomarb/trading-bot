@@ -96,6 +96,20 @@ def _stitched_stats(results: list[PortfolioResult]) -> dict[str, float]:
     }
 
 
+def sensitivity_favorable(
+    sensitivity: dict[str, object], metric: str,
+) -> bool:
+    """Return whether both concentration checks favor the challenger."""
+    if metric not in {"return", "sharpe"}:
+        raise ValueError(f"unsupported sensitivity metric: {metric}")
+    return bool(
+        float(sensitivity[f"year_challenger_{metric}"])
+        > float(sensitivity[f"year_control_{metric}"])
+        and float(sensitivity[f"symbol_challenger_{metric}"])
+        > float(sensitivity[f"symbol_control_{metric}"])
+    )
+
+
 def render_report(
     folds: dict[tuple[int, int], dict[int, PortfolioResult]],
     selected: dict[int, tuple[int, int]],
@@ -146,12 +160,13 @@ def render_report(
     control_pair = (30, 15)
     control = _stitched_stats([folds[control_pair][y] for y in HOLDOUT_YEARS])
     lines += [
-        "", "## Pre-registered verdict", "",
-        "Every challenger is evaluated against the same conjunctive rule; the report does not choose one challenger after viewing the results.", "",
-        "| Challenger | Years won | Sharpe edge | DD difference | Mean R | Remove-best-year | Remove-best-symbol | Verdict |",
+        "", "## Frozen implemented verdict and metric ambiguity", "",
+        "Every challenger is evaluated against the same conjunctive rule; the report does not choose one challenger after viewing the results. Criterion 5 was pre-registered as remaining `directionally favorable` but did not name return or Sharpe. The implementation used return before the corrected 30/10 result existed. Both readings are disclosed below rather than retroactively choosing one.", "",
+        "| Challenger | Years won | Sharpe edge | DD difference | Mean R | Remove-best-year (return; Sharpe) | Remove-best-symbol (return; Sharpe) | Return-rule verdict |",
         "|---|---:|---:|---:|---:|---|---|---|",
     ]
     passing: list[tuple[int, int]] = []
+    sharpe_passing: list[tuple[int, int]] = []
     for pair in VARIANTS:
         if pair == control_pair:
             continue
@@ -164,29 +179,40 @@ def render_report(
         sharpe_edge = challenger["sharpe"] - control["sharpe"]
         dd_difference = challenger["max_drawdown"] - control["max_drawdown"]
         sensitivity = sensitivities[pair]
+        return_sensitivity_favorable = sensitivity_favorable(
+            sensitivity, "return"
+        )
+        sharpe_sensitivity_favorable = sensitivity_favorable(
+            sensitivity, "sharpe"
+        )
         criteria = (
             years_won >= 4,
             sharpe_edge >= 0.15,
             dd_difference >= -0.03,
             challenger["mean_r"] > 0,
-            bool(
-                sensitivity["year_favorable"]
-                and sensitivity["symbol_favorable"]
-            ),
+            return_sensitivity_favorable,
         )
         if all(criteria):
             passing.append(pair)
+        if all((*criteria[:4], sharpe_sensitivity_favorable)):
+            sharpe_passing.append(pair)
         lines.append(
             f"| {pair[0]}/{pair[1]} | {years_won}/5 | {sharpe_edge:+.2f} | "
             f"{100*dd_difference:+.1f}pp | {challenger['mean_r']:+.2f}R | "
             f"{sensitivity['best_year']}: "
             f"{100*float(sensitivity['year_challenger_return']):+.1f}% vs "
             f"{100*float(sensitivity['year_control_return']):+.1f}% "
-            f"({'PASS' if sensitivity['year_favorable'] else 'FAIL'}) | "
+            f"({'PASS' if sensitivity['year_return_favorable'] else 'FAIL'}); "
+            f"{float(sensitivity['year_challenger_sharpe']):+.2f} vs "
+            f"{float(sensitivity['year_control_sharpe']):+.2f} "
+            f"({'PASS' if sensitivity['year_sharpe_favorable'] else 'FAIL'}) | "
             f"ex {sensitivity['best_symbol']}: "
             f"{100*float(sensitivity['symbol_challenger_return']):+.1f}% vs "
             f"{100*float(sensitivity['symbol_control_return']):+.1f}% "
-            f"({'PASS' if sensitivity['symbol_favorable'] else 'FAIL'}) | "
+            f"({'PASS' if sensitivity['symbol_return_favorable'] else 'FAIL'}); "
+            f"{float(sensitivity['symbol_challenger_sharpe']):+.2f} vs "
+            f"{float(sensitivity['symbol_control_sharpe']):+.2f} "
+            f"({'PASS' if sensitivity['symbol_sharpe_favorable'] else 'FAIL'}) | "
             f"C1 {'P' if criteria[0] else 'F'}, C2 {'P' if criteria[1] else 'F'}, "
             f"C3 {'P' if criteria[2] else 'F'}, C4 {'P' if criteria[3] else 'F'}, "
             f"C5 {'P' if criteria[4] else 'F'} |"
@@ -199,8 +225,16 @@ def render_report(
         )
     else:
         lines.append(
-            "**Decision: retain 30/15.** No challenger cleared every mandatory criterion; do not salvage a variant by changing the rule after seeing the result."
+            "**Implemented return-rule decision: retain 30/15.** No challenger cleared every mandatory criterion under the return reading used by the frozen implementation."
         )
+    sharpe_labels = ", ".join(
+        f"{pair[0]}/{pair[1]}" for pair in sharpe_passing
+    ) or "none"
+    thirty_ten = sensitivities[(30, 10)]
+    lines += [
+        "",
+        f"Under a Sharpe reading of criterion 5, the full-rule passers would be: **{sharpe_labels}**. For 30/10 specifically, remove-{thirty_ten['best_year']} Sharpe is {float(thirty_ten['year_challenger_sharpe']):+.2f} versus {float(thirty_ten['year_control_sharpe']):+.2f} for the control and the ex-{thirty_ten['best_symbol']} Sharpe is {float(thirty_ten['symbol_challenger_sharpe']):+.2f} versus {float(thirty_ten['symbol_control_sharpe']):+.2f}. The metric ambiguity cannot be resolved after seeing the result, so production remains 30/15 pending forward evidence. The historical direction nevertheless makes close-based 30/10 the leading candidate if a separately pre-registered paper experiment is later authorized.",
+    ]
     lines += ["", "## Selection audit", ""]
     for year in HOLDOUT_YEARS:
         scores = ", ".join(
@@ -212,7 +246,7 @@ def render_report(
         lines.append(f"- {pair[0]}/{pair[1]}: {_fmt_inline(shadow[pair])}")
     lines += ["", "## Coverage and limitations", "",
               f"- Frozen ranked pool: {len(coverage)} symbols; lifecycle-only SPCX excluded.",
-              "- Production parity includes the allocator's pre-sizing $100 minimum remaining-sleeve-capacity check and conservative STOP_LIMIT quantity from the worst permitted limit down to the pre-fill reference-anchored stop. Earlier drafts omitted the floor and then divided risk by only the post-fill 2 ATR protection distance; both corrections materially changed headline metrics, so these estimates support the no-change decision rather than precise expected returns.",
+              "- Production parity includes the allocator's pre-sizing $100 minimum remaining-sleeve-capacity check and conservative STOP_LIMIT quantity from the worst permitted limit down to the pre-fill reference-anchored stop. Earlier drafts omitted the floor and then divided risk by only the post-fill 2 ATR protection distance; both corrections materially changed headline metrics, so these estimates are not precise forecasts of any variant's edge.",
               "- Coverage is listing/provider dependent; no pre-listing history is fabricated.",
               "- Earnings blackout is unmodeled; current-cohort survivorship and selection bias remain.",
               "- See `docs/donchian_parameter_rebaseline.md` for the frozen contract and decision rule.", ""]
@@ -305,11 +339,17 @@ def main() -> int:
             "best_year": best_year,
             "year_control_return": year_control["return"],
             "year_challenger_return": year_challenger["return"],
-            "year_favorable": year_challenger["return"] > year_control["return"],
+            "year_control_sharpe": year_control["sharpe"],
+            "year_challenger_sharpe": year_challenger["sharpe"],
+            "year_return_favorable": year_challenger["return"] > year_control["return"],
+            "year_sharpe_favorable": year_challenger["sharpe"] > year_control["sharpe"],
             "best_symbol": best_symbol,
             "symbol_control_return": symbol_control["return"],
             "symbol_challenger_return": symbol_challenger["return"],
-            "symbol_favorable": symbol_challenger["return"] > symbol_control["return"],
+            "symbol_control_sharpe": symbol_control["sharpe"],
+            "symbol_challenger_sharpe": symbol_challenger["sharpe"],
+            "symbol_return_favorable": symbol_challenger["return"] > symbol_control["return"],
+            "symbol_sharpe_favorable": symbol_challenger["sharpe"] > symbol_control["sharpe"],
         }
     coverage = {s: (df.index.min(), df.index.max(), len(df)) for s, df in bars.items()}
     Path(args.output).write_text(

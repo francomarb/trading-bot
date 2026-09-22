@@ -75,6 +75,22 @@ The classic variants are implementation-family comparisons, not parameter
 challengers inside the current close-based implementation. The report must not
 call close-based 20/10 "classic."
 
+### Post-registration parity amendments
+
+The original frozen wording in `997e247` specified deterministic liquidity
+order and fill-anchored 2 ATR stops. The result commit `becc25b` made two
+parity amendments before publishing the comparison:
+
+- preserve each frozen universe's actual order—the original operator order for
+  the 32-name basket and the promoted liquidity ranking for the durable 100;
+- size STOP_LIMIT entries from the worst permitted limit to the
+  reference-anchored pre-fill stop, then rebuild protection at fill minus
+  2 ATR.
+
+Both corrections were applied uniformly to every cell and improve production
+fidelity. They were not part of the original frozen wording and must not be
+presented as though they were.
+
 ### Portfolio contract
 
 Hold constant across every cell:
@@ -97,8 +113,16 @@ Hold constant across every cell:
 - no earnings blackout unless trustworthy point-in-time history is available;
   omission must remain explicit; and
 - no allocator stretch. This isolates the Donchian baseline budget and must be
-  labelled as a conservative deployment boundary rather than exact full-book
-  arbitration.
+labelled as a conservative deployment boundary rather than exact full-book
+arbitration.
+
+Production currently has `STRATEGY_HEAT_CAP_ENFORCED=False`: it records
+would-block events but does not refuse entries. The classic results below are
+therefore conditional on enabling the cap. Any classic paper experiment must
+make that enforcement a separate recorded policy decision; otherwise its
+behavior will not match this model. This condition matters because the cap
+refused thousands of classic candidates while never binding current
+close-based 30/15 in the isolated baseline sleeve.
 
 ### Evaluation boundary
 
@@ -142,9 +166,13 @@ aggregate return but fewer resolved clusters and greater dependence on its top
 contributor. The 4R cap refused many classic pending-order bursts; it did not
 bind current close-based 30/15 inside the isolated 12% baseline sleeve.
 
-This is enough to retain classic high/low semantics as a plausible future paper
-experiment, not enough to replace the frozen deployment. The historical years
-and present-day memberships are already exposed, and the variants have
-materially different order frequency. The next authoritative evidence is the
-forward 30/15 cohort: at least 25 trusted exits plus enough distinct entry
-clusters before any implementation-family experiment or graduation review.
+Classic high/low semantics remain a plausible implementation-family research
+hypothesis, not a replacement for the frozen deployment. Across the combined
+work, close-based 30/10 has stronger direct support for a future experiment:
+the expanding selector chose it in all five folds, it passed criteria 1–4, and
+criterion 5 changes from fail to pass when the unspecified sensitivity metric
+is Sharpe rather than return. The historical years and present-day memberships
+are already exposed, so neither candidate is promoted. The next authoritative
+evidence is the forward 30/15 cohort: at least 25 trusted exits plus enough
+distinct entry clusters before any separately pre-registered parameter or
+implementation-family experiment, or a graduation review.
