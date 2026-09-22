@@ -1,0 +1,178 @@
+# Donchian Deployment Validation
+
+**Roadmap item:** `11.74`
+
+**Status:** HISTORICAL COMPARISON COMPLETE; FORWARD GATE OPEN; production settings unchanged
+
+**Pre-registration date:** 2026-09-21
+
+## Governing assessment
+
+Donchian is classified as:
+
+> **Plausible core signal, unproven deployment, strongly adverse initial regime.**
+
+Backtests are hypothesis and robustness evidence. Matched-configuration paper
+outcomes, reconciliation, and operational evidence remain authoritative. No
+historical result in this work can graduate the strategy or explain away poor
+forward results.
+
+## Original five-part requirement and current status
+
+1. **Repair the production-mirror and exit-observation evidence defects —
+   complete.** Lifecycle-exact reconciliation now uses recorded strategy
+   identity and regime. Donchian's 30/10-versus-30/15 observation uses the
+   correct owner identity and prior-close channel definition.
+2. **Freeze the universe and configuration — active.** The frozen paper cohort
+   begins with the corrected 100-name durable-liquidity pool and its current
+   configuration hash. Later universe, channel, filter, sizing, regime, feed,
+   or execution changes start a new cohort rather than being pooled into this
+   one.
+3. **Run a pre-registered production-like portfolio simulation — complete for
+   the isolated baseline sleeve.**
+   `11.73` implemented shared account cash, the production 12% baseline sleeve
+   budget, 4.8% per-position notional cap, 0.40% entry-risk target, whole-share
+   sizing, the allocator's pre-sizing $100 availability floor, DAY STOP_LIMIT
+   behavior, fixed fill-anchored 2 ATR protection, eight-position concurrency,
+   edge/regime gates, and deterministic candidate order. This extension
+   enforces the pre-registered 4R cap, including pending DAY reservations.
+   Allocator stretch and cross-sleeve arbitration remain omitted and explicit.
+4. **Use a holdout and compare the implementation families — complete as a
+   fixed historical sensitivity.** The
+   fixed 2021–2025 folds compared close-based 20/10, 30/10, 30/15, and 55/20
+   on the expanded pool. They did not test classic prior-high/prior-low Turtle
+   semantics or the original 32-name universe. This extension completed those
+   comparisons. The already inspected years must not be
+   relabelled as a new untouched holdout.
+5. **Collect enough forward evidence — open.** Do not reconsider Donchian for
+   live use before at least 25 trusted exits under one frozen configuration and
+   enough distinct entry clusters have resolved. Twenty-five symbols entering
+   the same market breakout are not 25 independent observations.
+
+## Frozen research extension
+
+The extension answered only the comparisons omitted by `11.73`. It reused
+the shared-capital simulator rather than the old per-symbol production-mirror
+script.
+
+### Universes
+
+- `ai_bigtech`: the frozen original 32-name operator-supplied research basket;
+- `durable_100`: the ranked first 100 names in the corrected active Donchian
+  pool, excluding lifecycle-only protection members.
+
+### Strategy families
+
+- **Current 30/15 close/close control:** entry close above the prior 30 closes;
+  exit close below the prior 15 closes, followed by the production-style next
+  session order behavior.
+- **Classic 20/10 high/low:** entry at a breakout of the prior 20 session highs
+  and exit at a break of the prior 10 session lows.
+- **Classic 55/20 high/low:** the slower Turtle System 2 comparison using the
+  same high/low semantics.
+
+The classic variants are implementation-family comparisons, not parameter
+challengers inside the current close-based implementation. The report must not
+call close-based 20/10 "classic."
+
+### Post-registration parity amendments
+
+The original frozen wording in `997e247` specified deterministic liquidity
+order and fill-anchored 2 ATR stops. The result commit `becc25b` made two
+parity amendments before publishing the comparison:
+
+- preserve each frozen universe's actual order—the original operator order for
+  the 32-name basket and the promoted liquidity ranking for the durable 100;
+- size STOP_LIMIT entries from the worst permitted limit to the
+  reference-anchored pre-fill stop, then rebuild protection at fill minus
+  2 ATR.
+
+Both corrections were applied uniformly to every cell and improve production
+fidelity. They were not part of the original frozen wording and must not be
+presented as though they were.
+
+### Portfolio contract
+
+Hold constant across every cell:
+
+- delayed consolidated SIP daily bars and full-history indicator warmup;
+- the stock SMA200 and $20M consolidated-dollar-volume filters;
+- the current SPY regime policy: TRENDING, RANGING, and VOLATILE allowed;
+  BEAR and unknown blocked;
+- production baseline sleeve capital, per-position notional cap, whole-share
+  sizing, minimum-availability floor, and eight-position ceiling;
+- DAY STOP_LIMIT entry/chase behavior and deterministic frozen universe order;
+  the old 32-name deployment preserves its original operator order, while the
+  durable 100 preserves its promoted liquidity ranking;
+- conservative pre-fill sizing from the worst permitted limit down to the
+  signal-close-minus-2-ATR stop, followed by fill-anchored static 2 ATR
+  protection, including gap-through behavior;
+- **the pre-registered 4R / 1.60%-of-equity heat cap enforced**, including
+  pending DAY-entry reservations rather than filled positions alone;
+- the same modeled exit/stop transaction cost used by `11.73`;
+- no earnings blackout unless trustworthy point-in-time history is available;
+  omission must remain explicit; and
+- no allocator stretch. This isolates the Donchian baseline budget and must be
+labelled as a conservative deployment boundary rather than exact full-book
+arbitration.
+
+Production currently has `STRATEGY_HEAT_CAP_ENFORCED=False`: it records
+would-block events but does not refuse entries. The classic results below are
+therefore conditional on enabling the cap. Any classic paper experiment must
+make that enforcement a separate recorded policy decision; otherwise its
+behavior will not match this model. This condition matters because the cap
+refused thousands of classic candidates while never binding current
+close-based 30/15 in the isolated baseline sleeve.
+
+### Evaluation boundary
+
+The historical period is a fixed-cohort sensitivity study because current
+universe membership and the 2021–2025 results are already known. Report each
+calendar year, the common fixed period, exit-reason mix, capacity and heat
+refusals, contributor concentration, and usable-history coverage. Do not select
+a winner by adding or changing variants after results are viewed.
+
+The genuinely untouched evidence begins prospectively after this
+pre-registration. Paper outcomes must remain grouped by exact configuration
+hash and entry cluster. Historical diagnostics can justify a separately
+reviewed paper experiment; they cannot satisfy the 25-exit/independent-cluster
+graduation requirement.
+
+## Decision rules
+
+- The current paper configuration remains close-based 30/15 throughout this
+  study.
+- A historical challenger is only a hypothesis for a separate paper cohort.
+- No variant is promoted merely for the best aggregate return or Sharpe.
+- Dependence on one year, one symbol, or one clustered market episode defeats
+  a durability claim.
+- Donchian remains **paper-only, no graduation** until the forward-evidence
+  requirement is met and reviewed by the operator.
+
+## Historical result
+
+The reproducible report is
+[`reports/donchian_deployment_validation_latest.md`](reports/donchian_deployment_validation_latest.md).
+On the common 2017–2025 fixed period:
+
+| Universe | Current close 30/15 | Classic high/low 20/10 | Classic high/low 55/20 |
+|---|---|---|---|
+| Original 32 | +18.6%, Sharpe 0.66, DD −4.1% | +23.4%, Sharpe 0.91, DD −2.7% | +22.4%, Sharpe 0.93, DD −3.8% |
+| Durable 100 | +26.3%, Sharpe 0.73, DD −7.3% | +23.8%, Sharpe 1.22, DD −2.3% | +31.5%, Sharpe 1.03, DD −4.8% |
+
+Classic 20/10 improved risk-adjusted performance and drawdown on both frozen
+universes, but did not dominate annual returns. Classic 55/20 produced stronger
+aggregate return but fewer resolved clusters and greater dependence on its top
+contributor. The 4R cap refused many classic pending-order bursts; it did not
+bind current close-based 30/15 inside the isolated 12% baseline sleeve.
+
+Classic high/low semantics remain a plausible implementation-family research
+hypothesis, not a replacement for the frozen deployment. Across the combined
+work, close-based 30/10 has stronger direct support for a future experiment:
+the expanding selector chose it in all five folds, it passed criteria 1–4, and
+criterion 5 changes from fail to pass when the unspecified sensitivity metric
+is Sharpe rather than return. The historical years and present-day memberships
+are already exposed, so neither candidate is promoted. The next authoritative
+evidence is the forward 30/15 cohort: at least 25 trusted exits plus enough
+distinct entry clusters before any separately pre-registered parameter or
+implementation-family experiment, or a graduation review.

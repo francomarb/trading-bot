@@ -10,65 +10,64 @@ Values: return | Sharpe | max drawdown | trades | win rate | mean R | capacity s
 
 | Year | 20/10 | 30/10 | 30/15 control | 55/20 | Expanding-history selection |
 |---:|---|---|---|---|---|
-| 2021 | +7.0%<br>+1.98<br>-1.4%<br>94<br>48.9%<br>+0.44R<br>2694 | +5.0%<br>+1.44<br>-1.9%<br>102<br>42.2%<br>+0.21R<br>2332 | +6.4%<br>+1.93<br>-1.8%<br>47<br>59.6%<br>+1.04R<br>2465 | +3.9%<br>+1.25<br>-1.8%<br>40<br>60.0%<br>+0.98R<br>2061 | 30/15 |
-| 2022 | -2.6%<br>-1.60<br>-3.3%<br>34<br>14.7%<br>-0.35R<br>335 | -2.4%<br>-1.64<br>-2.7%<br>33<br>18.2%<br>-0.45R<br>263 | -2.6%<br>-1.94<br>-2.7%<br>32<br>9.4%<br>-0.55R<br>274 | -1.5%<br>-1.04<br>-2.7%<br>26<br>15.4%<br>-0.10R<br>205 | 30/15 |
-| 2023 | -0.3%<br>-0.10<br>-2.9%<br>90<br>36.7%<br>+0.16R<br>2553 | +0.7%<br>+0.30<br>-2.6%<br>90<br>32.2%<br>+0.16R<br>2232 | +1.1%<br>+0.43<br>-2.7%<br>64<br>35.9%<br>+0.22R<br>2318 | +1.9%<br>+0.75<br>-2.3%<br>48<br>35.4%<br>+0.13R<br>1975 | 30/15 |
-| 2024 | +0.9%<br>+0.34<br>-2.7%<br>94<br>46.8%<br>+0.50R<br>2843 | +4.7%<br>+1.36<br>-2.5%<br>91<br>45.1%<br>+0.75R<br>2455 | +1.8%<br>+0.62<br>-3.1%<br>76<br>43.4%<br>+0.62R<br>2517 | +6.7%<br>+1.69<br>-3.2%<br>58<br>37.9%<br>+0.76R<br>2352 | 20/10 |
-| 2025 | +2.9%<br>+0.85<br>-2.8%<br>82<br>41.5%<br>+0.93R<br>2440 | +5.1%<br>+1.28<br>-2.7%<br>62<br>37.1%<br>+1.24R<br>2289 | +5.4%<br>+1.22<br>-3.4%<br>55<br>36.4%<br>+1.21R<br>2313 | +5.5%<br>+1.31<br>-2.8%<br>41<br>36.6%<br>+0.49R<br>2109 | 20/10 |
+| 2021 | +6.0%<br>+1.83<br>-1.9%<br>87<br>51.7%<br>+0.57R<br>2879 | +5.3%<br>+1.43<br>-2.2%<br>95<br>48.4%<br>+0.41R<br>2474 | +3.6%<br>+0.99<br>-2.9%<br>55<br>52.7%<br>+0.71R<br>2631 | +4.5%<br>+1.14<br>-2.7%<br>46<br>58.7%<br>+0.91R<br>2184 | 30/10 |
+| 2022 | -2.4%<br>-1.66<br>-2.7%<br>34<br>14.7%<br>-0.41R<br>367 | -2.1%<br>-1.59<br>-2.5%<br>27<br>14.8%<br>-0.46R<br>306 | -2.4%<br>-1.92<br>-2.5%<br>30<br>10.0%<br>-0.45R<br>294 | -1.2%<br>-0.85<br>-2.5%<br>21<br>14.3%<br>+0.07R<br>243 | 30/10 |
+| 2023 | +3.0%<br>+1.01<br>-3.0%<br>86<br>33.7%<br>+0.08R<br>2836 | +1.8%<br>+0.79<br>-2.6%<br>80<br>35.0%<br>+0.25R<br>2485 | +1.6%<br>+0.68<br>-2.6%<br>61<br>36.1%<br>+0.43R<br>2516 | +2.8%<br>+1.09<br>-2.6%<br>42<br>40.5%<br>+0.49R<br>2118 | 30/10 |
+| 2024 | +3.8%<br>+1.31<br>-2.3%<br>82<br>48.8%<br>+0.45R<br>3189 | +4.4%<br>+1.18<br>-2.8%<br>95<br>47.4%<br>+0.66R<br>2710 | +1.1%<br>+0.43<br>-2.4%<br>79<br>44.3%<br>+0.51R<br>2774 | +2.5%<br>+0.86<br>-3.2%<br>61<br>37.7%<br>+0.56R<br>2525 | 30/10 |
+| 2025 | +3.3%<br>+1.10<br>-2.8%<br>87<br>39.1%<br>+0.87R<br>2723 | +8.1%<br>+1.61<br>-3.3%<br>65<br>43.1%<br>+1.32R<br>2472 | +11.3%<br>+1.40<br>-7.0%<br>50<br>30.0%<br>+1.34R<br>2566 | +6.2%<br>+1.45<br>-2.6%<br>45<br>35.6%<br>+0.52R<br>2289 | 30/10 |
 
 ## Stitched held-out results
 
 | Variant | Return | Sharpe | Max drawdown | Trades | Mean R |
 |---|---:|---:|---:|---:|---:|
-| 20/10 | +7.8% | +0.54 | -4.9% | 394 | +0.42R |
-| 30/10 | +13.5% | +0.84 | -5.0% | 378 | +0.44R |
-| 30/15 | +12.5% | +0.78 | -4.1% | 274 | +0.58R |
-| 55/20 | +17.4% | +1.02 | -3.3% | 213 | +0.50R |
-| Expanding selection | +8.8% | +0.62 | -4.7% | 319 | +0.53R |
+| 20/10 | +14.3% | +0.97 | -4.8% | 376 | +0.41R |
+| 30/10 | +18.4% | +1.01 | -4.1% | 362 | +0.54R |
+| 30/15 | +15.7% | +0.71 | -7.0% | 275 | +0.58R |
+| 55/20 | +15.5% | +0.93 | -3.2% | 215 | +0.57R |
+| Expanding selection | +18.4% | +1.01 | -4.1% | 362 | +0.54R |
 
 ## Held-out exit-reason mix
 
 | Variant | Stop gap | Intrabar stop | Signal | Fold-end close |
 |---|---:|---:|---:|---:|
-| 20/10 | 6.6% | 22.6% | 64.7% | 6.1% |
-| 30/10 | 5.8% | 26.2% | 61.6% | 6.3% |
-| 30/15 | 7.7% | 31.8% | 50.0% | 10.6% |
-| 55/20 | 8.9% | 36.6% | 43.7% | 10.8% |
+| 20/10 | 6.6% | 25.8% | 60.9% | 6.6% |
+| 30/10 | 6.1% | 22.4% | 65.2% | 6.4% |
+| 30/15 | 7.6% | 32.7% | 48.4% | 11.3% |
+| 55/20 | 11.6% | 29.8% | 44.7% | 14.0% |
 
-## Pre-registered verdict
+## Frozen implemented verdict and metric ambiguity
 
-The strongest challenger, 55/20, beat 30/15 on return in **4 of 5** held-out years; the required bar was 4 of 5.
+Every challenger is evaluated against the same conjunctive rule; the report does not choose one challenger after viewing the results. Criterion 5 was pre-registered as remaining `directionally favorable` but did not name return or Sharpe. The implementation used return before the corrected 30/10 result existed. Both readings are disclosed below rather than retroactively choosing one.
 
-Its stitched Sharpe advantage was **+0.24** (required at least +0.15), maximum-drawdown difference was **+0.8 percentage points** (must not be worse by more than 3), and mean R was **+0.50R**.
+| Challenger | Years won | Sharpe edge | DD difference | Mean R | Remove-best-year (return; Sharpe) | Remove-best-symbol (return; Sharpe) | Return-rule verdict |
+|---|---:|---:|---:|---:|---|---|---|
+| 20/10 | 3/5 | +0.26 | +2.2pp | +0.41R | 2024: +10.1% vs +14.5% (FAIL); +0.88 vs +0.76 (PASS) | ex NVDA: +10.6% vs +14.3% (FAIL); +0.75 vs +0.73 (PASS) | C1 F, C2 P, C3 P, C4 P, C5 F |
+| 30/10 | 4/5 | +0.30 | +2.9pp | +0.54R | 2024: +13.4% vs +14.5% (FAIL); +0.96 vs +0.76 (PASS) | ex SNDK: +14.2% vs +8.2% (PASS); +0.92 vs +0.52 (PASS) | C1 P, C2 P, C3 P, C4 P, C5 F |
+| 55/20 | 4/5 | +0.22 | +3.8pp | +0.57R | 2024: +12.7% vs +14.5% (FAIL); +0.94 vs +0.76 (PASS) | ex STX: +10.6% vs +18.5% (FAIL); +0.74 vs +0.83 (FAIL) | C1 P, C2 P, C3 P, C4 P, C5 F |
 
-### Concentration sensitivities
+**Implemented return-rule decision: retain 30/15.** No challenger cleared every mandatory criterion under the return reading used by the frozen implementation.
 
-- Remove-best-year: excluded 2024. The remaining stitched return was +10.0% for 55/20 versus +10.5% for 30/15 — **FAIL**.
-- Remove-best-symbol: excluded PLTR, the largest realized 55/20 P&L contributor. The rerun return was +12.1% for 55/20 versus +14.1% for 30/15 — **FAIL**.
-
-Criteria: C1 PASS, C2 PASS, C3 PASS, C4 PASS, C5 FAIL.
-
-**Decision: retain 30/15.** At least one mandatory pre-registered criterion failed; do not salvage 55/20 by changing the rule after seeing the result.
+Under a Sharpe reading of criterion 5, the full-rule passers would be: **30/10**. For 30/10 specifically, remove-2024 Sharpe is +0.96 versus +0.76 for the control and the ex-SNDK Sharpe is +0.92 versus +0.52. The metric ambiguity cannot be resolved after seeing the result, so production remains 30/15 pending forward evidence. The historical direction nevertheless makes close-based 30/10 the leading candidate if a separately pre-registered paper experiment is later authorized.
 
 ## Selection audit
 
-- 2021: selected 30/15 from prior-history Sharpe (20/10=+0.77, 30/10=+0.90, 30/15=+1.04, 55/20=+0.49).
-- 2022: selected 30/15 from prior-history Sharpe (20/10=+0.92, 30/10=+0.90, 30/15=+1.01, 55/20=+0.66).
-- 2023: selected 30/15 from prior-history Sharpe (20/10=+0.66, 30/10=+0.59, 30/15=+0.68, 55/20=+0.35).
-- 2024: selected 20/10 from prior-history Sharpe (20/10=+0.71, 30/10=+0.59, 30/15=+0.65, 55/20=+0.43).
-- 2025: selected 20/10 from prior-history Sharpe (20/10=+0.68, 30/10=+0.59, 30/15=+0.67, 55/20=+0.47).
+- 2021: selected 30/10 from prior-history Sharpe (20/10=+1.04, 30/10=+1.24, 30/15=+0.97, 55/20=+0.65).
+- 2022: selected 30/10 from prior-history Sharpe (20/10=+1.10, 30/10=+1.23, 30/15=+1.00, 55/20=+0.75).
+- 2023: selected 30/10 from prior-history Sharpe (20/10=+0.76, 30/10=+0.98, 30/15=+0.71, 55/20=+0.52).
+- 2024: selected 30/10 from prior-history Sharpe (20/10=+0.79, 30/10=+0.97, 30/15=+0.67, 55/20=+0.60).
+- 2025: selected 30/10 from prior-history Sharpe (20/10=+0.72, 30/10=+0.93, 30/15=+0.65, 55/20=+0.56).
 
 ## Partial 2026 shadow (non-decision)
 
-- 20/10: return +12.0%, Sharpe +1.94, max DD -3.8%, 69 trades, win rate 26.1%, mean +0.48R, 1534 capacity skips
-- 30/10: return +11.7%, Sharpe +1.87, max DD -4.4%, 70 trades, win rate 27.1%, mean +0.55R, 1356 capacity skips
-- 30/15: return +13.3%, Sharpe +1.60, max DD -6.2%, 64 trades, win rate 29.7%, mean +0.26R, 1376 capacity skips
-- 55/20: return +9.4%, Sharpe +1.58, max DD -5.1%, 42 trades, win rate 45.2%, mean +1.30R, 1173 capacity skips
+- 20/10: return +11.6%, Sharpe +2.06, max DD -3.1%, 71 trades, win rate 38.0%, mean +0.85R, 1723 capacity skips
+- 30/10: return +11.6%, Sharpe +2.03, max DD -4.2%, 80 trades, win rate 26.2%, mean +0.55R, 1527 capacity skips
+- 30/15: return +13.1%, Sharpe +1.85, max DD -5.5%, 53 trades, win rate 35.8%, mean +0.71R, 1624 capacity skips
+- 55/20: return +7.6%, Sharpe +1.55, max DD -3.9%, 42 trades, win rate 47.6%, mean +1.10R, 1363 capacity skips
 
 ## Coverage and limitations
 
 - Frozen ranked pool: 100 symbols; lifecycle-only SPCX excluded.
-- Production parity includes the allocator's pre-sizing $100 minimum remaining-sleeve-capacity check. The first published draft omitted it; review showed that residual-capacity handling materially changes headline metrics, so these estimates support the no-change decision rather than precise expected returns.
+- Production parity includes the allocator's pre-sizing $100 minimum remaining-sleeve-capacity check and conservative STOP_LIMIT quantity from the worst permitted limit down to the pre-fill reference-anchored stop. Earlier drafts omitted the floor and then divided risk by only the post-fill 2 ATR protection distance; both corrections materially changed headline metrics, so these estimates are not precise forecasts of any variant's edge.
 - Coverage is listing/provider dependent; no pre-listing history is fabricated.
 - Earnings blackout is unmodeled; current-cohort survivorship and selection bias remain.
 - See `docs/donchian_parameter_rebaseline.md` for the frozen contract and decision rule.

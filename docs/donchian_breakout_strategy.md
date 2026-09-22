@@ -548,6 +548,40 @@ positions have encountered a 10-day-only exit (`exit_10=True`,
 and label any hypothetical 30/10 execution price as a proxy. Do not turn the
 logged signal comparison into claimed realized P&L without that qualification.
 
+### 2026-09 deployment validation
+
+The durable-pool rebaseline and the follow-up implementation-family comparison
+now use a shared-capital simulator with production baseline sleeve capital,
+worst-limit STOP_LIMIT sizing, fill-anchored protection, whole-share and
+minimum-availability rules, concurrency, and deterministic candidate order.
+The follow-up also enforces the pre-registered 4R cap including pending DAY
+reservations.
+
+The final close-based rebaseline retains 30/15 under the implemented return
+reading of criterion 5. That criterion was pre-registered only as remaining
+"directionally favorable," without naming return or Sharpe. Under a Sharpe
+reading, 30/10 clears all five proposal criteria; it was also selected by
+expanding-history Sharpe in all five folds. The ambiguity cannot be resolved
+after seeing the result, so production remains unchanged and close-based 30/10
+is the leading hypothesis for any later separately pre-registered paper
+experiment.
+
+A separate fixed-cohort diagnostic found classic high/low 20/10 improved
+Sharpe and drawdown on both the original 32 and durable 100, while classic
+55/20 had stronger aggregate return but more contributor concentration. Those
+classic variants are different execution families, not parameter substitutions
+for the deployed close-based strategy. Their modeled results enforce the 4R
+heat cap, while production currently observes but does not enforce it; any
+classic experiment would need a separate enforcement decision to match the
+model.
+
+No production or paper setting changed. The authoritative next gate is at
+least 25 trusted exits under the frozen configuration plus enough distinct
+entry clusters; correlated symbols from one breakout episode do not count as
+independent evidence. See
+[`donchian_deployment_validation.md`](donchian_deployment_validation.md) and
+[`reports/donchian_deployment_validation_latest.md`](reports/donchian_deployment_validation_latest.md).
+
 ---
 
 ## DD reduction experiments (tested, rejected)
@@ -584,7 +618,11 @@ is more targeted and preserves edge; universe dilution is not worth the Sharpe c
 
 1. **Pyramiding** — add-to-winners per original Turtle system; requires engine multi-position-per-symbol support
 2. **Walk-forward validation** — current sweep is in-sample; validate with out-of-sample splits before live capital
-3. **System 2 (55/20) as a second slot** — viable on ai_bigtech (+0.79 Sharpe) and sector_etfs; consider parallel slow-trend sleeve
+3. **Classic high/low implementation paper experiment** — 20/10 improved
+   fixed-cohort Sharpe/drawdown across both studied universes, while 55/20 was
+   more contributor-concentrated. Do not add a parallel slot before the frozen
+   close-based 30/15 cohort clears the 25-exit/independent-cluster review and a
+   separate prospective paper experiment is pre-registered.
 4. **Portfolio-level DD simulation** — current harness averages per-symbol DD; a proper joint simulation would show true portfolio DD (expected to be significantly lower)
 5. **Edge-filter ablation** — quantify filter contribution by running filter-OFF sweep
 6. **Sector concentration cap** — `DONCHIAN_SECTOR_GROUPS` dict + 2-per-sector limit; deferred pending user decision on static-map approach

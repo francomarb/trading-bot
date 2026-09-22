@@ -49,7 +49,9 @@ pre-listing bars are never backfilled.
 - earnings blackout omitted because no point-in-time calendar is available;
 - DAY STOP_LIMIT entry on the following session, with the production 500 bps
   / 2 ATR tighter-of chase ceiling and intraday trigger/retrace semantics;
-- static protective stop at fill minus 2 ATR, including gap-through fills;
+- conservative STOP_LIMIT sizing from the worst permitted limit price down to
+  the pre-fill signal-close-minus-2-ATR stop, followed after fill by the
+  production fill-minus-2-ATR protective stop, including gap-through fills;
 - channel exits filled at the following session open;
 - one position per symbol, no pyramiding;
 - shared account equity, 0.40% risk budget per entry, 12% baseline Donchian
@@ -92,6 +94,13 @@ all of the following hold on the five fixed held-out folds:
 5. the result is not dependent on one year or one symbol (remove-best-year and
    remove-best-symbol sensitivity remains directionally favorable).
 
+Criterion 5 did not pre-register which reported metric defined
+"directionally favorable." The frozen implementation used portfolio return;
+that choice was coded before the corrected 30/10 result existed. Because the
+choice now changes the outcome, the result must disclose both the return and
+Sharpe readings rather than retroactively declaring either one uniquely
+pre-registered.
+
 If no challenger clears every bar, retain 30/15. A good static-cohort result
 does not validate the watchlist selector and does not erase the need for paper
 evidence under the new configuration hash.
@@ -114,25 +123,39 @@ be dropped from a favorable summary.
 
 The frozen run is published in
 [`reports/donchian_parameter_rebaseline_latest.md`](reports/donchian_parameter_rebaseline_latest.md).
-Review found that the first result omitted production's pre-sizing
-`MIN_TRADE_NOTIONAL` rule: the allocator refuses a candidate when remaining
-sleeve capacity is below $100. The corrected harness applies that exact
-availability check—not the stricter and inaccurate rule that every completed
-order itself must exceed $100—and the entire study was rerun from the warmed
-100-name SIP cache. Execution mechanics and the explicit-universe boundary
-received focused regression coverage at the same time.
+Two production-parity defects were found in review and the full study was rerun
+after each correction. First, the allocator refuses a candidate when remaining
+sleeve capacity is below `MIN_TRADE_NOTIONAL`; it does not require the eventual
+whole-share order itself to exceed $100. Second, STOP_LIMIT quantity is sized
+before fill from the worst permitted limit down to the reference-anchored stop.
+The first harness incorrectly divided risk by only 2 ATR, which is the later
+fill-anchored protection distance and can overstate approved quantity. The
+final harness now preserves the conservative pre-fill risk basis and the
+post-fill stop rebuild as separate stages. Focused tests cover both rules.
 
-In the corrected run, 55/20 had stitched held-out Sharpe 1.02 versus 0.78 for
-30/15, a shallower modeled maximum drawdown, positive mean R, and higher return
-in four of five years. It therefore passed criteria 1–4. It failed the
-pre-registered concentration guard: after removing its best relative year,
-55/20 returned 10.0% versus 10.5% for 30/15; after removing PLTR, its largest
-realized contributor, it returned 12.1% versus 14.1%. The expanding-history
-selector chose 30/15 for three folds and 20/10 for two; it never selected
-55/20.
+Final stitched held-out results were: 20/10 +14.3% return / 0.97 Sharpe /
+−4.8% maximum drawdown; 30/10 +18.4% / 1.01 / −4.1%; current 30/15 +15.7% /
+0.71 / −7.0%; and 55/20 +15.5% / 0.93 / −3.2%. The expanding-history selector
+chose 30/10 in all five folds. Every challenger was evaluated against the same
+conjunctive rule rather than declaring whichever aggregate result looked best
+the "strongest" after inspection.
 
-The conjunctive decision rule therefore still retains 30/15, now because
-criterion 5 failed. The material movement after a small capacity-parity repair
-also means the modeled point estimates are fragile: they support a no-change
-decision, not a precise forecast of either variant's edge. No live or paper
-configuration changed, and forward paper evidence remains the higher authority.
+Under the implemented return reading, no challenger cleared criterion 5.
+Removing its best relative year left 20/10 at +10.1%, 30/10 at +13.4%, and
+55/20 at +12.7%, each below the 30/15 control at +14.5%. The
+remove-best-symbol rerun also failed for 20/10 and 55/20; 30/10 passed that
+half of the return concentration test.
+
+The Sharpe reading changes that interpretation. For 30/10, removing 2024
+leaves Sharpe 0.96 versus 0.76 for 30/15, and removing SNDK leaves 0.92 versus
+0.52. It therefore clears all five proposal criteria if criterion 5 means
+Sharpe. That ambiguity cannot be resolved after viewing the result. Production
+and paper remain at **30/15 pending forward evidence**, but the historical
+direction favors close-based 30/10 and makes it the leading candidate if a
+separately pre-registered paper experiment is later authorized.
+
+The material movement after small-looking execution-parity repairs is itself
+evidence that the modeled point estimates are fragile. The return-based rule
+does not clear a change, while the result direction favors 30/10; neither is a
+precise forecast of durable edge. No live or paper configuration changed, and
+forward paper evidence remains the higher authority.
