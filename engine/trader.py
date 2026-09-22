@@ -690,6 +690,7 @@ class TradingEngine:
         self._running: bool = False
         self._session_start_equity: float | None = None
         self._cycle_count: int = 0
+        self._cycle_symbol_error_count: int = 0
         self._last_cycle_end: float = 0.0  # monotonic timestamp
         # Operator Controls Phase B — fast operator-command heartbeat.
         # Daemon thread polls the operator_commands queue every
@@ -1898,9 +1899,9 @@ class TradingEngine:
         total_symbols = sum(len(slot.active_symbols()) for slot in self.slots)
         processed_symbols = 0
         new_positions = 0
-        error_count = 0
         cycle_status = "ok"
         self._candidate_cycle_uid = uuid.uuid4().hex
+        self._cycle_symbol_error_count = 0
 
         # PLAN 11.10f: reset the per-cycle lifecycle counter accumulator
         # at the start of each cycle. Flushed via _flush_lifecycle_counters
@@ -2251,8 +2252,7 @@ class TradingEngine:
                             )
                     except Exception as e:
                         # Never let one symbol kill the cycle.
-                        error_count += 1
-                        cycle_status = "symbol_errors"
+                        self._cycle_symbol_error_count += 1
                         logger.exception(f"{symbol}: cycle step failed: {e}")
         finally:
             # RESTRICTED mode auto-clears after one cycle — anomalies were
@@ -2265,10 +2265,13 @@ class TradingEngine:
                 self._startup_mode = "NORMAL"
 
             duration = time.monotonic() - cycle_started_mono
+            if cycle_status == "ok" and self._cycle_symbol_error_count:
+                cycle_status = "symbol_errors"
             logger.info(
                 f"cycle {cycle_id} complete: status={cycle_status}, "
                 f"processed={processed_symbols}/{total_symbols}, "
-                f"new_positions={new_positions}, errors={error_count}, "
+                f"new_positions={new_positions}, "
+                f"errors={self._cycle_symbol_error_count}, "
                 f"duration={duration:.1f}s, "
                 f"next_cycle_in={self.config.cycle_interval_seconds:.0f}s"
             )
@@ -2285,6 +2288,11 @@ class TradingEngine:
             close_connections()
             self.broker.close_connections()
             self._last_cycle_end = time.monotonic()
+
+    def _record_cycle_symbol_error(self, message: str) -> None:
+        """Log a handled symbol error and include it in the cycle summary."""
+        self._cycle_symbol_error_count += 1
+        logger.error(message)
 
     def _process_symbol(
         self,
@@ -2368,7 +2376,7 @@ class TradingEngine:
                 )
                 df = df.join(renamed, how="inner").sort_index()
         except Exception as e:
-            logger.error(f"{symbol}: fetch failed: {e}")
+            self._record_cycle_symbol_error(f"{symbol}: fetch failed: {e}")
             return
         if df.empty:
             logger.warning(f"{symbol}: fetch returned no bars")
@@ -2447,7 +2455,7 @@ class TradingEngine:
                                     alert_reason="exit signal",
                                 )
                         except Exception as e:
-                            logger.error(
+                            self._record_cycle_symbol_error(
                                 f"[{strategy.name}] {symbol}: processed-bar exit check failed: {e}"
                             )
             if (
@@ -2613,7 +2621,10 @@ class TradingEngine:
                 if emergency_exit:
                     logger.warning(f"[{strategy.name}] {symbol}: EMERGENCY EXIT triggered by strategy hook.")
             except Exception as e:
-                logger.error(f"[{strategy.name}] {symbol}: inspect_open_positions failed: {e}")
+                self._record_cycle_symbol_error(
+                    f"[{strategy.name}] {symbol}: "
+                    f"inspect_open_positions failed: {e}"
+                )
 
         if (last_exit or emergency_exit) and position is not None:
             if self._has_pending_close_order(position.symbol, snapshot):
@@ -2961,7 +2972,10 @@ class TradingEngine:
                 )
                 return None
             except Exception as e:
-                logger.error(f"[{strategy.name}] Failed to build option execution for {symbol}: {e}")
+                self._record_cycle_symbol_error(
+                    f"[{strategy.name}] Failed to build option execution "
+                    f"for {symbol}: {e}"
+                )
                 self._update_candidate_observation(
                     candidate_uid,
                     disposition="execution_error",
@@ -3054,7 +3068,7 @@ class TradingEngine:
         ):
             policy = settings.ENTRY_PRICE_CAPS.get(strategy.name)
             if policy is None:
-                logger.error(
+                self._record_cycle_symbol_error(
                     f"[entry-guard] {strategy.name} {symbol}: STOP_LIMIT strategy "
                     f"requires an ENTRY_PRICE_CAPS policy to anchor the limit "
                     f"leg; skipping entry"
@@ -3071,7 +3085,7 @@ class TradingEngine:
             try:
                 trigger = float(strategy.compute_entry_trigger(df))
             except Exception as e:
-                logger.error(
+                self._record_cycle_symbol_error(
                     f"[entry-guard] {strategy.name} {symbol}: "
                     f"compute_entry_trigger failed: {e}"
                 )
@@ -3310,7 +3324,7 @@ class TradingEngine:
                         f"row will sit at pending until manual "
                         f"investigation"
                     )
-                    logger.error(msg)
+                    self._record_cycle_symbol_error(msg)
                     self.risk.record_broker_error()
                     self.alerts.broker_error(msg)
                 if strategy_statuses is not None:
@@ -3407,7 +3421,7 @@ class TradingEngine:
                 signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
             )
         except Exception as e:
-            logger.error(f"{symbol}: place_order raised: {e}")
+            self._record_cycle_symbol_error(f"{symbol}: place_order raised: {e}")
             self._update_candidate_observation(
                 candidate_uid,
                 selected=True,
@@ -10174,8 +10188,9 @@ class TradingEngine:
 
         Stale-orphan signal: rows older than
         ``_SUBSTRATE_NULL_ATTACH_SWEEP_STALE_SECONDS`` produce a
-        CRITICAL log so the operator knows the failure is no longer
-        transient.
+        CRITICAL log only when this recovery attempt leaves them
+        unresolved. A successful attach or broker-authoritative 404
+        is self-healing and must not raise a false alarm.
 
         Per-row exceptions are CRITICAL-logged and absorbed: one
         bad orphan cannot stall the cycle or startup.
@@ -10227,9 +10242,6 @@ class TradingEngine:
             if backoff_until is not None and backoff_until > now_utc:
                 skipped_for_backoff += 1
                 continue
-            # Stale rows whose backoff has expired should NOT
-            # silently re-fire forever; the per-row CRITICAL below
-            # provides the operator-visible signal.
             if budget is not None and rest_calls >= budget:
                 remaining = (
                     len(orphans) - rest_calls - skipped_for_backoff
@@ -10243,9 +10255,6 @@ class TradingEngine:
                 )
                 break
             rest_calls += 1
-            # CRITICAL on stale orphans BEFORE the broker call so
-            # the operator sees the alert even if the broker is
-            # also failing.
             try:
                 created_at_dt = datetime.fromisoformat(row.created_at)
                 if created_at_dt.tzinfo is None:
@@ -10255,17 +10264,6 @@ class TradingEngine:
                 is_stale = created_at_dt <= stale_cutoff
             except (ValueError, TypeError):
                 is_stale = False
-            if is_stale:
-                logger.critical(
-                    f"substrate {reason} null-attach sweep: orphan "
-                    f"client_order_id={cli} role={row.role} "
-                    f"position_uid={row.position_uid[:8]} has been "
-                    f"orphaned > "
-                    f"{_SUBSTRATE_NULL_ATTACH_SWEEP_STALE_SECONDS}s "
-                    f"(created_at={row.created_at}). The substrate "
-                    f"attach path is not self-healing for this row "
-                    f"— investigate."
-                )
             try:
                 broker_order = (
                     self.broker.get_order_by_client_id_for_sweep(cli)
@@ -10283,12 +10281,13 @@ class TradingEngine:
                         ),
                     )
                 )
-                logger.warning(
+                message = (
                     f"substrate {reason} null-attach sweep: "
                     f"get_order_by_client_id raised for {cli}: "
                     f"{type(exc).__name__}: {exc} — backed off for "
                     f"{_SUBSTRATE_NULL_ATTACH_SWEEP_BACKOFF_SECONDS}s"
                 )
+                (logger.critical if is_stale else logger.warning)(message)
                 continue
             # Successful broker call (200 or 404) clears any prior
             # backoff so a row that fails once then recovers gets
@@ -10328,15 +10327,17 @@ class TradingEngine:
                         f"client_order_id={cli} already resolved "
                         f"out of band; skipping"
                     )
+                self._release_resolved_order_watch(cli, reason=reason)
                 continue
 
             broker_order_id = str(getattr(broker_order, "id", ""))
             if not broker_order_id:
-                logger.warning(
+                message = (
                     f"substrate {reason} null-attach sweep: "
                     f"broker returned order without id for {cli}; "
                     f"skipping"
                 )
+                (logger.critical if is_stale else logger.warning)(message)
                 continue
 
             # Outcomes (a) and (b): attach the broker order_id.
@@ -10376,6 +10377,7 @@ class TradingEngine:
                         f"{cli} reached terminal {refreshed.status} "
                         f"during sweep; skipping"
                     )
+                    self._release_resolved_order_watch(cli, reason=reason)
                     continue
                 else:
                     logger.critical(
@@ -10399,6 +10401,7 @@ class TradingEngine:
                     f"client_order_id={cli} → order_id="
                     f"{broker_order_id} role={row.role}"
                 )
+                self._release_resolved_order_watch(cli, reason=reason)
 
             # Build the broker-state event and apply it. Alpaca
             # status 'new' / 'accepted' maps to substrate 'working'
@@ -10447,6 +10450,24 @@ class TradingEngine:
                 self._maybe_dispatch_substrate_stop_fill(
                     event=event, snapshot=snapshot,
                 )
+
+    def _release_resolved_order_watch(
+        self,
+        client_order_id: str,
+        *,
+        reason: str,
+    ) -> None:
+        """Drop transient stream bookkeeping after durable sweep resolution."""
+        if self._stream_manager is None:
+            return
+        try:
+            self._stream_manager.unwatch(client_order_id)
+        except Exception as exc:
+            logger.warning(
+                f"substrate {reason} null-attach sweep: failed to unwatch "
+                f"resolved client_order_id={client_order_id}: "
+                f"{type(exc).__name__}: {exc}"
+            )
 
     def _reconcile_substrate_via_rest(
         self,

@@ -15,7 +15,8 @@ Coverage (acceptance criteria from the PR brief):
 6. ``role='partial_close'`` excluded
 7. Spread close rows excluded
 8. PR #71 trailing-stop fallback race: no double-attach
-9. Stale orphan (>1h) fires CRITICAL log
+9. Stale resolved orphan stays quiet; stale unresolved orphan fires CRITICAL
+10. Durable resolution removes transient stream watch bookkeeping
 """
 
 from __future__ import annotations
@@ -228,6 +229,7 @@ class TestSweepAliveOrder:
                 order_id="alpaca-alive", status="new",
             )
         )
+        engine._stream_manager = MagicMock()
 
         engine._sweep_null_order_id_attaches(
             _make_snapshot(), reason="cycle", budget=5,
@@ -242,6 +244,7 @@ class TestSweepAliveOrder:
         # regular reconciler.
         assert row.status == "working"
         assert row.submitted_at is not None
+        engine._stream_manager.unwatch.assert_called_once_with("cli-alive")
 
 
 # ── (b) Terminal order: attach + advance ───────────────────────────────────
@@ -300,6 +303,7 @@ class TestSweepUnknownToBroker:
         engine.broker.get_order_by_client_id_for_sweep = MagicMock(
             return_value=None
         )
+        engine._stream_manager = MagicMock()
 
         engine._sweep_null_order_id_attaches(
             _make_snapshot(), reason="cycle", budget=5,
@@ -318,6 +322,7 @@ class TestSweepUnknownToBroker:
             (uid,),
         ).fetchone()
         assert pos_row[0] == "canceled"
+        engine._stream_manager.unwatch.assert_called_once_with("cli-unknown")
 
 
 # ── (4) Startup gap closure ────────────────────────────────────────────────
@@ -760,16 +765,15 @@ class TestSweepStarvationBackoff:
         )
 
 
-# ── (9) Stale orphan → CRITICAL ────────────────────────────────────────────
+# ── (9) Stale orphan escalation reflects post-lookup state ────────────────
 
 
 class TestSweepStaleOrphanCritical:
-    def test_stale_orphan_emits_critical(
+    def test_stale_orphan_resolved_by_attach_does_not_emit_critical(
         self,
         engine: TradingEngine,
         pos_store: PositionLifecycleStore,
         orders_store: PositionLifecycleOrdersStore,
-        caplog,
     ):
         from loguru import logger as loguru_logger
 
@@ -795,13 +799,48 @@ class TestSweepStaleOrphanCritical:
         finally:
             loguru_logger.remove(sink_id)
 
-        assert any(
-            "orphaned >" in m and "cli-stale" in m
-            for m in critical_messages
-        ), (
-            f"stale-orphan CRITICAL not emitted. messages="
-            f"{critical_messages}"
+        assert not critical_messages
+
+    def test_stale_orphan_with_failed_lookup_emits_critical_and_stays_watched(
+        self,
+        engine: TradingEngine,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        from loguru import logger as loguru_logger
+
+        _seed_orphan(
+            pos_store=pos_store,
+            orders_store=orders_store,
+            owner_key="STALEFAIL",
+            cli="cli-stale-fail",
+            age_seconds=2 * 3600,
         )
+        engine.broker.get_order_by_client_id_for_sweep = MagicMock(
+            side_effect=RuntimeError("broker unavailable")
+        )
+        engine._stream_manager = MagicMock()
+
+        critical_messages = []
+        sink_id = loguru_logger.add(
+            lambda msg: critical_messages.append(msg.record["message"]),
+            level="CRITICAL",
+        )
+        try:
+            engine._sweep_null_order_id_attaches(
+                _make_snapshot(), reason="cycle", budget=5,
+            )
+        finally:
+            loguru_logger.remove(sink_id)
+
+        assert any(
+            "cli-stale-fail" in message and "broker unavailable" in message
+            for message in critical_messages
+        )
+        engine._stream_manager.unwatch.assert_not_called()
+        row = orders_store.get_by_client_order_id("cli-stale-fail")
+        assert row.status == "pending"
+        assert row.order_id is None
 
 
 # ── Constants smoke ────────────────────────────────────────────────────────

@@ -1730,6 +1730,46 @@ class TestRunOneCycle:
         # Even with the first symbol failing, the second placed an order.
         assert broker.place_order.call_count == 1
 
+    def test_handled_symbol_errors_are_counted_in_cycle_summary(
+        self, engine_factory, patch_fetch
+    ):
+        from loguru import logger as loguru_logger
+
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        engine.slots[0].symbols = ["BAD", "AAPL"]
+        engine._session_start_equity = 100_000.0
+        engine._cycle_count = 1
+        broker.place_order.side_effect = RuntimeError("submit disconnected")
+        original = patch_fetch["df"]
+
+        def _fetch(symbol, start, end, timeframe="1Day", **kwargs):
+            if symbol == "BAD":
+                raise RuntimeError("fetch disconnected")
+            return original, SimpleNamespace(api_calls=0)
+
+        import engine.trader as engmod
+
+        summaries = []
+        sink_id = loguru_logger.add(
+            lambda msg: summaries.append(msg.record["message"])
+            if "cycle 1 complete:" in msg.record["message"]
+            else None,
+            level="INFO",
+        )
+        engmod.fetch_symbol = _fetch
+        try:
+            engine._run_one_cycle()
+        finally:
+            engmod.fetch_symbol = lambda *a, **k: (
+                original,
+                SimpleNamespace(api_calls=0),
+            )
+            loguru_logger.remove(sink_id)
+
+        assert len(summaries) == 1
+        assert "status=symbol_errors" in summaries[0]
+        assert "errors=2" in summaries[0]
+
     def test_market_open_daily_cycle_ignores_in_progress_bar(
         self, engine_factory, patch_fetch
     ):
