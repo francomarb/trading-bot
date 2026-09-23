@@ -10221,7 +10221,10 @@ class TradingEngine:
         if not orphans:
             return
 
-        from engine.lifecycle_orders import apply_order_event
+        from engine.lifecycle_orders import (
+            TERMINAL_ORDER_STATUSES,
+            apply_order_event,
+        )
 
         rest_calls = 0
         skipped_for_backoff = 0
@@ -10401,7 +10404,6 @@ class TradingEngine:
                     f"client_order_id={cli} → order_id="
                     f"{broker_order_id} role={row.role}"
                 )
-                self._release_resolved_order_watch(cli, reason=reason)
 
             # Build the broker-state event and apply it. Alpaca
             # status 'new' / 'accepted' maps to substrate 'working'
@@ -10434,6 +10436,8 @@ class TradingEngine:
                     f"{exc}"
                 )
                 continue
+            if event.status in TERMINAL_ORDER_STATUSES:
+                self._release_resolved_order_watch(cli, reason=reason)
             if outcome.applied:
                 logger.info(
                     f"substrate {reason} null-attach sweep: "

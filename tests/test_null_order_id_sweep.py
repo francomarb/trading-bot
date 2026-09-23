@@ -16,7 +16,7 @@ Coverage (acceptance criteria from the PR brief):
 7. Spread close rows excluded
 8. PR #71 trailing-stop fallback race: no double-attach
 9. Stale resolved orphan stays quiet; stale unresolved orphan fires CRITICAL
-10. Durable resolution removes transient stream watch bookkeeping
+10. Terminal resolution removes transient stream watch bookkeeping
 """
 
 from __future__ import annotations
@@ -244,7 +244,7 @@ class TestSweepAliveOrder:
         # regular reconciler.
         assert row.status == "working"
         assert row.submitted_at is not None
-        engine._stream_manager.unwatch.assert_called_once_with("cli-alive")
+        engine._stream_manager.unwatch.assert_not_called()
 
 
 # ── (b) Terminal order: attach + advance ───────────────────────────────────
@@ -269,6 +269,7 @@ class TestSweepTerminalOrder:
                 avg_price=420.0,
             )
         )
+        engine._stream_manager = MagicMock()
 
         engine._sweep_null_order_id_attaches(
             _make_snapshot(), reason="cycle", budget=5,
@@ -283,6 +284,7 @@ class TestSweepTerminalOrder:
         # Dispatch helpers fire on terminal advance — same as
         # _reconcile_substrate_via_rest.
         engine._maybe_dispatch_substrate_entry_fill.assert_called_once()
+        engine._stream_manager.unwatch.assert_called_once_with("cli-filled")
 
 
 # ── (c) Unknown to broker: reject ──────────────────────────────────────────
