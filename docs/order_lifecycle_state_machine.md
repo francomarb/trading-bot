@@ -991,7 +991,7 @@ Critical properties:
 - **`error` is immediate on oversold.** Once `current_qty < 0`, the violation is already realized — the operator needs visibility now, not after the sell-side orders finish.
 - **Engine stop-cleanup flow.** When a position reaches `partially_filled` with `current_qty == 0` and only working stops remaining, the engine's stop-cleanup path issues the broker-side cancels. Each cancel flows through `apply_order_event` and advances the stop's per-order row to `canceled`. Once the last sell-side row terminates, the next event re-evaluates and the position transitions to `closed`.
 
-`closed_at` is set only when status reaches `closed` or `external_closed`. `canceled`, `error`, and pre-fill `pending` / `open` transitions leave `closed_at` NULL.
+`closed_at` is set when status reaches `closed`, `external_closed`, or `canceled`. A canceled zero-fill entry is terminal even though it is not a completed trade. `error` and pre-fill `pending` / `open` transitions leave `closed_at` NULL.
 
 The §8.1 invariant is preserved end-to-end: a position with any per-order row at `filled_qty > 0` cannot reach `canceled` because that requires branch (2)'s "no fills ever" check to fire. A position fully exited via either signal-exit or stop fill reaches `closed` correctly once its close-side per-order row terminates. A position with negative `current_qty` reaches `error`, surfacing the data-integrity violation rather than silently completing.
 

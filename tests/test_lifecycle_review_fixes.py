@@ -255,7 +255,7 @@ class TestReverseReconcileBrokerOpenEntry:
     def _open_order(
         *,
         order_id: str = "broker-crm-entry",
-        client_order_id: str = "rsi-crm-entry",
+        client_order_id: str | None = "rsi-crm-entry",
         side: Side = Side.BUY,
         stop_price: float | None = None,
     ) -> OpenOrder:
@@ -277,7 +277,7 @@ class TestReverseReconcileBrokerOpenEntry:
         engine, lifecycle_store, _, uid = self._setup(tmp_path)
 
         engine._reconcile_position_lifecycle(
-            self._snapshot(self._open_order())
+            self._snapshot(self._open_order(client_order_id=None))
         )
 
         row = lifecycle_store.get_by_position_uid(uid)
