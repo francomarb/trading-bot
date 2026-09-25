@@ -1890,8 +1890,13 @@ class TradingEngine:
 
     def _run_one_cycle(self) -> None:
         """
-        One full sweep across all strategy slots and their symbols. Wraps
-        the whole cycle in a try/except so one bad cycle never crashes the loop.
+        One full sweep across all strategy slots and their symbols.
+
+        Each symbol's step is isolated: its exception is logged and counted,
+        and the cycle continues. Cycle-level phases (drains, reconciles) are
+        not isolated: their exception is logged with its traceback, the
+        summary line reports ``status=exception``, and it is re-raised to
+        the caller, which stops the engine loop.
         """
         cycle_id = self._cycle_count
         now_mono = time.monotonic()
@@ -2254,6 +2259,17 @@ class TradingEngine:
                         # Never let one symbol kill the cycle.
                         self._cycle_symbol_error_count += 1
                         logger.exception(f"{symbol}: cycle step failed: {e}")
+        except Exception as exc:
+            # A cycle-level phase (drains, reconciles) is outside the
+            # per-symbol isolation above. Record the traceback in the log
+            # sinks before re-raising: uncaught, it reaches only stderr, and
+            # the summary below would otherwise still report "ok".
+            cycle_status = "exception"
+            logger.opt(exception=True).critical(
+                f"cycle {cycle_id} raised outside per-symbol isolation — "
+                f"{type(exc).__name__}: {exc}; re-raising"
+            )
+            raise
         finally:
             # RESTRICTED mode auto-clears after one cycle — anomalies were
             # logged at startup; a full clean cycle proves state is coherent.

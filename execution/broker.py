@@ -449,6 +449,10 @@ class AlpacaBroker:
     # counter table. Phase A is purely additive — when
     # `self._lifecycle_store is None`, these helpers are no-ops and the
     # broker's behavior is byte-for-byte identical to pre-Phase-A.
+    #
+    # One exception: an async single-leg option entry in `place_order` is
+    # refused when `_lifecycle_begin` returns None. There the uid is not
+    # additive — it is the engine's identity for the position.
 
     def _lifecycle_begin(
         self,
@@ -1517,6 +1521,29 @@ class AlpacaBroker:
                 decision=decision,
                 client_order_id=client_order_id,
             )
+            if position_uid is None:
+                # The engine tracks this position by its uid from dispatch
+                # to the drained terminal outcome. Without one it cannot
+                # roll back a canceled entry or re-bind a fill, so refuse
+                # before any broker submission.
+                logger.error(
+                    f"{decision.symbol} ({decision.strategy_name}): option "
+                    "entry refused before submission — no durable lifecycle "
+                    "identity (store unavailable or create_pending failed)"
+                )
+                return OrderResult(
+                    status=OrderStatus.REJECTED,
+                    order_id=None,
+                    symbol=decision.symbol,
+                    requested_qty=decision.qty,
+                    filled_qty=0,
+                    avg_fill_price=None,
+                    raw_status="lifecycle_unavailable",
+                    message=(
+                        "option entry refused: durable lifecycle identity "
+                        "unavailable"
+                    ),
+                )
             # Options enter with a simple DAY LIMIT, then the engine installs
             # and ratchets their required standalone GTC broker stop.
             self._lifecycle_orders_insert_pending(
@@ -1603,6 +1630,10 @@ class AlpacaBroker:
                 avg_fill_price=0.0,
                 raw_status="accepted",
                 message="dispatched to OptionsExecutionWorker",
+                # The engine pre-registers ownership under this uid, and the
+                # drained terminal outcome carries the same uid: a fill keeps
+                # the registration, a cancel/reject rolls it back by uid.
+                position_uid=position_uid,
             )
 
         if decision.protection_model is ProtectionModel.SIGNAL_EXIT_ONLY:
