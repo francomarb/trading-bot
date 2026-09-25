@@ -24,6 +24,7 @@ loops are exercised.
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import replace
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -2184,7 +2185,12 @@ class TestOptionsDryRun:
         """Without DRY_RUN, an OCC LIMIT decision must start the background worker."""
         from unittest.mock import patch
         api = MagicMock()
-        broker = AlpacaBroker(client=api, max_attempts=1, base_delay=0.0, dry_run=False)
+        # Async option entries need a durable lifecycle identity; the
+        # store-absent refusal is covered in TestOptionsDurableIdentity.
+        broker = AlpacaBroker(
+            client=api, max_attempts=1, base_delay=0.0, dry_run=False,
+            lifecycle_store=MagicMock(),
+        )
 
         with patch("execution.broker.OptionsExecutionWorker") as mock_worker_cls:
             mock_worker_cls.return_value = MagicMock()
@@ -3426,6 +3432,56 @@ class TestOptionsDurableIdentity:
 
         captured["on_fill"]("canceled", 0.0, None, "alpaca-options-ord-3")
         assert broker.drain_option_fills()[0][5] == lifecycle_uid
+
+    @pytest.mark.parametrize(
+        "create_pending_error",
+        [
+            None,
+            OSError("disk I/O error"),
+            sqlite3.IntegrityError(
+                "UNIQUE constraint failed: position_lifecycle.owner_key"
+            ),
+        ],
+        ids=["store_absent", "create_pending_oserror", "active_claim_conflict"],
+    )
+    def test_options_entry_refused_without_durable_identity(
+        self, create_pending_error
+    ):
+        """Without a lifecycle uid the engine cannot track the async entry
+        (a cancel would leave ownership behind), so the broker refuses it
+        before starting a worker. The IntegrityError case is the
+        one-active-claim-per-contract index rejecting a second claim."""
+        if create_pending_error is None:
+            lifecycle_store = None
+        else:
+            lifecycle_store = MagicMock()
+            lifecycle_store.create_pending.side_effect = create_pending_error
+        orders_store = MagicMock()
+        broker = AlpacaBroker(
+            client=MagicMock(), max_attempts=1, base_delay=0.0,
+            lifecycle_orders_store=orders_store,
+            lifecycle_store=lifecycle_store,
+        )
+        opt_decision = RiskDecision(
+            symbol="SPY261016C00764000",
+            side=Side.BUY,
+            qty=3,
+            entry_reference_price=11.60,
+            stop_price=8.70,
+            strategy_name="spy_options_reversion",
+            reason="test",
+            order_type=OrderType.LIMIT,
+            limit_price=11.60,
+        )
+
+        with patch("execution.broker.OptionsExecutionWorker") as worker_cls:
+            result = broker.place_order(opt_decision, poll_timeout=0.0)
+
+        assert result.status is OrderStatus.REJECTED
+        assert result.position_uid is None
+        worker_cls.assert_not_called()
+        orders_store.insert_pending.assert_not_called()
+        assert broker.drain_option_fills() == []
 
 
 # ── PR #60 round 2 fixes ────────────────────────────────────────────────────

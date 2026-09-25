@@ -5228,7 +5228,10 @@ class TestAsyncOptionEntryIdentity:
 
     OCC = "SPY261016C00764000"
 
-    def _dispatch(self, engine_factory):
+    def _wire(self, engine_factory, lifecycle_store):
+        """Run one options entry through the engine with a real broker.
+        Returns the engine and the captured worker callbacks, which are
+        empty when the broker refused before starting a worker."""
         from unittest.mock import patch
 
         engine, broker = engine_factory(entries=[False] * 59 + [True])
@@ -5245,7 +5248,6 @@ class TestAsyncOptionEntryIdentity:
             order_type=OrderType.LIMIT, limit_price=11.60,
         ))
 
-        lifecycle_store = MagicMock()
         real_broker = AlpacaBroker(
             client=MagicMock(), max_attempts=1, base_delay=0.0,
             lifecycle_orders_store=MagicMock(),
@@ -5268,6 +5270,11 @@ class TestAsyncOptionEntryIdentity:
             engine._process_symbol(
                 "AAPL", snap, snap.account, slot.strategy, slot.timeframe,
             )
+        return engine, captured
+
+    def _dispatch(self, engine_factory):
+        lifecycle_store = MagicMock()
+        engine, captured = self._wire(engine_factory, lifecycle_store)
         lifecycle_uid = lifecycle_store.create_pending.call_args.kwargs[
             "position_uid"
         ]
@@ -5311,6 +5318,35 @@ class TestAsyncOptionEntryIdentity:
         engine._drain_option_fills()
 
         assert self._position_ids_for_contract(engine) == [lifecycle_uid]
+
+    @pytest.mark.parametrize(
+        "create_pending_error",
+        [None, OSError("disk I/O error")],
+        ids=["store_absent", "create_pending_fails"],
+    )
+    def test_entry_without_durable_identity_is_refused_before_dispatch(
+        self, engine_factory, create_pending_error
+    ):
+        """No lifecycle uid means no worker and no pre-registration, so
+        there is nothing a later cancel could leave behind."""
+        if create_pending_error is None:
+            lifecycle_store = None
+        else:
+            lifecycle_store = MagicMock()
+            lifecycle_store.create_pending.side_effect = create_pending_error
+
+        engine, captured = self._wire(engine_factory, lifecycle_store)
+
+        assert "on_fill" not in captured
+        assert not engine._has_position(self.OCC)
+        empty = _snapshot()
+        for _ in range(engine.config.external_close_confirm_cycles + 1):
+            engine._detect_external_closes(empty)
+        assert [
+            row for row in engine.trade_logger.read_all()
+            if row["reason"] == "external_close_detected"
+            or row["side"] == "buy"
+        ] == []
 
 
 class TestGenericSingleLegOptionTrailingStops:
