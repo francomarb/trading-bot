@@ -1810,6 +1810,37 @@ class TestRunOneCycle:
         assert slot.strategy.raw_calls == 1
         broker.place_order.assert_not_called()
 
+    def test_cycle_phase_exception_is_logged_and_reraised(self, engine_factory):
+        """A cycle-level phase that raises must not be summarized as ``ok``.
+        The traceback reaches the log sinks, the summary line reports
+        ``status=exception``, and the exception still propagates, so the
+        engine stops exactly as before (2026-09-15 crash logged a clean
+        ``status=ok, errors=0`` cycle and left its traceback only on
+        stderr)."""
+        engine, _broker = engine_factory(market_open=True)
+        engine._session_start_equity = 100_000.0
+        engine._cycle_count = 1
+        engine._drain_option_fills = MagicMock(side_effect=ValueError("boom"))
+        records: list[str] = []
+        handler_id = logger.add(lambda msg: records.append(str(msg)), level="INFO")
+        try:
+            with pytest.raises(ValueError, match="boom"):
+                engine._run_one_cycle()
+        finally:
+            logger.remove(handler_id)
+
+        summaries = [r for r in records if "cycle 1 complete:" in r]
+        assert len(summaries) == 1
+        assert "status=exception" in summaries[0]
+        assert any(
+            "CRITICAL" in r
+            and "raised outside per-symbol isolation" in r
+            and "ValueError: boom" in r
+            and "Traceback" in r
+            for r in records
+        )
+
+
 class TestStartStop:
     def test_max_cycles_terminates_loop(self, engine_factory):
         engine, broker = engine_factory()
@@ -5180,6 +5211,107 @@ class TestOptionsEngineFixes:
         assert filled_qty == 2
         assert reason == "stop_triggered"
         assert stop_price == 7.50
+
+
+class TestAsyncOptionEntryIdentity:
+    """Async single-leg option entries are tracked under their lifecycle
+    ``position_uid`` from dispatch through the drained terminal outcome.
+
+    Drives the real broker dispatch (``AlpacaBroker.place_order``), the
+    engine's ACCEPTED branch in ``_process_symbol``, the worker's real
+    ``on_fill`` callback and ``_drain_option_fills``. Before the fix the
+    ACCEPTED result carried no uid, so the engine registered a random one:
+    a canceled entry was never rolled back (false external close and a
+    zero-quantity trade row, 2026-09-24) and a fill's re-register raised
+    ``ValueError`` and stopped the engine (2026-09-15).
+    """
+
+    OCC = "SPY261016C00764000"
+
+    def _dispatch(self, engine_factory):
+        from unittest.mock import patch
+
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        slot = engine.slots[0]
+        slot.strategy.build_option_execution = (
+            lambda *_args, **_kwargs: (self.OCC, 11.60, 34.80, 8.70)
+        )
+        slot.strategy.preferred_order_type = OrderType.LIMIT
+        engine._reject_if_contract_conflict = MagicMock(return_value=None)
+        engine.risk.evaluate = MagicMock(return_value=RiskDecision(
+            symbol=self.OCC, side=Side.BUY, qty=3,
+            entry_reference_price=11.60, stop_price=8.70,
+            strategy_name=slot.strategy.name, reason="opt entry",
+            order_type=OrderType.LIMIT, limit_price=11.60,
+        ))
+
+        lifecycle_store = MagicMock()
+        real_broker = AlpacaBroker(
+            client=MagicMock(), max_attempts=1, base_delay=0.0,
+            lifecycle_orders_store=MagicMock(),
+            lifecycle_store=lifecycle_store,
+        )
+        broker.place_order.side_effect = real_broker.place_order
+        broker.drain_option_fills.side_effect = real_broker.drain_option_fills
+        captured = {}
+
+        def _capture_worker(*, on_fill, on_submitted, **_kwargs):
+            captured["on_fill"] = on_fill
+            return MagicMock()
+
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        with patch(
+            "execution.broker.OptionsExecutionWorker",
+            side_effect=_capture_worker,
+        ):
+            engine._process_symbol(
+                "AAPL", snap, snap.account, slot.strategy, slot.timeframe,
+            )
+        lifecycle_uid = lifecycle_store.create_pending.call_args.kwargs[
+            "position_uid"
+        ]
+        return engine, captured["on_fill"], lifecycle_uid
+
+    def _position_ids_for_contract(self, engine) -> list[str]:
+        return [
+            pos.position_id for pos in engine._positions.values()
+            if pos.primary_leg is not None
+            and pos.primary_leg.symbol == self.OCC
+        ]
+
+    def test_dispatch_pre_registers_under_lifecycle_uid(self, engine_factory):
+        engine, _on_fill, lifecycle_uid = self._dispatch(engine_factory)
+
+        assert self._position_ids_for_contract(engine) == [lifecycle_uid]
+
+    def test_canceled_entry_releases_ownership_without_external_close(
+        self, engine_factory
+    ):
+        engine, on_fill, _lifecycle_uid = self._dispatch(engine_factory)
+        on_fill("canceled", 0.0, None, "alpaca-ord-canceled")
+
+        engine._drain_option_fills()
+
+        assert not engine._has_position(self.OCC)
+        # The contract never reaches the broker. Past the confirmation
+        # window the detector must find nothing to declare closed.
+        empty = _snapshot()
+        for _ in range(engine.config.external_close_confirm_cycles + 1):
+            engine._detect_external_closes(empty)
+        assert [
+            row for row in engine.trade_logger.read_all()
+            if row["reason"] == "external_close_detected"
+        ] == []
+
+    def test_filled_entry_keeps_lifecycle_identity(self, engine_factory):
+        engine, on_fill, lifecycle_uid = self._dispatch(engine_factory)
+        on_fill("filled", 3.0, 11.55, "alpaca-ord-filled")
+
+        engine._drain_option_fills()
+
+        assert self._position_ids_for_contract(engine) == [lifecycle_uid]
+
 
 class TestGenericSingleLegOptionTrailingStops:
     class GenericOptionStrategy(FakeStrategy):

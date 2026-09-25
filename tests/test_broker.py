@@ -3380,6 +3380,53 @@ class TestOptionsDurableIdentity:
         )
         assert queued[0][5].startswith("pos_")
 
+    def test_options_accepted_result_carries_lifecycle_position_uid(self):
+        """The ACCEPTED result must carry the uid the lifecycle row was
+        created with — the same uid the worker's terminal outcome is queued
+        under. The engine pre-registers ownership from the ACCEPTED result
+        and later finds it by the queued uid; if the result omits the uid,
+        the engine falls back to a random one and the two never match
+        (2026-09-24 canceled entry left ownership behind; 2026-09-15 fill
+        re-register raised and stopped the engine)."""
+        lifecycle_store = MagicMock()
+        broker = AlpacaBroker(
+            client=MagicMock(), max_attempts=1, base_delay=0.0,
+            lifecycle_orders_store=MagicMock(),
+            lifecycle_store=lifecycle_store,
+        )
+        captured = {}
+
+        def _capture_worker(*, on_fill, on_submitted, **kwargs):
+            captured["on_fill"] = on_fill
+            return MagicMock()
+
+        opt_decision = RiskDecision(
+            symbol="SPY261016C00764000",
+            side=Side.BUY,
+            qty=3,
+            entry_reference_price=11.60,
+            stop_price=8.70,
+            strategy_name="spy_options_reversion",
+            reason="test",
+            order_type=OrderType.LIMIT,
+            limit_price=11.60,
+        )
+
+        with patch(
+            "execution.broker.OptionsExecutionWorker",
+            side_effect=_capture_worker,
+        ):
+            result = broker.place_order(opt_decision, poll_timeout=0.0)
+
+        lifecycle_uid = lifecycle_store.create_pending.call_args.kwargs[
+            "position_uid"
+        ]
+        assert result.status is OrderStatus.ACCEPTED
+        assert result.position_uid == lifecycle_uid
+
+        captured["on_fill"]("canceled", 0.0, None, "alpaca-options-ord-3")
+        assert broker.drain_option_fills()[0][5] == lifecycle_uid
+
 
 # ── PR #60 round 2 fixes ────────────────────────────────────────────────────
 

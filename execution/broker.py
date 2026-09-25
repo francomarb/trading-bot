@@ -1603,6 +1603,10 @@ class AlpacaBroker:
                 avg_fill_price=0.0,
                 raw_status="accepted",
                 message="dispatched to OptionsExecutionWorker",
+                # The engine pre-registers ownership under this uid, and the
+                # drained terminal outcome carries the same uid: a fill keeps
+                # the registration, a cancel/reject rolls it back by uid.
+                position_uid=position_uid,
             )
 
         if decision.protection_model is ProtectionModel.SIGNAL_EXIT_ONLY:
