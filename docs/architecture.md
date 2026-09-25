@@ -558,7 +558,7 @@ A thin wrapper (`AlpacaBroker`) around `alpaca-py`'s `TradingClient`. Translates
 
 #### Options order path (`execution/options_executor.py`)
 
-Options orders are detected by matching the OCC symbol format (`^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$`, compiled as `_OCC_PAT` at module level in `engine/trader.py`). When an OCC symbol is detected, the broker dispatches an `OptionsExecutionWorker` thread and returns `OrderResult(status=ACCEPTED)` immediately so the engine loop is not blocked.
+Options orders are detected by matching the OCC symbol format (`^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$`, compiled as `_OCC_PAT` at module level in `engine/trader.py`). When an OCC symbol is detected, the broker dispatches an `OptionsExecutionWorker` thread and returns `OrderResult(status=ACCEPTED, position_uid=…)` immediately so the engine loop is not blocked. That `position_uid` is the one the pending lifecycle row was created with. The engine pre-registers ownership of the exact contract under it, and the worker's terminal outcome is drained under the same uid: a fill keeps the registration, a cancel or reject rolls it back.
 
 **OptionsExecutionWorker lifecycle:**
 
