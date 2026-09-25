@@ -297,6 +297,23 @@ class TestEarningsBlackout:
             f(df)
             mock_yf.assert_not_called()  # used cache, didn't hit yfinance
 
+    def test_dot_class_symbol_queries_yahoo_hyphen_form(self):
+        """Yahoo returns no earnings for BRK.B, only for BRK-B. The query must
+        use the hyphen form while the cache stays keyed by the broker symbol."""
+        f = EarningsBlackout(days_before=5, days_after=2)
+        f.set_symbol("BRK.B")
+        tomorrow = datetime.date.today() + datetime.timedelta(days=1)
+        ticker = MagicMock()
+        ticker.info = {"quoteType": "EQUITY"}
+        ticker.calendar = {"Earnings Date": [tomorrow]}
+        ticker.earnings_dates = pd.DataFrame()
+        with patch("yfinance.Ticker", return_value=ticker) as mock_yf:
+            gate = f(self._df_on(datetime.date.today()))
+
+        mock_yf.assert_called_once_with("BRK-B")
+        assert not gate.any()  # earnings tomorrow now blocks
+        assert f._cache["BRK.B"][1] == [tomorrow]
+
 
 # ── TestSMAEdgeFilter ─────────────────────────────────────────────────────────
 

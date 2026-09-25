@@ -290,8 +290,11 @@ class EarningsBlackout:
             import yfinance as yf
             import os
             import contextlib
-            
-            ticker = yf.Ticker(symbol)
+
+            # Yahoo uses hyphens for dot-class symbols (BRK.B -> BRK-B), as in
+            # sector/resolver.py. Only the provider query is normalized; cache
+            # keys and log lines keep the broker symbol.
+            ticker = yf.Ticker(symbol.replace(".", "-"))
             dates: list[datetime.date] = []
 
             # Determine quote type using permanent cache to avoid rate limits.
