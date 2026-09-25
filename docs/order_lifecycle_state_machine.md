@@ -162,17 +162,18 @@ What this does NOT handle:
 - **advancing an existing pending row to open.** If a pending row exists for `owner_key=AAPL` and a broker position appears for AAPL, the forward pass sees `existing != None` and skips. The row stays pending even though a broker position now exists for it.
 - distinguishing primary fill from residual fill on a hybrid entry (PR #58's split-entry shape). The forward pass treats any broker position for that owner_key as the synthesized open state.
 
-**Reverse (close-reconcile).** For each non-terminal lifecycle row whose `owner_key` is no longer in broker positions, call `mark_closed(external=True)`. Skips spread rows. Skips `pending` rows younger than `LIFECYCLE_PENDING_GRACE_SECONDS` ([settings.py](../config/settings.py)) — added in PR-2 to avoid mass-closing legitimate in-flight entries after a startup race.
+**Reverse (close-reconcile).** For each non-terminal lifecycle row whose `owner_key` is no longer in broker positions, first compare that lifecycle's entry-order identities with the broker's open-order snapshot. An exact `order_id` or `client_order_id` match on `entry_primary` / `entry_residual` preserves the lifecycle because the broker can still create the position. Symbol-only matches and contingent protective-stop rows do not qualify. With no exact broker-open entry, call `mark_closed(external=True)`. The pass skips spread rows and also skips `pending` rows younger than `LIFECYCLE_PENDING_GRACE_SECONDS` ([settings.py](../config/settings.py)) to protect the brief submit/attach race before broker identity is durable.
 
 **Foundation PR addition (review-8 finding #4):** the reverse pass must also **skip `status='error'` rows**. An errored position is operator-attention required; the bot must not auto-resolve it via broker-snapshot defense even when the symbol vanishes from the broker (the vanish could itself be a consequence of the error scenario). Errored rows are released only by explicit operator action through the resolution flow. This pairs with §6.2's `uniq_one_active_position_per_owner_key` index, which retains the lock for `'error'` status — together they guarantee an unresolved error blocks both new entries on the symbol AND auto-`external_close` by reverse-pass.
 
 What this handles:
 - overnight stop fills that the bot didn't witness
 - manual broker-side closes
+- GTC or other resting entries that remain broker-open beyond the pending grace window
 - broker-side cancels of `pending` rows older than the grace window (these are marked `external_closed`, which loses the §8.1 distinction between "canceled" and "externally closed" — but this is intentional since the bot can no longer prove zero-fill at this remove)
 
 What this does NOT handle:
-- pending rows for orders that legitimately worked >grace_seconds before filling (rare today, routine for PR #58's resting orders)
+- rows whose durable entry order identity is missing or corrupt after the grace window; the NULL-order-id attach sweep handles recoverable client IDs, but an unidentifiable row cannot be matched safely by symbol
 
 ### 3.2 `_recover_suspect_orders` — cycle-level, narrow
 
@@ -990,7 +991,7 @@ Critical properties:
 - **`error` is immediate on oversold.** Once `current_qty < 0`, the violation is already realized — the operator needs visibility now, not after the sell-side orders finish.
 - **Engine stop-cleanup flow.** When a position reaches `partially_filled` with `current_qty == 0` and only working stops remaining, the engine's stop-cleanup path issues the broker-side cancels. Each cancel flows through `apply_order_event` and advances the stop's per-order row to `canceled`. Once the last sell-side row terminates, the next event re-evaluates and the position transitions to `closed`.
 
-`closed_at` is set only when status reaches `closed` or `external_closed`. `canceled`, `error`, and pre-fill `pending` / `open` transitions leave `closed_at` NULL.
+`closed_at` is set when status reaches `closed`, `external_closed`, or `canceled`. A canceled zero-fill entry is terminal even though it is not a completed trade. `error` and pre-fill `pending` / `open` transitions leave `closed_at` NULL.
 
 The §8.1 invariant is preserved end-to-end: a position with any per-order row at `filled_qty > 0` cannot reach `canceled` because that requires branch (2)'s "no fills ever" check to fire. A position fully exited via either signal-exit or stop fill reaches `closed` correctly once its close-side per-order row terminates. A position with negative `current_qty` reaches `error`, surfacing the data-integrity violation rather than silently completing.
 

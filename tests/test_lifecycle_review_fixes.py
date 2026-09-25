@@ -16,14 +16,20 @@ F4 was doc-only (no code path), so it has no test.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from engine.lifecycle import PositionLifecycleStore, new_position_uid
+from engine.lifecycle_orders import (
+    OrderEvent,
+    PositionLifecycleOrdersStore,
+    apply_order_event,
+)
 from execution.broker import (
     AlpacaBroker,
+    OpenOrder,
     OrderResult,
     OrderStatus,
 )
@@ -169,6 +175,178 @@ class TestBackfillIteratesPositions:
         nvda_row = next(r for r in rows if r.owner_key == "NVDA")
         assert nvda_row.current_qty == 10.0
         assert nvda_row.avg_entry_price == 884.20
+
+
+# ─────────────────────────────────────────────────────────────────────
+# CRM regression — a broker-open GTC entry is not an external close
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestReverseReconcileBrokerOpenEntry:
+    def _setup(self, tmp_path, *, attach_order_id: bool = True):
+        from engine.trader import TradingEngine
+
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        conn = tl._ensure_db()
+        lifecycle_store = PositionLifecycleStore(conn)
+        orders_store = PositionLifecycleOrdersStore(conn)
+        uid = new_position_uid()
+        lifecycle_store.create_pending(
+            position_uid=uid,
+            symbol="CRM",
+            owner_key="CRM",
+            strategy="rsi_reversion",
+            position_type="single_leg",
+            entry_qty=6.0,
+        )
+        orders_store.insert_pending(
+            position_uid=uid,
+            role="entry_primary",
+            client_order_id="rsi-crm-entry",
+            order_type="limit",
+            order_class="oto",
+            time_in_force="gtc",
+            side="buy",
+            intended_qty=6.0,
+            intended_stop_price=214.83,
+            intended_limit_price=233.35,
+        )
+        if attach_order_id:
+            orders_store.attach_broker_order_id(
+                client_order_id="rsi-crm-entry",
+                order_id="broker-crm-entry",
+            )
+            apply_order_event(
+                conn,
+                OrderEvent(
+                    order_id="broker-crm-entry",
+                    status="working",
+                    filled_qty=0.0,
+                    avg_fill_price=None,
+                    broker_updated_at=datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
+        old_created_at = (
+            datetime.now(timezone.utc) - timedelta(hours=12)
+        ).isoformat()
+        conn.execute(
+            "UPDATE position_lifecycle SET created_at = ? "
+            "WHERE position_uid = ?",
+            (old_created_at, uid),
+        )
+        conn.commit()
+
+        engine = TradingEngine.__new__(TradingEngine)
+        engine.lifecycle_store = lifecycle_store
+        engine.lifecycle_orders_store = orders_store
+        engine._positions = {}
+        return engine, lifecycle_store, orders_store, uid
+
+    @staticmethod
+    def _snapshot(*open_orders: OpenOrder):
+        snapshot = MagicMock()
+        snapshot.account = MagicMock()
+        snapshot.account.open_positions = {}
+        snapshot.open_orders = list(open_orders)
+        return snapshot
+
+    @staticmethod
+    def _open_order(
+        *,
+        order_id: str = "broker-crm-entry",
+        client_order_id: str | None = "rsi-crm-entry",
+        side: Side = Side.BUY,
+        stop_price: float | None = None,
+    ) -> OpenOrder:
+        return OpenOrder(
+            order_id=order_id,
+            client_order_id=client_order_id,
+            symbol="CRM",
+            side=side,
+            qty=6.0,
+            order_type=OrderType.LIMIT,
+            status="new",
+            submitted_at=datetime.now(timezone.utc),
+            limit_price=None if stop_price is not None else 233.35,
+            stop_price=stop_price,
+            time_in_force="gtc",
+        )
+
+    def test_exact_broker_order_id_preserves_old_pending_entry(self, tmp_path):
+        engine, lifecycle_store, _, uid = self._setup(tmp_path)
+
+        engine._reconcile_position_lifecycle(
+            self._snapshot(self._open_order(client_order_id=None))
+        )
+
+        row = lifecycle_store.get_by_position_uid(uid)
+        assert row.status == "pending"
+        assert row.closed_at is None
+
+    def test_exact_client_order_id_preserves_unattached_entry(self, tmp_path):
+        engine, lifecycle_store, _, uid = self._setup(
+            tmp_path, attach_order_id=False,
+        )
+
+        engine._reconcile_position_lifecycle(
+            self._snapshot(
+                self._open_order(order_id="broker-assigned-after-crash")
+            )
+        )
+
+        row = lifecycle_store.get_by_position_uid(uid)
+        assert row.status == "pending"
+        assert row.closed_at is None
+
+    def test_same_symbol_unrelated_order_does_not_preserve_entry(self, tmp_path):
+        engine, lifecycle_store, _, uid = self._setup(tmp_path)
+
+        engine._reconcile_position_lifecycle(
+            self._snapshot(
+                self._open_order(
+                    order_id="other-crm-order",
+                    client_order_id="other-strategy-crm",
+                )
+            )
+        )
+
+        assert lifecycle_store.get_by_position_uid(uid).status == (
+            "external_closed"
+        )
+
+    def test_protective_child_does_not_preserve_absent_position(self, tmp_path):
+        engine, lifecycle_store, orders_store, uid = self._setup(tmp_path)
+        orders_store.insert_pending(
+            position_uid=uid,
+            role="protective_stop",
+            client_order_id="rsi-crm-stop",
+            order_type="stop",
+            order_class="oto",
+            time_in_force="gtc",
+            side="sell",
+            intended_qty=6.0,
+            intended_stop_price=214.83,
+        )
+        orders_store.attach_broker_order_id(
+            client_order_id="rsi-crm-stop",
+            order_id="broker-crm-stop",
+        )
+
+        engine._reconcile_position_lifecycle(
+            self._snapshot(
+                self._open_order(
+                    order_id="broker-crm-stop",
+                    client_order_id="rsi-crm-stop",
+                    side=Side.SELL,
+                    stop_price=214.83,
+                )
+            )
+        )
+
+        assert lifecycle_store.get_by_position_uid(uid).status == (
+            "external_closed"
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────

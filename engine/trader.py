@@ -13558,6 +13558,35 @@ class TradingEngine:
 
     # ── Position lifecycle reconciliation (Operator Controls Phase A) ──
 
+    def _has_broker_open_entry_order(
+        self,
+        *,
+        position_uid: str,
+        broker_open_order_ids: set[str],
+        broker_open_client_order_ids: set[str],
+    ) -> bool:
+        """Return whether Alpaca still has this lifecycle's entry open.
+
+        Match durable order identity only. Symbols are shared across strategies,
+        and contingent protective stops must not keep a vanished position open.
+        Broker-open truth wins even if the local per-order status is stale.
+        """
+        if self.lifecycle_orders_store is None:
+            return False
+        for order_row in self.lifecycle_orders_store.get_all_for_position(
+            position_uid
+        ):
+            if order_row.role not in {"entry_primary", "entry_residual"}:
+                continue
+            if (
+                order_row.order_id is not None
+                and order_row.order_id in broker_open_order_ids
+            ):
+                return True
+            if order_row.client_order_id in broker_open_client_order_ids:
+                return True
+        return False
+
     def _reconcile_position_lifecycle(self, snapshot: "BrokerSnapshot") -> None:
         """Make the `position_lifecycle` table consistent with broker reality.
 
@@ -13572,9 +13601,11 @@ class TradingEngine:
 
         2. **Reverse (close-reconcile)**: for each open lifecycle row
            whose `owner_key` is no longer present in broker positions,
-           mark the row `external_closed`. Catches overnight stop
-           fills, manual broker-side closes, and any other path that
-           closed a position without the bot's normal close flow.
+           first preserve it when an exact lifecycle entry order remains
+           open at the broker; otherwise mark it `external_closed`.
+           Catches overnight stop fills, manual broker-side closes, and
+           any other path that closed a position without the bot's normal
+           close flow without misclassifying durable resting entries.
 
         Multi-leg spread lifecycle integration remains deferred. Managed
         single-leg OCC options are included here because option trailing
@@ -13671,12 +13702,33 @@ class TradingEngine:
             # external_closed before _lifecycle_mark_filled gets a
             # chance to transition them.
             broker_owners = set(snapshot.account.open_positions)
+            broker_open_order_ids = {
+                order.order_id
+                for order in snapshot.open_orders
+                if getattr(order, "order_id", None)
+            }
+            broker_open_client_order_ids = {
+                order.client_order_id
+                for order in snapshot.open_orders
+                if getattr(order, "client_order_id", None)
+            }
             grace_seconds = int(settings.LIFECYCLE_PENDING_GRACE_SECONDS)
             now_utc = datetime.now(timezone.utc)
             for row in self.lifecycle_store.get_open():
                 if row.position_type != "single_leg":
                     continue
                 if row.owner_key in broker_owners:
+                    continue
+                if self._has_broker_open_entry_order(
+                    position_uid=row.position_uid,
+                    broker_open_order_ids=broker_open_order_ids,
+                    broker_open_client_order_ids=broker_open_client_order_ids,
+                ):
+                    logger.debug(
+                        f"lifecycle: preserving {row.position_uid[:18]}… "
+                        f"({row.owner_key}) — exact entry order remains "
+                        f"open at broker"
+                    )
                     continue
                 if row.status == "pending":
                     try:

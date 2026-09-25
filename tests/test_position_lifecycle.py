@@ -563,8 +563,9 @@ class TestReverseReconcileGrace:
     `engine/trader.py:_reconcile_position_lifecycle`).
 
     Without this grace, a bot restart mid-submit would mass-close
-    legitimate pending rows as `external_closed` before
-    `_lifecycle_mark_filled` has a chance to transition them.
+    legitimate pending rows whose broker identity is not durable yet as
+    `external_closed`. Once identity is durable, exact broker-open order
+    matching protects a resting entry for its full lifetime.
 
     The actual reverse-reconcile code lives in trader.py and isn't
     easily exercised here without the full engine. Instead this test
@@ -614,8 +615,9 @@ class TestReverseReconcileGrace:
 
     def test_old_pending_row_qualifies_for_close(self, store):
         """An old pending row (older than the grace window) is the
-        case the reverse-pass IS supposed to close. Verify the row
-        is reachable via `get_open()` so the pass can find it."""
+        case the reverse pass may close when it also has no exact
+        broker-open entry. Verify the row is reachable via `get_open()`
+        so the pass can evaluate it."""
         from datetime import datetime, timedelta, timezone
 
         old_uid = new_position_uid()
