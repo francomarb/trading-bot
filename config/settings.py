@@ -526,8 +526,8 @@ RSI_WATCHLIST = [
     "WMT", "V", "JPM", "GEV", "CAT", "NOW", "CRWV", "KLAC", "APP", "CSCO",
     "MRNA", "PANW", "HOOD", "XOM", "BRK.B", "IBM", "QCOM", "UNH", "GS",
     "GLW", "COST", "TXN", "CRWD",
-    # Temporary lifecycle-preservation additions outside the ranked 50.
-    "ABNB", "CCK", "BAC",
+    # Temporary lifecycle-preservation member outside the ranked 50.
+    "BAC",
 ]
 # Legacy/reference RSI macro-gate tolerance used by the historical
 # `scripts/rsi_filter_variant_backtest.py` SPY50 study. The active RSI3
