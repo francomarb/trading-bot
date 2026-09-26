@@ -22,11 +22,14 @@ OBSERVED = datetime(2026, 9, 9, 13, 43, 21, tzinfo=timezone.utc)
 
 
 def _contract(
-    *, time_in_force: str = "day", stop_anchor: str = "reference"
+    *,
+    time_in_force: str = "day",
+    stop_anchor: str = "reference",
+    max_entry_age_seconds: int = 86_400,
 ) -> RSIReplayContract:
     return RSIReplayContract.from_mapping(
         {
-            "contract_version": 1,
+            "contract_version": 2,
             "strategy": "rsi_reversion",
             "timeframe": "1Day",
             "period": 3,
@@ -37,6 +40,7 @@ def _contract(
             "quick_exit_rsi": 55.0,
             "entry_order_type": "limit",
             "entry_time_in_force": time_in_force,
+            "max_entry_age_seconds": max_entry_age_seconds,
             "stop_anchor": stop_anchor,
             "atr_stop_multiplier": 2.0,
             "exit_order_type": "market",
@@ -109,9 +113,43 @@ class TestReplayContract:
         assert resolved == contract
         assert source == "stored_candidate_contract"
 
+    def test_stored_v1_contract_recovers_historical_entry_age(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        stored = dict(_contract().__dict__)
+        stored["contract_version"] = 1
+        stored.pop("max_entry_age_seconds")
+        candidate = _candidate(
+            common_context_json=json.dumps({"shadow_replay_contract": stored})
+        )
+        historical_source = """
+SLIPPAGE_MODEL_MARKET_BPS = 5.0
+STALE_LIMIT_MAX_AGE_SECONDS = int(os.getenv("STALE_LIMIT_MAX_AGE_SECONDS", 86400))
+ATR_STOP_MULTIPLIER = 2.0
+RSI_REVERSION_PARAMS = {
+    "period": 3, "oversold": 15.0, "overbought": 70.0,
+    "entry_mode": "level_below", "exit_sma_window": None,
+    "quick_exit_rsi": 55.0,
+}
+"""
+        monkeypatch.setattr(
+            candidate_shadows.subprocess,
+            "run",
+            lambda *_args, **_kwargs: SimpleNamespace(stdout=historical_source),
+        )
+
+        resolved, source = replay_contract_for_candidate(
+            candidate, repo_root=tmp_path
+        )
+
+        assert resolved.contract_version == 2
+        assert resolved.max_entry_age_seconds == 86_400
+        assert source == "stored_candidate_contract+historical_entry_age_default"
+
     def test_historical_settings_are_parsed_without_execution(self) -> None:
         source = """
 SLIPPAGE_MODEL_MARKET_BPS = 7.0
+STALE_LIMIT_MAX_AGE_SECONDS = int(os.getenv("STALE_LIMIT_MAX_AGE_SECONDS", 86400))
 RSI_REVERSION_PARAMS: dict = {
     "period": 4, "oversold": 12.0, "overbought": 75.0,
     "entry_mode": "level_below", "exit_sma_window": 6,
@@ -126,6 +164,7 @@ ATR_STOP_MULTIPLIER = 2.5
 
         assert contract.period == 4
         assert contract.entry_time_in_force == "gtc"
+        assert contract.max_entry_age_seconds == 86_400
         assert contract.stop_anchor == "reference"
         assert contract.atr_stop_multiplier == 2.5
         assert contract.modeled_exit_slippage_bps == 7.0
@@ -144,6 +183,7 @@ ATR_STOP_MULTIPLIER = 2.5
     ) -> None:
         source = """
 SLIPPAGE_MODEL_MARKET_BPS = 5.0
+STALE_LIMIT_MAX_AGE_SECONDS = int(os.getenv("STALE_LIMIT_MAX_AGE_SECONDS", 86400))
 RSI_REVERSION_PARAMS = {
     "period": 3, "oversold": 15.0, "overbought": 70.0,
     "entry_mode": "level_below", "exit_sma_window": None,
@@ -290,6 +330,7 @@ class TestRSIShadowReplay:
         fill_session = daily.index.tz_convert("America/New_York").date == datetime(
             2026, 9, 10
         ).date()
+        daily.loc[fill_session, "open"] = 99.0
         daily.loc[fill_session, "low"] = 99.0
 
         result = resolve_rsi_shadow(
@@ -305,11 +346,37 @@ class TestRSIShadowReplay:
         )
 
         assert result.status == "open"
-        assert result.entry_price == 100.0
+        assert result.entry_price == 99.0
         assert result.metadata["fill_resolution"] == "daily"
         assert result.metadata["excursion_precision"] == "fill_session_excluded"
 
-    def test_unfilled_gtc_limit_waits_until_broker_expiry(self) -> None:
+    def test_gtc_limit_touch_during_cancellation_boundary_needs_review(self) -> None:
+        daily = _daily()
+        boundary_session = (
+            daily.index.tz_convert("America/New_York").date
+            == datetime(2026, 9, 10).date()
+        )
+        daily.loc[boundary_session, "open"] = 105.0
+        daily.loc[boundary_session, "low"] = 99.0
+
+        result = resolve_rsi_shadow(
+            _candidate(),
+            _contract(time_in_force="gtc"),
+            daily_bars=daily,
+            entry_minutes=_minutes(
+                ("2026-09-09T13:44:00", 102.0, 103.0, 101.0, 102.0)
+            ),
+            as_of=datetime(2026, 9, 10, 21, tzinfo=timezone.utc),
+            entry_window_complete=True,
+            contract_source="test",
+        )
+
+        assert result.status == "needs_review"
+        assert "cancellation boundary" in result.metadata["unresolved_reason"]
+
+    def test_unfilled_gtc_uses_local_stale_age_before_broker_expiry(
+        self,
+    ) -> None:
         arguments = {
             "candidate": _candidate(),
             "contract": _contract(time_in_force="gtc"),
@@ -323,12 +390,18 @@ class TestRSIShadowReplay:
 
         waiting = resolve_rsi_shadow(
             **arguments,
-            as_of=datetime(2026, 9, 12, 12, tzinfo=timezone.utc),
+            as_of=datetime(2026, 9, 10, 12, tzinfo=timezone.utc),
         )
         expired = resolve_rsi_shadow(
             **arguments,
-            as_of=datetime(2026, 12, 9, 14, tzinfo=timezone.utc),
+            as_of=datetime(2026, 9, 10, 14, tzinfo=timezone.utc),
         )
 
         assert waiting.status == "awaiting_fill"
         assert expired.status == "not_filled"
+        assert expired.metadata["entry_policy_expires_at"].startswith(
+            "2026-09-10T13:43:21"
+        )
+        assert expired.metadata["broker_gtc_expires_at"].startswith(
+            "2026-12-08T13:43:21"
+        )

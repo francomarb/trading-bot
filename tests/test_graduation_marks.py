@@ -276,4 +276,7 @@ class TestGraduationDailyMarksAndCosts:
         assert cohort["coverage"]["daily_marks"] == 3
         assert cohort["coverage"]["complete_daily_marks"] == 2
         assert cohort["performance"]["forward_daily_total_max_drawdown"] == -60
-        assert cohort["evidence_status"] == "DATA INCOMPLETE"
+        assert cohort["evidence_status"] == "EARLY EVIDENCE"
+        assert cohort["coverage"]["daily_mark_status"] == "gapped"
+        assert cohort["coverage"]["daily_mark_gap_days"] == 1
+        assert cohort["coverage"]["daily_mark_coverage"] == pytest.approx(2 / 3)
