@@ -44,6 +44,7 @@ class RSIReplayContract:
     quick_exit_rsi: float | None
     entry_order_type: str
     entry_time_in_force: str
+    max_entry_age_seconds: int
     stop_anchor: str
     atr_stop_multiplier: float
     exit_order_type: str
@@ -71,6 +72,7 @@ class RSIReplayContract:
             ),
             entry_order_type=str(value["entry_order_type"]),
             entry_time_in_force=str(value["entry_time_in_force"]),
+            max_entry_age_seconds=int(value["max_entry_age_seconds"]),
             stop_anchor=str(value["stop_anchor"]),
             atr_stop_multiplier=float(value["atr_stop_multiplier"]),
             exit_order_type=str(value["exit_order_type"]),
@@ -82,7 +84,7 @@ class RSIReplayContract:
         return contract
 
     def validate(self) -> None:
-        if self.contract_version != 1:
+        if self.contract_version != 2:
             raise ValueError(
                 f"unsupported RSI replay contract {self.contract_version}"
             )
@@ -95,6 +97,8 @@ class RSIReplayContract:
             raise ValueError("RSI shadow replay requires a DAY or GTC LIMIT entry")
         if self.exit_order_type != "market":
             raise ValueError("RSI shadow replay requires MARKET signal exits")
+        if self.max_entry_age_seconds <= 0:
+            raise ValueError("RSI shadow replay requires a positive entry lifetime")
         if self.stop_anchor not in {"reference", "fill"}:
             raise ValueError("RSI shadow replay requires a known stop anchor")
         if (
@@ -170,6 +174,7 @@ def _literal_assignments(source: str) -> dict[str, Any]:
         "RSI_REVERSION_PARAMS",
         "ATR_STOP_MULTIPLIER",
         "SLIPPAGE_MODEL_MARKET_BPS",
+        "STALE_LIMIT_MAX_AGE_SECONDS",
     }
     values: dict[str, Any] = {}
     for node in ast.parse(source).body:
@@ -184,7 +189,28 @@ def _literal_assignments(source: str) -> dict[str, Any]:
             and target.id in wanted
             and value_node is not None
         ):
-            values[target.id] = ast.literal_eval(value_node)
+            try:
+                values[target.id] = ast.literal_eval(value_node)
+            except ValueError:
+                # settings.py declares the stale limit as
+                # int(os.getenv("STALE_LIMIT_MAX_AGE_SECONDS", 86400)).  Read
+                # only that numeric default without executing historical code.
+                if (
+                    target.id == "STALE_LIMIT_MAX_AGE_SECONDS"
+                    and isinstance(value_node, ast.Call)
+                    and isinstance(value_node.func, ast.Name)
+                    and value_node.func.id == "int"
+                    and len(value_node.args) == 1
+                    and isinstance(value_node.args[0], ast.Call)
+                    and isinstance(value_node.args[0].func, ast.Attribute)
+                    and value_node.args[0].func.attr == "getenv"
+                    and len(value_node.args[0].args) == 2
+                ):
+                    values[target.id] = ast.literal_eval(
+                        value_node.args[0].args[1]
+                    )
+                else:
+                    raise
     missing = sorted(wanted - values.keys())
     if missing:
         raise ValueError(f"historical settings missing literal values: {missing}")
@@ -199,12 +225,13 @@ def historical_contract_from_settings_source(
     params = dict(values["RSI_REVERSION_PARAMS"])
     return RSIReplayContract.from_mapping(
         {
-            "contract_version": 1,
+            "contract_version": 2,
             "strategy": "rsi_reversion",
             "timeframe": "1Day",
             **params,
             "entry_order_type": "limit",
             "entry_time_in_force": entry_time_in_force,
+            "max_entry_age_seconds": values["STALE_LIMIT_MAX_AGE_SECONDS"],
             # Legacy/current ordinary RSI GTC OTO stops were submitted from
             # the reference and were not rebuilt after a gap-down fill.
             "stop_anchor": "reference",
@@ -229,7 +256,36 @@ def replay_contract_for_candidate(
     common = _decoded(candidate.get("common_context_json"))
     stored = common.get("shadow_replay_contract")
     if isinstance(stored, Mapping):
-        return RSIReplayContract.from_mapping(stored), "stored_candidate_contract"
+        stored_values = dict(stored)
+        if (
+            int(stored_values.get("contract_version", 0)) == 1
+            and "max_entry_age_seconds" not in stored_values
+        ):
+            commit = str(candidate.get("bot_git_commit") or "")
+            if commit.startswith("uncommitted:") or not _COMMIT_RE.fullmatch(commit):
+                raise ValueError(
+                    "stored v1 contract cannot recover its historical entry lifetime"
+                )
+            result = subprocess.run(
+                ["git", "show", f"{commit}:config/settings.py"],
+                cwd=Path(repo_root),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            historical = _literal_assignments(result.stdout)
+            stored_values["contract_version"] = 2
+            stored_values["max_entry_age_seconds"] = historical[
+                "STALE_LIMIT_MAX_AGE_SECONDS"
+            ]
+            return (
+                RSIReplayContract.from_mapping(stored_values),
+                "stored_candidate_contract+historical_entry_age_default",
+            )
+        return (
+            RSIReplayContract.from_mapping(stored_values),
+            "stored_candidate_contract",
+        )
 
     commit = str(candidate.get("bot_git_commit") or "")
     if commit.startswith("uncommitted:") or not _COMMIT_RE.fullmatch(commit):
@@ -321,10 +377,11 @@ def resolve_rsi_shadow(
     """Replay one refused RSI candidate without inventing dollar P&L.
 
     The observation session uses only full one-minute bars after the candidate
-    existed.  A GTC order then remains eligible on later completed sessions for
-    its broker-defined 90-day lifetime.  Thereafter production RSI exits and
-    the fixed ATR stop are replayed on completed daily bars.  Ordering that
-    cannot be proven from the available bar resolution remains ``needs_review``.
+    existed.  A GTC order then remains eligible only until the earlier of the
+    frozen engine stale-entry age and the broker's 90-day ceiling.  Thereafter
+    production RSI exits and the fixed ATR stop are replayed on completed daily
+    bars.  Ordering that cannot be proven from the available bar resolution
+    remains ``needs_review``.
     """
     if candidate.get("strategy") != "rsi_reversion":
         raise ValueError("resolve_rsi_shadow received a non-RSI candidate")
@@ -477,14 +534,65 @@ def resolve_rsi_shadow(
                 max_adverse_pct=None,
                 metadata={**base_meta, "fill_status": "not_filled"},
             )
-        expires_at = observed + timedelta(days=90)
-        eligible = daily[
-            (daily["_session_date"] > session_date)
-            & (daily.index <= pd.Timestamp(expires_at))
-        ]
+        broker_expires_at = observed + timedelta(days=90)
+        policy_expires_at = observed + timedelta(
+            seconds=contract.max_entry_age_seconds
+        )
+        expires_at = min(broker_expires_at, policy_expires_at)
+        later = daily[daily["_session_date"] > session_date]
+        fully_eligible_indexes: list[pd.Timestamp] = []
+        boundary_rows: list[tuple[pd.Timestamp, pd.Series]] = []
+        for timestamp, row in later.iterrows():
+            row_date = row["_session_date"]
+            session_end = datetime.combine(row_date, time(16, 0), _NY).astimezone(
+                timezone.utc
+            )
+            if session_end <= expires_at:
+                fully_eligible_indexes.append(timestamp)
+            else:
+                # Cleanup runs only inside a market-hours engine cycle.  The
+                # first session ending after the wall-clock threshold still
+                # sees the order at its open, including when the threshold
+                # fell on a weekend or holiday.  Daily bars cannot prove a
+                # later intraday touch happened before the cleanup cycle.
+                boundary_rows.append((timestamp, row))
+                break
+        eligible = later.loc[fully_eligible_indexes]
         later_touches = eligible[eligible["low"].astype(float) <= limit_price]
+        if later_touches.empty and boundary_rows:
+            boundary_at, boundary = boundary_rows[0]
+            if float(boundary["open"]) <= limit_price:
+                later_touches = later.loc[[boundary_at]]
+            elif float(boundary["low"]) <= limit_price:
+                return ShadowReplayResult(
+                    status="needs_review",
+                    entry_price=None,
+                    exit_price=None,
+                    exit_at=None,
+                    return_pct=None,
+                    r_multiple=None,
+                    max_favorable_pct=None,
+                    max_adverse_pct=None,
+                    metadata={
+                        **base_meta,
+                        "fill_status": "needs_review",
+                        "unresolved_reason": (
+                            "entry limit touched during the local-cancellation "
+                            "boundary session; daily bars cannot prove ordering"
+                        ),
+                        "entry_policy_expires_at": policy_expires_at.isoformat(),
+                        "broker_gtc_expires_at": broker_expires_at.isoformat(),
+                    },
+                )
         if later_touches.empty:
-            status = "not_filled" if as_of >= expires_at else "awaiting_fill"
+            # A wall-clock threshold is not itself a terminal observation.
+            # Until the first applicable market session is complete, the
+            # production order may still fill at that session's open.
+            status = (
+                "not_filled"
+                if boundary_rows and as_of >= expires_at
+                else "awaiting_fill"
+            )
             return ShadowReplayResult(
                 status=status,
                 entry_price=None,
@@ -497,7 +605,9 @@ def resolve_rsi_shadow(
                 metadata={
                     **base_meta,
                     "fill_status": status,
-                    "gtc_expires_at": expires_at.isoformat(),
+                    "entry_policy_expires_at": policy_expires_at.isoformat(),
+                    "broker_gtc_expires_at": broker_expires_at.isoformat(),
+                    "effective_entry_expires_at": expires_at.isoformat(),
                 },
             )
         fill_at = later_touches.index[0]
@@ -513,7 +623,9 @@ def resolve_rsi_shadow(
                 "entry_at": fill_at.isoformat(),
                 "fill_resolution": "daily",
                 "excursion_precision": "fill_session_excluded",
-                "gtc_expires_at": expires_at.isoformat(),
+                "entry_policy_expires_at": policy_expires_at.isoformat(),
+                "broker_gtc_expires_at": broker_expires_at.isoformat(),
+                "effective_entry_expires_at": expires_at.isoformat(),
                 "stop_price": stop,
             }
         )

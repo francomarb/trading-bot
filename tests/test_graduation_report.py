@@ -135,6 +135,38 @@ class TestGraduationReport:
         assert cohort["performance"]["gross_realized_pnl"] == 100
         assert cohort["performance"]["average_r"] == 1
 
+    def test_canceled_attempt_is_not_reported_as_open(self, tmp_path):
+        db = tmp_path / "canceled.db"
+        conn = _database(db)
+        store = PositionLifecycleStore(conn)
+        uid = "pos_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        store.create_pending(
+            position_uid=uid,
+            symbol="SPY261016P00600000",
+            owner_key="spread-canceled",
+            strategy="credit_spread",
+            strategy_version="1.0",
+            strategy_config_hash="spread123",
+            bot_git_commit="deadbeef",
+            position_type="spread",
+            entry_qty=1,
+        )
+        conn.execute(
+            "UPDATE position_lifecycle SET status='canceled' "
+            "WHERE position_uid=?",
+            (uid,),
+        )
+        conn.commit()
+        conn.close()
+
+        report = build_graduation_report(db)
+        cohort = report["cohorts"][0]
+
+        assert cohort["coverage"]["active_lifecycles"] == 0
+        assert cohort["coverage"]["canceled_without_outcome"] == 1
+        assert "1 canceled without outcome" in render_markdown(report)
+        assert "open/nonterminal" not in render_markdown(report)
+
     def test_unknown_epoch_is_context_not_cohort(self, tmp_path):
         db = tmp_path / "trades.db"
         conn = _database(db)

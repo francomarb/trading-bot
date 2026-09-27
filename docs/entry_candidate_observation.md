@@ -54,8 +54,9 @@ Current strategy-owned feature groups are:
 | Credit Spread | underlying trend/IV state, configured delta/DTE/credit constraints, selected spread economics and rank components |
 
 RSI feature schema v2 also stores the RSI period. Its candidate context freezes
-the entry order, the broker's actual TIF, the stop anchor and ATR multiplier,
-the exit rule, and modeled market-exit slippage. A configuration hash
+the entry order, the broker's actual TIF, the engine's maximum stale-entry age,
+the stop anchor and ATR multiplier, the exit rule, and modeled market-exit
+slippage. A configuration hash
 distinguishes epochs but cannot be reversed into these values, so future replay
 never borrows whatever configuration happens to be active when the resolver is
 run.
@@ -97,10 +98,17 @@ The RSI resolver is an explicit offline command:
 
 It tests the observation session against complete one-minute bars from the
 candidate's recorded feed after the observation time. RSI equity limits are
-GTC in the running bot, so an untouched order remains eligible on later
-completed daily sessions until Alpaca's 90-day GTC expiry. A legacy candidate's
-exact TIF is recovered from the selected peer's durable entry-order row; it is
-never guessed. The replay contract explicitly records that ordinary RSI GTC
+GTC at the broker, but the engine normally cancels an unfilled LIMIT after the
+frozen `STALE_LIMIT_MAX_AGE_SECONDS` threshold. Replay therefore uses the
+earlier of that local policy and Alpaca's 90-day ceiling. Because cleanup runs
+only in a market-hours cycle, the first trading session ending after the cutoff
+is the cancellation-boundary session, including after a weekend or holiday. A
+daily bar that touches the limit during that session is marked `needs_review`
+unless its open proves a pre-cleanup fill; an in-progress boundary session stays
+`awaiting_fill`, because daily resolution cannot invent the ordering. A legacy candidate's exact TIF is recovered from
+the selected peer's durable entry-order row, while its historical configured
+age default is parsed from its immutable commit. The replay contract explicitly
+records that ordinary RSI GTC
 OTO stops currently remain anchored to the entry reference; this matches the
 selected trades rather than assuming the fill-anchoring used by other equity
 entry variants. After a fill, the resolver applies that recorded ATR stop and
@@ -110,9 +118,9 @@ ordering is marked `needs_review`, not guessed. A live GTC order remains
 `awaiting_fill`; a filled candidate with no exit stays `open`. Both can be
 refreshed later. The indicator warm-up is derived from the frozen RSI/SMA
 windows rather than a fixed date span. Old schema-v1 candidates recover their
-missing configuration by parsing literal settings from their immutable stored
-bot commit; historical Python is never executed and current settings are never
-substituted.
+missing configuration and stale-age default by parsing settings from their
+immutable stored bot commit; historical Python is never executed and current
+settings are never substituted.
 
 The command only updates `entry_candidate_shadow_outcomes`. It never changes a
 decision, lifecycle, allocator state, or bot behavior. Once ranking is accepted,

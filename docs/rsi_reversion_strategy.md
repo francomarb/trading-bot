@@ -33,6 +33,14 @@ Configured in `forward_test.py`:
 | Risk per trade | 0.25% of equity |
 | Protective stop | `entry - 2 * ATR(14)` |
 
+The ordinary whole-share entry is submitted GTC, but that does not make it a
+90-day production opportunity. The engine cancels an identified unfilled LIMIT
+after `STALE_LIMIT_MAX_AGE_SECONDS` (24 hours by default, enforced on the next
+applicable market-hours cycle). The order can therefore still fill at the open
+of the first session after a weekend/holiday cutoff. The `11.61` shadow replay
+freezes that resolved runtime age and uses it ahead of Alpaca's outer GTC
+expiry while preserving this boundary-session behavior.
+
 The active `RSI_WATCHLIST` contains the 50-name v3 durable-company opportunity
 pool promoted on 2026-09-09 and narrowly corrected on 2026-09-20 by replacing
 the falsely excluded BRK.B ranked slot. Temporary lifecycle-preservation

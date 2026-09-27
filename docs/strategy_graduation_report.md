@@ -31,6 +31,14 @@ Only version plus configuration hash defines a comparable performance cohort.
 The bot commit is provenance: ordinary code fixes remain visible without
 splitting otherwise identical strategy evidence.
 
+Configuration hashes remain the non-negotiable raw boundary even when a change
+is described as universe maintenance. Watchlist members are evaluated by the
+engine and can change signals, contention, and capital admission. A future
+cross-hash summary may be added only through an explicit reviewed compatibility
+manifest that names the differing fields and explains why they are comparable;
+it must retain the component cohorts and may not replace their exact-hash
+results. No report infers compatibility from similar names or adjacent dates.
+
 Existing lifecycles are not relabeled. They appear under **unknown-epoch
 history** as context and are excluded from versioned cohort metrics. A future
 review may explicitly classify a historical interval with the optional
@@ -80,6 +88,11 @@ consistency, entry regimes, outlier dependence, order outcomes, operator-order
 count, external closes, calibration-grade execution slippage, modeled
 regulatory costs, and forward daily total-P&L drawdown.
 
+Lifecycle coverage separates active/pending positions, canceled attempts that
+never became outcomes, error rows, and completed economic outcomes. A canceled
+zero-fill entry is operational evidence, but it is neither an open position nor
+a completed trade and does not inflate either count.
+
 Only terminal lifecycles with at least one linked realized-P&L event and a
 parent/ledger total that reconciles within one cent enter performance metrics.
 External or recovered closes without durable economics remain visible as
@@ -113,14 +126,31 @@ collector is deployed and does not pretend to reconstruct earlier marks. A
 report run before the engine creates the new table treats forward marks as not
 yet collected; an existing table with the wrong schema remains an error. If a
 cohort has incomplete days, drawdown is calculated from its complete observed
-days while mark coverage stays explicit and the cohort remains `DATA
-INCOMPLETE`. Because a missing day could hide a deeper trough, that observed-day
-drawdown may understate the true drawdown.
+days while `daily_mark_status`, gap count, and coverage stay explicit. A
+historical mark gap does not by itself overwrite reconciled lifecycle evidence
+with `DATA INCOMPLETE`; that label is reserved for missing outcomes or current
+identity/economic/cost integrity failures. Because a missing day could hide a
+deeper trough, the observed-day drawdown may understate the true drawdown.
+
+### Evidence-sufficiency boundary
+
+The later `READY FOR OPERATOR REVIEW` contract must evaluate mark coverage as a
+separate gate. Historical NULL marks remain immutable and may not be estimated
+or backfilled. An isolated, explained operational incident is not an automatic
+permanent veto, but the eventual reviewed rule must set minimum coverage and
+maximum-gap limits and must fail closed on unexplained or current unresolved
+economics. Until those numeric limits are reviewed, every cohort remains at
+most `EARLY EVIDENCE`.
+
+Sufficiency is evaluated first on the exact version/configuration cohort.
+Evidence from another hash may be shown only as explicitly stratified context
+or under the reviewed compatibility-manifest process above; counts from hashes
+are never silently added together.
 
 ### Reviewed regulatory-cost model
 
 Realized lifecycle P&L already uses actual broker fill prices, so execution
-slippage is already present and is not deducted again. Report schema v3 applies
+slippage is already present and is not deducted again. Report schema v4 applies
 the versioned `alpaca-retail-us-2026-06-01-v1` pass-through schedule to actual
 filled quantities:
 

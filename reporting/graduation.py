@@ -17,7 +17,7 @@ from reporting.costs import DEFAULT_COST_MODEL
 from reporting.logger import is_execution_quality_measurement
 
 
-REPORT_SCHEMA_VERSION = 3
+REPORT_SCHEMA_VERSION = 4
 TERMINAL_STATUSES = frozenset({"closed", "external_closed"})
 ACTIVE_STATUSES = frozenset({"pending", "open", "partially_filled"})
 _REQUIRED_LIFECYCLE_COLUMNS = frozenset({
@@ -378,12 +378,34 @@ def _summarize(
     integrity_missing = sum(1 for row in rows if not row.version or not row.config_hash)
     pnl_mismatches = sum(not row.pnl_reconciled for row in terminal)
     missing_pnl_events = sum(not row.has_realized_pnl_event for row in terminal)
+    # Historical mark gaps are immutable audit evidence, not a current
+    # lifecycle-accounting failure.  Keep their coverage explicit below, but
+    # do not let one transient, explained gap permanently relabel otherwise
+    # reconciled outcomes as DATA INCOMPLETE.  A later sufficiency contract
+    # still decides whether the observed coverage is adequate for review.
     status = "EARLY EVIDENCE" if trusted else "DATA INCOMPLETE"
     if (
         integrity_missing or pnl_mismatches or missing_pnl_events or not trusted
-        or not costs_complete or not marks_complete
+        or not costs_complete
     ):
         status = "DATA INCOMPLETE"
+
+    active_lifecycles = sum(row.status in ACTIVE_STATUSES for row in rows)
+    canceled_lifecycles = sum(row.status == "canceled" for row in rows)
+    error_lifecycles = sum(row.status == "error" for row in rows)
+    other_non_outcomes = (
+        len(rows)
+        - len(terminal)
+        - active_lifecycles
+        - canceled_lifecycles
+        - error_lifecycles
+    )
+    if not marks:
+        daily_mark_status = "not_collected"
+    elif marks_complete:
+        daily_mark_status = "complete"
+    else:
+        daily_mark_status = "gapped"
 
     return {
         "strategy": strategy,
@@ -401,7 +423,10 @@ def _summarize(
             "terminal_lifecycles": len(terminal),
             "trusted_completed": len(trusted),
             "unresolved_economics": len(terminal) - len(trusted),
-            "open_or_nonterminal": len(rows) - len(terminal),
+            "active_lifecycles": active_lifecycles,
+            "canceled_without_outcome": canceled_lifecycles,
+            "error_lifecycles": error_lifecycles,
+            "other_non_outcome_lifecycles": other_non_outcomes,
             "identity_missing": integrity_missing,
             "pnl_reconciliation_mismatches": pnl_mismatches,
             "missing_realized_pnl_events": missing_pnl_events,
@@ -412,6 +437,9 @@ def _summarize(
             ),
             "daily_marks": len(marks),
             "complete_daily_marks": len(complete_marks),
+            "daily_mark_gap_days": len(marks) - len(complete_marks),
+            "daily_mark_coverage": _safe_div(len(complete_marks), len(marks)),
+            "daily_mark_status": daily_mark_status,
             "first_daily_mark": marks[0].mark_date if marks else None,
             "last_daily_mark": marks[-1].mark_date if marks else None,
             "daily_mark_missing_lifecycles": sum(
@@ -797,8 +825,11 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"operator decision: `{cohort['operator_decision']}`",
             "",
             f"Trusted completed lifecycles: {coverage['trusted_completed']} "
-            f"(unresolved economics: {coverage['unresolved_economics']}; "
-            f"open/nonterminal: {coverage['open_or_nonterminal']})",
+            f"(unresolved economics: {coverage['unresolved_economics']})",
+            f"Lifecycle state: {coverage['active_lifecycles']} active/pending; "
+            f"{coverage['canceled_without_outcome']} canceled without outcome; "
+            f"{coverage['error_lifecycles']} error; "
+            f"{coverage['other_non_outcome_lifecycles']} other non-outcome",
             (
                 f"Gross realized P&L: ${perf['gross_realized_pnl']:,.2f}"
                 if perf["gross_realized_pnl"] is not None
@@ -835,7 +866,8 @@ def render_markdown(report: dict[str, Any]) -> str:
             ),
             "",
             f"Daily marks: {coverage['complete_daily_marks']}/"
-            f"{coverage['daily_marks']} complete; collection begins forward only.",
+            f"{coverage['daily_marks']} complete "
+            f"({coverage['daily_mark_status']}); collection begins forward only.",
             "",
         ])
     if report["unknown_epoch_history"]:

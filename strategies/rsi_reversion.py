@@ -183,7 +183,7 @@ class RSIReversion(BaseStrategy):
         from config import settings
 
         return {
-            "contract_version": 1,
+            "contract_version": 2,
             "strategy": self.name,
             "timeframe": "1Day",
             "period": self.period,
@@ -193,6 +193,10 @@ class RSIReversion(BaseStrategy):
             "exit_sma_window": self.exit_sma_window,
             "quick_exit_rsi": self.quick_exit_rsi,
             "entry_order_type": self.preferred_order_type.value,
+            # The broker accepts this order as GTC, but the engine applies a
+            # shorter local stale-entry policy.  Freeze the resolved runtime
+            # value so offline replay cannot borrow a later configuration.
+            "max_entry_age_seconds": settings.STALE_LIMIT_MAX_AGE_SECONDS,
             # Ordinary whole-share GTC LIMIT + OTO entries retain the stop
             # submitted from the signal reference. Capped/fractional paths
             # differ, but RSI currently reaches this ordinary broker path.

@@ -439,8 +439,9 @@ candidate was selected and another hit a capacity gate enqueue a disposable
 counterfactual outcome row. RSI candidates freeze a replay contract through
 `candidate_replay_contract()`, enriched with the broker's actual entry TIF, and
 can be resolved offline from post-observation minute bars plus completed daily
-bars. The contract also versions the effective stop anchor so a future
-production change cannot rewrite historical counterfactuals. Other strategies
+bars. The contract freezes the engine's local stale-LIMIT age as well as the
+effective stop anchor, so neither a later configuration change nor Alpaca's
+longer 90-day GTC ceiling can rewrite historical counterfactuals. Other strategies
 require their own
 instrument-correct resolver. Ranking remains disabled; see
 [`entry_candidate_observation.md`](entry_candidate_observation.md).
@@ -698,8 +699,17 @@ The replacement now records forward-only daily marks in
 broker-reported unrealized P&L, grouped by strategy version and configuration
 hash. Missing positions/legs produce NULL rather than an inferred valuation.
 Reports calculate forward drawdown from complete observed days while exposing
-mark coverage; any gap keeps the cohort incomplete and means the observed
-drawdown may understate the true drawdown.
+mark coverage. A historical gap remains visible and means the observed drawdown
+may understate the true drawdown, but it does not by itself relabel reconciled
+lifecycle outcomes as incomplete. The later evidence-sufficiency contract must
+set reviewed coverage/gap limits rather than silently backfilling marks or
+using one transient day as an automatic permanent veto. Canceled zero-fill
+attempts are reported separately from active/pending lifecycles and completed
+economic outcomes.
+Exact strategy version/configuration hashes remain the primary cohort boundary.
+Cross-hash evidence may be presented only through a reviewed compatibility
+manifest that preserves the component results; universe-maintenance labels do
+not automatically make watchlists behavior-equivalent.
 Trade-only realized-P&L events with no matching lifecycle are disclosed in a
 separate footer and never merged into lifecycle or versioned-cohort totals.
 Operators may request inclusive UTC date bounds and one or more strategies;
