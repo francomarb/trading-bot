@@ -100,10 +100,12 @@ It tests the observation session against complete one-minute bars from the
 candidate's recorded feed after the observation time. RSI equity limits are
 GTC at the broker, but the engine normally cancels an unfilled LIMIT after the
 frozen `STALE_LIMIT_MAX_AGE_SECONDS` threshold. Replay therefore uses the
-earlier of that local policy and Alpaca's 90-day ceiling. A daily bar that
-touches the limit during the intraday cancellation-boundary session is marked
-`needs_review` unless its open proves a pre-boundary fill; daily resolution
-cannot invent the ordering. A legacy candidate's exact TIF is recovered from
+earlier of that local policy and Alpaca's 90-day ceiling. Because cleanup runs
+only in a market-hours cycle, the first trading session ending after the cutoff
+is the cancellation-boundary session, including after a weekend or holiday. A
+daily bar that touches the limit during that session is marked `needs_review`
+unless its open proves a pre-cleanup fill; an in-progress boundary session stays
+`awaiting_fill`, because daily resolution cannot invent the ordering. A legacy candidate's exact TIF is recovered from
 the selected peer's durable entry-order row, while its historical configured
 age default is parsed from its immutable commit. The replay contract explicitly
 records that ordinary RSI GTC

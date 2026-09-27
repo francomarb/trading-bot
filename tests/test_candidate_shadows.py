@@ -392,12 +392,17 @@ class TestRSIShadowReplay:
             **arguments,
             as_of=datetime(2026, 9, 10, 12, tzinfo=timezone.utc),
         )
-        expired = resolve_rsi_shadow(
+        boundary_session_in_progress = resolve_rsi_shadow(
             **arguments,
             as_of=datetime(2026, 9, 10, 14, tzinfo=timezone.utc),
         )
+        expired = resolve_rsi_shadow(
+            **arguments,
+            as_of=datetime(2026, 9, 10, 21, tzinfo=timezone.utc),
+        )
 
         assert waiting.status == "awaiting_fill"
+        assert boundary_session_in_progress.status == "awaiting_fill"
         assert expired.status == "not_filled"
         assert expired.metadata["entry_policy_expires_at"].startswith(
             "2026-09-10T13:43:21"
@@ -405,3 +410,46 @@ class TestRSIShadowReplay:
         assert expired.metadata["broker_gtc_expires_at"].startswith(
             "2026-12-08T13:43:21"
         )
+
+    def test_friday_gtc_can_fill_at_monday_open_after_age_threshold(self) -> None:
+        friday_observed = datetime(2026, 9, 11, 13, 32, tzinfo=timezone.utc)
+        candidate = _candidate(
+            observed_at=friday_observed.isoformat(),
+            signal_at="2026-09-10T04:00:00+00:00",
+        )
+        index = pd.bdate_range(
+            "2026-09-08", "2026-09-14", tz="America/New_York"
+        ).tz_convert("UTC")
+        daily = pd.DataFrame(
+            {
+                "open": [110.0, 108.0, 106.0, 104.0, 98.0],
+                "high": [111.0, 109.0, 107.0, 105.0, 99.0],
+                "low": [109.0, 107.0, 105.0, 103.0, 97.0],
+                "close": [110.0, 108.0, 106.0, 104.0, 98.0],
+            },
+            index=index,
+        )
+        arguments = {
+            "candidate": candidate,
+            "contract": _contract(time_in_force="gtc"),
+            "daily_bars": daily,
+            "entry_minutes": _minutes(
+                ("2026-09-11T13:33:00", 102.0, 103.0, 101.0, 102.0)
+            ),
+            "entry_window_complete": True,
+            "contract_source": "test",
+        }
+
+        sunday = resolve_rsi_shadow(
+            **arguments,
+            as_of=datetime(2026, 9, 13, 18, tzinfo=timezone.utc),
+        )
+        monday_close = resolve_rsi_shadow(
+            **arguments,
+            as_of=datetime(2026, 9, 14, 21, tzinfo=timezone.utc),
+        )
+
+        assert sunday.status == "awaiting_fill"
+        assert monday_close.status == "open"
+        assert monday_close.entry_price == 98.0
+        assert monday_close.metadata["entry_at"].startswith("2026-09-14")

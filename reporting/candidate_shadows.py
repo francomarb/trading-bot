@@ -544,16 +544,19 @@ def resolve_rsi_shadow(
         boundary_rows: list[tuple[pd.Timestamp, pd.Series]] = []
         for timestamp, row in later.iterrows():
             row_date = row["_session_date"]
-            session_open = datetime.combine(row_date, time(9, 30), _NY).astimezone(
-                timezone.utc
-            )
             session_end = datetime.combine(row_date, time(16, 0), _NY).astimezone(
                 timezone.utc
             )
             if session_end <= expires_at:
                 fully_eligible_indexes.append(timestamp)
-            elif session_open < expires_at < session_end:
+            else:
+                # Cleanup runs only inside a market-hours engine cycle.  The
+                # first session ending after the wall-clock threshold still
+                # sees the order at its open, including when the threshold
+                # fell on a weekend or holiday.  Daily bars cannot prove a
+                # later intraday touch happened before the cleanup cycle.
                 boundary_rows.append((timestamp, row))
+                break
         eligible = later.loc[fully_eligible_indexes]
         later_touches = eligible[eligible["low"].astype(float) <= limit_price]
         if later_touches.empty and boundary_rows:
@@ -582,7 +585,14 @@ def resolve_rsi_shadow(
                     },
                 )
         if later_touches.empty:
-            status = "not_filled" if as_of >= expires_at else "awaiting_fill"
+            # A wall-clock threshold is not itself a terminal observation.
+            # Until the first applicable market session is complete, the
+            # production order may still fill at that session's open.
+            status = (
+                "not_filled"
+                if boundary_rows and as_of >= expires_at
+                else "awaiting_fill"
+            )
             return ShadowReplayResult(
                 status=status,
                 entry_price=None,
