@@ -3,7 +3,7 @@
 **Status:** ✅ **PAPER ACTIVE** — wired in `engine/trader.py` and `forward_test.py`
 since project inception. The original MVP trend-follower for this project.
 
-**Last updated:** 2026-06-06
+**Last updated:** 2026-09-28
 
 > **Entry-quality audit (PLAN `11.70`, closed 2026-09-11):** the
 > production-mirror control, wider structure-aware stop, five-session pullback,
@@ -32,11 +32,12 @@ pullbacks.
 **Why 20/50 and not 50/200 (classic "golden cross"):**
 The 50/200 golden cross is iconic but fires a few times per decade per
 name — far too rare to be a workable strategy at the watchlist scale we
-run (50 names). The 20/50 cross fires multiple times per name per year,
+run (100 ranked names). The 20/50 cross fires multiple times per name per year,
 which is what makes the sleeve generate enough trades to be statistically
 meaningful. The 200 SMA *is* used elsewhere — as a gate in
-`SMAEdgeFilter` (stock above its 200 SMA) and in `SPYTrendFilter` (macro
-SPY > 200 SMA). 200 SMA is a *structural gate*; 20/50 is the *trigger*.
+`SMAEdgeFilter` (stock above its 200 SMA) and by `RegimeDetector` when
+classifying the macro BEAR state from SPY. The 200 SMA is a *structural gate*;
+20/50 is the *trigger*.
 
 ---
 
@@ -49,9 +50,9 @@ SPY > 200 SMA). 200 SMA is a *structural gate*; 20/50 is the *trigger*.
 | Order type | MARKET | `SMACrossover.preferred_order_type` |
 | Regime gate | `TRENDING`, `RANGING` only | `settings.STRATEGY_ALLOWED_REGIMES` |
 | Edge filter | `SMAEdgeFilter` + `SectorMomentumFilter` | `forward_test.py:210-216` |
-| Sleeve weight | 0.40 of equity (target) — carved from 0.45 when credit_spread was added | `settings.STRATEGY_ALLOCATIONS["sma_crossover"]["target_pct"]` |
+| Sleeve weight | 0.30 of deployable capital (target) | `settings.STRATEGY_ALLOCATIONS["sma_crossover"]["target_pct"]` |
 | ATR stop | `entry − 2.0 × ATR(14)` (static) | `settings.ATR_STOP_MULTIPLIER` |
-| Watchlist | `SMA_WATCHLIST` (50 names) | `config/settings.py` |
+| Watchlist | 100 ranked v3 names plus lifecycle preservation | `config/settings.py` |
 | Stop time-in-force | GTC (DAY at submit → promoted to GTC) | `engine/trader.py` |
 | Fractional shares | Enabled when MARKET path active | `settings.FRACTIONAL_ENABLED` |
 
@@ -121,14 +122,15 @@ Applied in order. Any failure blocks the entry.
 1. **Regime gate** (`settings.STRATEGY_ALLOWED_REGIMES["sma_crossover"]`) —
    sleeve enabled only when `RegimeDetector` reports `TRENDING` or
    `RANGING`. Disabled in `BEAR` and `VOLATILE`.
-2. **`SPYTrendFilter`** (shared macro gate, `strategies/filters/common.py`) —
-   SPY must be above its 200 SMA.
-3. **`SMAEdgeFilter`** (`strategies/filters/sma_crossover.py`) —
+2. **`SMAEdgeFilter`** (`strategies/filters/sma_crossover.py`) —
    stock must be above its 200 SMA and show volume expansion.
-4. **`SectorMomentumFilter`** (`sector/gauge.py`) — the stock's sector ETF
-   must be HOT or NEUTRAL. COLD sectors are blocked.
-5. **Earnings blackout** — no entry inside the symbol's earnings blackout
-   window.
+3. **Earnings blackout** inside `SMAEdgeFilter` — no entry in the two calendar
+   days before earnings; post-earnings entries are allowed immediately.
+4. **`SectorMomentumFilter`** (`sector/gauge.py`) — warning-only for SMA.
+   HOT/NEUTRAL/COLD/unknown context is recorded but never vetoes an entry.
+
+The old standalone `SPYTrendFilter` is intentionally disabled because the
+regime detector owns the macro SPY>200-SMA condition used to classify BEAR.
 
 The composite is wired in `forward_test.py`:
 
@@ -156,15 +158,13 @@ Composition is dynamic and lives in `config/settings.py::SMA_WATCHLIST`.
 Findings about *what* to put on the list and how often to refresh it are
 tracked in [`sma_crossover_optimizations.md`](sma_crossover_optimizations.md).
 
-**Current composition (2026-06-08):** 50 names, derived from
-`scripts/sma_watchlist_scan.py` (composite-score top 30 from 2026-05-11, plus 10 fundamentals-sanitized additions on 2026-06-08)
-plus manual additions (NVDA, DUOL).
-* **Operational Boundary (June 8, 2026):** Marks the transition from the initial 40-symbol cohort to the expanded 50-symbol watchlist. The 40-symbol period is closed as an operational baseline with one completed lifecycle and two open positions (not as a statistical performance baseline). Existing positions are kept running normally, and pre/post-boundary results will be reported separately.
-An audit-driven cull was attempted
-and reverted in the same session — see
-[`sma_crossover_optimizations.md`](sma_crossover_optimizations.md) for
-the methodology gates that must be satisfied before any cull is
-re-promoted.
+**Current composition (2026-09-28):** 100 names ranked by 50-session SIP dollar
+liquidity after durable price, size, solvency, and share-class gates, plus any
+temporary lifecycle-preservation members. Technical state, historical
+crossovers, FCF/revenue, ATR, and sector are diagnostics only. Promotion starts
+a new exact-configuration paper cohort. See
+[`sma-watchlist-selection.md`](sma-watchlist-selection.md) and
+[`sma-watchlist-methodology-audit.md`](sma-watchlist-methodology-audit.md).
 
 ---
 
@@ -247,10 +247,10 @@ and the L2 execution check. Stop-out fills record against the active
 stop price, which is the stop-gap erosion family and likewise excluded
 (PLAN `11.49`).
 
-**Data feed.** Production runs on Alpaca's IEX feed (paper-account
-constraint; SIP requires paid subscription). Backtests use the same
-IEX cache via `data.fetcher`. IEX is a subset of national tape — volume
-filters and edge filters are calibrated to the IEX scale, not SIP.
+**Data feed.** Production runs on Alpaca's real-time IEX feed because of the
+paper-account entitlement. Offline selection and current research use delayed
+SIP through `BACKTEST_DATA_FEED`, while execution replay uses IEX to reproduce
+what the bot saw. Historical reports retain their originally disclosed feed.
 
 **Sample size.** ~10–18 trades per name per 7.5-year window. Individual
 symbol-level conclusions are noisy; only aggregate watchlist-level
@@ -279,7 +279,9 @@ bear — the strategy's behavior in that regime is untested in this window.
 - `forward_test.py` — forward-test wiring with full filter stack.
 - `backtest/runner.py` — vectorbt harness used for initial validation.
 - `scripts/sma_giveback_audit.py` — exit-rule and profit-concentration audit.
-- `scripts/sma_watchlist_scan.py` — watchlist regeneration scanner.
+- `scripts/sma_watchlist_scan.py` — retired v2 implementation; CLI requires
+  explicit historical opt-in and the module temporarily supplies shared helpers.
+- `scripts/sma_durable_watchlist_scan.py` — active v3 durable-pool selector.
 
 ## Related docs
 

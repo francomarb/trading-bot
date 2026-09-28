@@ -35,7 +35,7 @@ the resulting membership review are complete.
   standalone report, and process exit status.
 - `scripts/rsi_watchlist_scan.py`: active RSI durable-pool selector.
 - `scripts/donchian_watchlist_scan.py`: active Donchian durable-pool selector.
-- `scripts/sma_watchlist_scan.py`: active SMA research selector and its use of
+- `scripts/sma_watchlist_scan.py`: retired SMA v2 research selector and its use of
   the shared display verdict as an eligibility decision.
 - `scripts/rsi_static_universe.py`: historical builder retained for research.
 - Current tests, committed RSI/Donchian reports, configuration, and the
@@ -224,7 +224,8 @@ Files:
 
 - `scripts/rsi_watchlist_scan.py`
 - `scripts/donchian_watchlist_scan.py`
-- `scripts/sma_watchlist_scan.py`
+- `scripts/sma_watchlist_scan.py` (historical v2 consumer; active SMA refreshes
+  use `scripts/sma_durable_watchlist_scan.py`)
 - `scripts/rsi_static_universe.py`
 - their focused tests and watchlist-selection documentation.
 

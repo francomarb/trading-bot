@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
-"""
-SMA watchlist scanner.
+"""Retired SMA v2 scanner and shared watchlist-scan helpers.
 
-Builds a ranked list of SMA crossover candidates using the documented
-`sma_watchlist_v1` rules in docs/sma-watchlist-selection.md.
+The v2 technical-snapshot selector is historical-only. The active SMA
+watchlist selector is ``scripts/sma_durable_watchlist_scan.py`` under rule
+``sma_watchlist_v3_durable_liquid_pool``. Several research selectors still
+import the market-data and asset-universe helpers in this module, so the module
+is retained while direct CLI execution requires an explicit legacy opt-in.
 
 Data sources:
   - Alpaca Trading API: active/tradable US equity universe
   - Alpaca Market Data API: adjusted daily OHLCV bars
   - Optional Yahoo Finance fundamentals: existing watchlist-review checks
 
-Usage:
-    python scripts/sma_watchlist_scan.py
-    python scripts/sma_watchlist_scan.py --top 30 --max-assets 500
-    python scripts/sma_watchlist_scan.py --include-fundamentals --output logs/sma_scan.md
-    python scripts/sma_watchlist_scan.py --feed sip --end-delay-minutes 60
-    python scripts/sma_watchlist_scan.py --explain-symbols NVDA MSFT AVGO
+Historical reproduction only:
+    python scripts/sma_watchlist_scan.py --allow-legacy-v2 [options]
 
 The scanner is report-only. It does not modify config/settings.py or any live
 strategy slot.
@@ -1155,7 +1153,15 @@ def _fmt_dollars(value: float) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Scan Alpaca assets for SMA crossover watchlist candidates.",
+        description=(
+            "Reproduce the retired SMA v2 technical-snapshot scan. The active "
+            "selector is scripts/sma_durable_watchlist_scan.py."
+        ),
+    )
+    parser.add_argument(
+        "--allow-legacy-v2",
+        action="store_true",
+        help="Acknowledge that this is historical research, not an active selector.",
     )
     parser.add_argument("--top", type=int, default=30, help="Number of candidates to show.")
     parser.add_argument(
@@ -1231,6 +1237,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     configure_logging(args.verbose)
+
+    if not args.allow_legacy_v2:
+        raise SystemExit(
+            "sma_watchlist_v2 is retired. Use "
+            "scripts/sma_durable_watchlist_scan.py for active SMA refreshes, "
+            "or pass --allow-legacy-v2 only to reproduce historical research."
+        )
 
     if args.end_delay_minutes < 0:
         raise ValueError("--end-delay-minutes must be >= 0")

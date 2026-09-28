@@ -1,412 +1,187 @@
 # SMA Watchlist Selection
 
-## Purpose
+**Active rule:** `sma_watchlist_v3_durable_liquid_pool`
 
-Define the stock-selection rules for the SMA crossover strategy.
+**Promoted:** 2026-09-28
 
-The SMA crossover strategy should not scan for "interesting" stocks. It should
-watch only liquid stocks that are already in broad, confirmed uptrends. The
-strategy then waits for its own 20/50 SMA crossover signal.
+**Ranked pool:** 100 companies, followed only by temporary lifecycle-preservation members
 
-This document is intended to be stable. Changes to these rules should be treated
-as strategy-spec changes and versioned deliberately.
+This document is the authoritative SMA watchlist specification. The historical
+`sma_watchlist_v2` technical snapshot method is retired and must not be used to
+refresh production or paper configuration.
 
 ## Responsibility Split
 
-Symbol selection and trade timing are separate concerns.
+The watchlist answers:
+
+> Which companies are durable and practical enough for SMA to monitor?
+
+The strategy and runtime gates answer:
+
+> Is one of those companies a good trade now?
 
 ```text
-Universe -> Watchlist Source -> Strategy Watchlist -> SMA Signal -> Risk -> Execution
+Tradable stock universe
+    -> durable eligibility
+    -> liquidity-ranked top 100
+    -> 20/50 crossover
+    -> runtime entry gates
+    -> portfolio and risk checks
+    -> execution
 ```
 
-- Universe: the broad set of symbols that may be considered.
-- Watchlist source: static list or dynamic selector that returns symbols.
-- SMA strategy: entry and exit logic only.
-- Risk manager: sizing, exposure, loss limits, and kill switches.
-- Execution: broker order placement.
-
-The SMA strategy answers:
-
-> Is there a valid 20/50 SMA crossover signal now?
-
-The watchlist selector answers:
-
-> Which symbols are even eligible for SMA trend following?
-
-Do not embed candidate-selection logic inside `SMACrossover`.
-
-## Architecture Direction
-
-The bot should support two watchlist styles:
-
-### Static Watchlist
-
-A handpicked list of symbols in config.
-
-Use this for:
-
-- early paper testing
-- stable reconciliation windows
-- debugging
-- deliberately curated portfolios
-
-Properties:
-
-- simple
-- explainable
-- low churn
-- easy to reproduce
-
-### Dynamic Watchlist
-
-A rules-based watchlist source that rebuilds symbols periodically.
-
-Use this only after the static strategy is operationally stable.
-
-Properties:
-
-- adaptive
-- more complex
-- easier to overfit
-- must be deterministic and auditable
-
-### Generic Contract
-
-Dynamic watchlists should be implemented behind a generic interface, not as an
-SMA-only special case.
-
-Conceptual contract:
-
-```python
-class WatchlistSource:
-    name: str
-
-    def symbols(self) -> list[str]:
-        """Return the current symbols to watch."""
-```
-
-Possible implementations:
-
-- `StaticWatchlistSource`
-- `ConfigWatchlistSource`
-- `AlpacaAssetUniverseSource`
-- `CsvWatchlistSource`
-- `DynamicFilteredWatchlistSource`
-
-Dynamic sources may use a strategy-specific selector or filter internally, but
-the engine should only care that a list of symbols is returned.
-
-Examples:
-
-- SMA dynamic watchlist uses a trend-following selector.
-- RSI dynamic watchlist uses a mean-reversion selector.
-- A future breakout strategy uses a breakout/liquidity selector.
-
-This keeps the engine scalable and avoids hard-coding strategy-specific scanner
-logic into the orchestration layer.
-
-### Dynamic Watchlist Guardrails
-
-Dynamic watchlists are operationally riskier than static lists. They must be
-introduced with guardrails before they can drive live or paper trading.
-
-Required guardrails:
-
-- do not remove a symbol with an open position unless ownership and exit rules
-  are explicit
-- do not change the active watchlist mid-paper-run when the run is being used
-  for lifecycle reconciliation or a controlled strategy analysis
-- cache every generated watchlist with timestamp, rule version, data timestamp,
-  and selected symbols
-- log rejection counts for every hard filter
-- log manual overrides separately from rule-driven selections
-- run new dynamic selectors in report-only mode before allowing them to drive a
-  strategy slot
-- cap turnover so small daily data changes cannot churn the entire watchlist
-- keep strategy ownership durable across restarts before enabling dynamic
-  multi-strategy watchlists
-
-If a dynamic watchlist changes while a position is open, the position remains
-owned by the strategy that opened it. Watchlist membership is not the same as
-position ownership.
-
-## Current State
-
-Today, SMA uses the curated static `SMA_WATCHLIST` in `config/settings.py`.
-That runtime setting is the source of truth; this methodology document does
-not duplicate the symbol list because operator-directed additions occur during
-paper development.
-
-The active paper engine passes this static list into `StrategySlot`.
-
-No automated SMA candidate selector exists yet.
-
-## SMA Candidate Rule
-
-A symbol is eligible for the SMA crossover watchlist only if all hard filters
-pass.
-
-### 1. Tradability
-
-Required:
-
-- Alpaca active US equity
-- tradable through Alpaca
-- regular listed security, not OTC
-- at least 260 daily bars available
-
-Excluded:
-
-- leveraged ETFs
-- inverse ETFs
-- symbols with unreliable or incomplete daily data
-- manually flagged names that cannot be reconciled or traded cleanly
-
-### 2. Liquidity
-
-Required:
-
-- market capitalization >= 2,000,000,000
-- latest close >= 10.00
-- 20-day average share volume >= 500,000
-- 50-day average dollar volume >= 50,000,000
-
-Rationale:
-
-SMA crossover is a market-order trend strategy. It needs clean fills and should
-not depend on thin liquidity. The market-cap floor keeps the watchlist away
-from very small companies where one news cycle, financing event, or thin holder
-base can overwhelm the technical trend.
-
-### 3. Confirmed Uptrend
-
-Required:
-
-- close > SMA50
-- close > SMA150
-- close > SMA200
-- SMA50 > SMA150
-- SMA150 > SMA200
-
-Rationale:
-
-This follows the same broad consensus as trend-template style screens: trade
-stocks already in sustained Stage 2-style uptrends, not stocks that merely
-look cheap or recently bounced.
-
-Note (v2): the v1 rule also required "SMA200 today > SMA200 from 20 trading
-days ago." It was retired in v2 because the long-term-direction concern it
-addressed is already covered twice:
-
-1. The engine-level BEAR regime gate (`RegimeDetector`: SPY < 200 SMA)
-   blocks SMA entries during macro downtrends regardless of per-symbol state.
-2. The per-symbol `close > SMA200` plus `SMA50 > SMA150 > SMA200`
-   alignment requirement already guarantees price is above a long-term
-   moving average that the shorter averages confirm.
-
-In addition, the rising-SMA200 rule was producing systematic lateness at
-bear-to-bull transitions: SMA200 can keep falling for 60-90 trading days
-after a real bottom, and a 20-day rising requirement adds another month on
-top of that. The result was missing the highest-edge Stage-2 emergence
-trades — exactly the entries the strategy is designed to capture.
-
-### 4. 52-Week Strength
-
-Required:
-
-- close >= 1.30 * 52-week low
-- close >= 0.75 * 52-week high
-
-Rationale:
-
-Trend-following candidates should be close to leadership, not deep in damaged
-recovery territory.
-
-### 5. Relative Strength
-
-Required:
-
-- 12-month momentum excluding the most recent month ranks in the top 30% of
-  the candidate universe
-
-Equivalent:
-
-- relative strength percentile >= 70
-
-Rationale:
-
-Academic and practitioner evidence both favor buying strength over weakness.
-SMA crossover should focus on leaders, not laggards.
-
-### 6. Trend Strength
-
-Required:
-
-- ADX14 >= 20
-- +DI > -DI
-
-Preferred:
-
-- ADX14 >= 25
-- ADX14 rising over the last 5 trading days
-
-Rationale:
-
-Moving average crossovers are vulnerable to sideways-market whipsaws. ADX is a
-trend-strength filter; it does not replace the SMA signal.
-
-### 7. Volatility Sanity
-
-Required:
-
-- ATR14 / close >= 0.01
-- ATR14 / close <= 0.08
-
-Rationale:
-
-Reject names that are too quiet to move or too chaotic for stable trend
-following.
-
-### 8. Fundamental Sanity
-
-Required for SMA:
-
-- annual free cash flow > 0
-- YoY revenue growth > 0
-- profitable, or if unprofitable, cash runway >= 18 months
-
-Excluded:
-
-- pre-profit "story" names with no earnings anchor
-- companies with unresolved solvency concerns
-- active bank-debt crisis or similar financing stress
-
-Rationale:
-
-The existing watchlist review logic treats deteriorating fundamentals as a poor
-fit for SMA trend following. SMA should not depend on a pure narrative stock
-holding its trend after sentiment changes.
-
-### 9. Portfolio Hygiene
-
-Required:
-
-- no more than 3 symbols per sector in the final SMA watchlist
-- no symbol should be added or removed mid-paper-run
-- watchlist changes must be made before a new paper/reconciliation window
-
-Preferred:
-
-- final list size between 10 and 25 symbols
-- keep stable names unless a hard filter fails
-- document every manual override
-
-Rationale:
-
-Concentration and watchlist churn can contaminate forward-test results and make
-strategy attribution harder.
-
-## Ranking Survivors
-
-If more symbols pass than the target list size allows, rank survivors.
-
-Recommended ranking inputs:
-
-1. relative strength percentile
-2. Consolidation Score (penalizes parabolic exhaustion above SMA50)
-3. Freshness / Coil Score (rewards tightness between SMA20 and SMA50)
-4. ADX14 level and slope
-5. 50-day average dollar volume
-6. trend smoothness, measured by fewer 20/50 crossovers over the last year
-7. sector diversification
-
-Do not rank by recent one-day price jump alone.
-
-## What Stays Out Of The Core Rule
-
-These may be useful later, but should not be hard admission rules for the first
-SMA watchlist selector:
-
-- RSI overbought or oversold
-- MACD crossover
-- Bollinger Band breakout
-- SuperTrend
-- news sentiment
-- analyst ratings
-- social media attention
-
-Reason:
-
-Most of these either duplicate moving-average information, belong to a different
-strategy, or introduce data dependencies that make the first implementation less
-auditable.
-
-## Static To Dynamic Migration
-
-Recommended rollout:
-
-1. Keep the current static `SMA_WATCHLIST` during the active paper run.
-2. Use this document to review the static list after the run.
-3. Implement a generic watchlist-source abstraction.
-4. Add a dynamic SMA selector behind that abstraction.
-5. Run the selector in report-only mode first.
-6. Compare static vs dynamic candidates for several weeks.
-7. Only then allow the dynamic source to drive a paper-trading slot.
-
-The dynamic selector must log:
-
-- base universe size
-- symbols removed by each hard filter
-- final candidate count
-- selected symbols
-- rule version
-- data timestamp
-
-## Rule Version
-
-Current rule version: `sma_watchlist_v2`
-
-History:
-
-- `sma_watchlist_v2`: dropped the "SMA200 rising over 20 trading days"
-  sub-rule from §3. The long-term-direction concern is owned by the
-  engine-level BEAR regime gate and by the in-§3 alignment requirement; the
-  rising-SMA200 clause added systematic lateness at bear-to-bull transitions
-  without independent edge.
-- `sma_watchlist_v1`: initial published rules.
-
-Changing any hard threshold creates a new rule version.
-
-Examples:
-
-- changing minimum market cap from 10B to 5B
-- changing minimum dollar volume from 50M to 25M
-- replacing ADX with another trend-strength indicator
-- removing the 52-week high/low constraints
-- changing the relative strength percentile
-
-Adding a new data source without changing rules does not require a new strategy
-rule version, but should still be noted in implementation docs.
-
-## Sources
-
-- Mark Minervini-style trend template: price above 50/150/200 day moving
-  averages, moving-average alignment, rising 200-day average, near 52-week high,
-  and relative strength.
-- StockCharts Technical Rank methodology: relative strength across multiple
-  timeframes, with heavier weight on long-term and medium-term trend.
-- StockCharts ADX scans: liquid stocks, average price above 10, price above
-  50-day SMA, ADX above 20, and +DI above -DI for long trend candidates.
-- AQR and academic trend-following literature: time-series momentum has shown
-  persistence across markets and long histories.
-- Jegadeesh and Titman momentum research: stocks with strong 3-to-12 month past
-  returns tend to outperform over intermediate horizons.
-- Existing project rule: SMA requires positive FCF, revenue growth, and solvency
-  checks from `scripts/watchlist_review.py`.
-
-Every required SMA fundamental must be affirmatively available and passing.
-The scanner evaluates the structured FCF, revenue, and solvency results rather
-than the standalone report's display verdict. Provider errors and unavailable
-required facts fail closed with distinct reasons. Profitability uses Yahoo's
-exact `Net Income` row first and `Net Income Common Stockholders` as the only
-approved fallback.
+Watchlist membership is not a buy recommendation. A member may remain inactive
+for months without a valid crossover.
+
+## Hard Membership Gates
+
+A ranked company must satisfy every requirement using completed-session data:
+
+- active and tradable through Alpaca;
+- stock-like US security rather than an ETF, fund, warrant, unit, right, OTC
+  security, or other non-operating-company instrument;
+- at least 260 clean adjusted daily bars;
+- latest close at least $10;
+- 50-session average SIP dollar volume at least $50 million;
+- market capitalization at least $2 billion;
+- affirmative solvency under the shared durable-company policy: profitable, or
+  enough cash runway for at least 12 months;
+- preferred share class (`GOOG`, not both `GOOG` and `GOOGL`); and
+- all required provider facts available without an unresolved error.
+
+Required facts fail closed. A provider error, unknown market capitalization, or
+unknown solvency cannot silently admit a company or shift the ranked boundary.
+The selector makes one bounded retry for a whole-request fundamentals failure.
+
+## Ranking
+
+Eligible companies are ordered by descending 50-session average SIP dollar
+volume. The first 100 form the ranked opportunity pool.
+
+Liquidity rank is an execution-priority measure, not a forecast. Rank 1 is the
+most liquid eligible company, not the company with the highest expected return.
+The strategy applies the same signal and gates to every member.
+
+The target of 100 was chosen because the promotion scan found:
+
+| Pool | Raw 20/50 crossovers | Active days | Peak same-day signals | Days above 8-position capacity |
+|---:|---:|---:|---:|---:|
+| 50 | 119 | 83 | 4 | 0 |
+| **100** | **243** | **142** | **5** | **0** |
+| 200 | 491 | 193 | 11 | 3 |
+
+These are current-universe opportunity counts, not a survivorship-free return
+backtest. One hundred roughly doubled coverage versus 50 without exceeding the
+sleeve's same-day position capacity. Two hundred introduced contention and
+additional cycle cost.
+
+## Diagnostics That Do Not Control Membership
+
+The report records these for review, but they do not admit, reject, or rank a
+company:
+
+- current SMA50/SMA150/SMA200 state or alignment;
+- 12-to-1-month momentum and relative strength;
+- position within the 52-week range;
+- ADX and directional indicators;
+- ATR percentage;
+- share volume independent of dollar liquidity;
+- historical 20/50 crossover counts;
+- free cash flow and recent revenue growth; and
+- sector or industry concentration.
+
+These are temporary market states, non-sector-neutral accounting facts, or
+portfolio context. Using them as quarterly membership gates caused excessive
+turnover and duplicated decisions that belong at signal, risk, or portfolio
+time.
+
+## Runtime Trade Gates
+
+After membership, an entry still requires all applicable runtime controls:
+
+1. a fresh bullish 20-day/50-day SMA crossover;
+2. an allowed market regime (`TRENDING` or `RANGING`);
+3. stock close above its 200-day SMA;
+4. 10-session median volume above 30-session median volume;
+5. no earnings announcement within the two-day pre-earnings blackout;
+6. no ownership, pending-order, symbol-lock, or conflicting-position issue;
+7. available sleeve position count, capital, gross exposure, and risk budget;
+8. successful broker and lifecycle preflight.
+
+The sector gauge is warning-only for SMA. A COLD or unknown sector supplies
+context but does not veto an entry.
+
+The stock-SMA, volume, and earnings filters fail open when their documented
+inputs are unavailable. This is existing runtime behavior and is distinct from
+the watchlist selector's fail-closed durable membership rules.
+
+## Risk And Capacity
+
+- SMA targets 0.60% of account equity in initial stop risk.
+- The protective stop is two ATR below the fill-based entry anchor.
+- Position, sleeve, cash, and gross-exposure caps may reduce approved quantity.
+- The sleeve hard maximum is eight positions.
+- Volatility changes position size; it is not a membership rejection.
+
+At the current allocation and caps, the position notional cap starts reducing
+the risk target at approximately 3.12% ATR/close. This is expected and is
+reported as risk-target coverage rather than treated as a bad company.
+
+## Lifecycle Preservation
+
+The ranked pool always occupies the first 100 settings entries. If an existing
+SMA-owned position falls outside the new pool, append it after the ranked names
+until it is flat and terminal. Never remove it merely because a refresh changed
+membership. Unresolved entry orders must also be reconciled before promotion.
+
+Lifecycle-preservation members do not change the ranked target and must not be
+described as selector winners.
+
+## Refresh And Promotion Procedure
+
+Refresh quarterly, or after a material tradability, corporate-action,
+data-quality, or persistent opportunity-starvation event. Do not rotate the
+pool for ordinary one-scan liquidity movement.
+
+Every refresh must:
+
+1. run `scripts/sma_durable_watchlist_scan.py` with delayed SIP data and at
+   least a 1,440-minute completed-session delay;
+2. compare the nested 25/50/100/200 pools and inspect rejection reasons;
+3. resolve every required-provider error or reproduce a clean stable rerun;
+4. privately reconcile lifecycle ownership and unresolved SMA entry orders;
+5. obtain explicit operator approval before editing `SMA_WATCHLIST`;
+6. preserve required lifecycle members outside the ranked 100;
+7. update configuration, this specification, deployment documentation, and
+   `PLAN.md` together;
+8. run focused and full tests;
+9. recycle only with `./recycle_bot.sh`; and
+10. verify startup ownership, protective stops, ranked count, cycle duration,
+    market-data request volume, and errors.
+
+A promotion starts a new strategy configuration-hash evidence cohort. Do not
+pool its paper outcomes with the previous exact configuration.
+
+## Implementation And Evidence
+
+- Active configuration: `config/settings.py::SMA_WATCHLIST`
+- Active selector: `scripts/sma_durable_watchlist_scan.py`
+- Methodology and filter audit:
+  [`sma-watchlist-methodology-audit.md`](sma-watchlist-methodology-audit.md)
+- Approved scan artifact:
+  [`reports/sma_durable_watchlist_scan_20260928_promoted.md`](reports/sma_durable_watchlist_scan_20260928_promoted.md)
+
+`scripts/sma_watchlist_scan.py` contains the retired v2 research implementation
+and shared market-data helpers still imported by research scripts. Its command
+line is opt-in historical reproduction only; it is not an alternative active
+selector.
+
+## Version History
+
+- `sma_watchlist_v3_durable_liquid_pool` — active from 2026-09-28. Separates
+  durable company membership from time-sensitive trade gating and ranks by
+  dollar liquidity.
+- `sma_watchlist_v2` — retired 2026-09-28. Mixed current trend, relative
+  strength, ADX, ATR, fundamentals, and sector caps into membership; retained
+  only for historical report reproduction.
+- `sma_watchlist_v1` — retired initial technical-selection method.

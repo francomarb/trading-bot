@@ -303,9 +303,9 @@ rather than "is its unit-share P&L positive."
 | | Status | Action |
 |---|---|---|
 | Cull chronic underperformers | ⛔ DEFERRED 2026-06-06 | Briefly removed VIAV, VSAT, CIEN, ALB, INTC; reverted after reviewer correctly noted the audit was unit-share, unfiltered, and in-sample — see *Methodology gates* below. Re-promote only after the gated audit signs off. |
-| Quarterly automatic regeneration | TODO | Schedule `scripts/sma_watchlist_scan.py` via cron / scheduled task. Diff before promoting to settings. |
-| Scanner ranking criterion audit | TODO | Audit `sma_watchlist_v2` rule in `sma_watchlist_scan.py`. Does it select for *trend-friendliness* (clean directional moves, high ATR-adjusted returns) or just historical price action? |
-| Chronic-loser eject rule | TODO | Add a scanner rule: any name with negative net P&L on the strategy over a rolling 3y window is auto-excluded from the next regeneration. Must use the filtered/sized audit, not the raw one. |
+| Quarterly durable-pool refresh | ACTIVE | Run `scripts/sma_durable_watchlist_scan.py` report-only, review 25/50/100/200 pools, reconcile lifecycle state, and require explicit approval before updating settings. Do not schedule automatic promotion. |
+| Scanner ranking criterion audit | ✅ COMPLETE (`11.75`) | Liquidity is the active ranking because it is durable and execution-relevant. Momentum and 52-week ordering remain diagnostics without point-in-time walk-forward evidence. The v2 composite rank is retired. |
+| Chronic-loser eject rule | REJECTED | Historical per-symbol P&L is survivor-selected and would turn outcomes into a membership gate. Forward outcomes assess the strategy; they do not automatically delete otherwise durable companies. |
 
 ### 2. Filter calibration — MEDIUM-HIGH LEVERAGE
 

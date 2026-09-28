@@ -35,6 +35,7 @@ from scripts.sma_watchlist_scan import (
     _is_biotech_industry,
     _normalize_company_name,
     get_open_sma_positions,
+    main,
     scan_candidates,
 )
 from scripts.watchlist_review import SymbolFundamentals
@@ -67,6 +68,17 @@ class TestRuleVersion:
     def test_sma200_rising_label_removed(self):
         # The label was retired with the rule in v2.
         assert "sma200_rising" not in REJECTION_LABELS
+
+
+class TestLegacyCliGuard:
+    def test_direct_v2_scan_requires_explicit_historical_opt_in(self, monkeypatch):
+        monkeypatch.setattr("sys.argv", ["sma_watchlist_scan.py"])
+        monkeypatch.setattr(
+            "scripts.sma_watchlist_scan.configure_logging", lambda _verbose: None
+        )
+
+        with pytest.raises(SystemExit, match="sma_watchlist_v2 is retired"):
+            main()
 
 
 # ── Company-name normalization (share-class dedup key) ───────────────────────

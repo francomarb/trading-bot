@@ -118,7 +118,7 @@ def main() -> int:
         # (label, watchlist_kind, strategy_factory, watchlist)
         (
             "SMA Crossover (20/50)",
-            "SMA_WATCHLIST (static, periodically rotated by scripts/sma_watchlist_scan.py)",
+            "Historical SMA_WATCHLIST snapshot (v3 refresh is separate)",
             lambda: SMACrossover(fast=20, slow=50, edge_filter=SMAEdgeFilter()),
             settings.SMA_WATCHLIST,
         ),

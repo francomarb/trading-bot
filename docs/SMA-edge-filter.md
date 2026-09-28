@@ -58,7 +58,7 @@ This is computed from the same historical bars already fetched for the symbol �
 **Why:**
 A crossover on contracting volume is a weak signal. If institutions are not participating — volume is shrinking relative to the recent baseline — the move is likely noise rather than the start of a sustained trend. Expanding volume (10-day median exceeding 30-day median) confirms that demand is growing, not fading, at the point of the crossover. We use the median rather than the mean to prevent a single massive volume spike (e.g. an old earnings event 25 days ago) from artificially inflating the 30-day baseline and causing false lockouts.
 
-**Fail-open:** if the `volume` column is absent or there are fewer than 30 bars of history (NaN rolling averages), the gate returns `True`. Volume data absence does not silently block trades.
+**Fail-open:** if the `volume` column is absent or there are fewer than 30 bars of history (NaN rolling medians), the gate returns `True`. Volume data absence does not silently block trades.
 
 ---
 
@@ -159,7 +159,7 @@ distinct scope. `SMAEdgeFilter` is the third and innermost.
 
 | Layer | Cadence | Owner | Scope | Blocks when |
 |---|---|---|---|---|
-| Selection | Slow (offline refresh) | `scripts/sma_watchlist_scan.py` rules (see [sma-watchlist-selection.md](sma-watchlist-selection.md)) | Whole candidate universe | Name fails liquidity, trend alignment, RS percentile, ADX, ATR band, ETF/biotech industry, share-class dup |
+| Selection | Slow (offline refresh) | `scripts/sma_durable_watchlist_scan.py` v3 rules (see [sma-watchlist-selection.md](sma-watchlist-selection.md)) | Whole candidate universe | Name fails tradability, history, price, SIP dollar liquidity, size, affirmative solvency, required-data, or share-class gates |
 | Regime | Per-cycle | `RegimeDetector` | Entire strategy slot | BEAR (SPY < 200 SMA) or VOLATILE (high ATR%) |
 | Entry edge | Per-bar | `SMAEdgeFilter` | Individual symbol | Stock below 200 SMA, volume contracting, pre-earnings window |
 
@@ -168,19 +168,14 @@ during BEAR/VOLATILE and the edge filter is never called. The selection
 layer runs offline and updates the static watchlist; once a name is in,
 the edge filter judges every fresh bar.
 
-**v2 selection rules** — the watchlist scanner retired its "SMA200 rising
-over 20 trading days" sub-rule. The long-term-direction concern is owned
-by the BEAR regime gate plus the in-§3 close-above-SMA200 + alignment
-requirement; the rising-SMA200 clause was producing systematic lateness
-at bear-to-bull transitions. The edge filter's own `stock > SMA200`
-Gate 1 is unchanged — that's per-bar protection against intraperiod
-trend breaks, not a duplicate of the selection-time alignment check.
-
-v2 also added eager exclusion of ETFs (by name and yfinance `quoteType`)
-and binary-catalyst industries (Biotechnology, Drug Manufacturers —
-Specialty & Generic, Diagnostics & Research) and share-class
-deduplication (e.g. GOOG vs GOOGL). These are selection-layer concerns;
-the edge filter is unaffected.
+**v3 selection rules** — watchlist membership is intentionally durable. It
+uses price, SIP dollar liquidity, company size, affirmative solvency, stock-like
+security type, sufficient history, and preferred share class. Current trend
+alignment, relative strength, ADX, ATR, FCF/revenue, biotech labels, and sector
+are diagnostics rather than membership gates. The edge filter's own
+`stock > SMA200` rule is unchanged because it is a per-bar trade-timing gate,
+not a quarterly company-selection rule. The retired v2 scanner requires an
+explicit historical CLI opt-in.
 
 ---
 

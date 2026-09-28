@@ -476,39 +476,30 @@ for _strat, _steps in MLEG_ENTRY_WALK_PROFILE_OVERRIDES_BY_STRATEGY.items():
     )
 
 # Strategy-specific watchlists
-# SMA Crossover — trend-following; static list promoted from:
-#   /Users/franco/trading-bot/scripts/sma_watchlist_scan.py --top 30 --feed sip
-#   rule=sma_watchlist_v2, feed=sip, end_delay=60m
-#   generated 2026-05-11; report: logs/sma_scan_top30.md
-#
-# Scanner-derived top 30 by composite score (the first 30 entries below).
-# Manual additions can also come from a quick external 20/50 SMA crossover
-# screen, then verified against local Alpaca daily bars and existing bot
-# watchlists before inclusion. Example: DUOL was added 2026-06-04 from
-# stock-screener.org/20-50-day-moving-average-crossover after this filter.
-# NVDA is the lone non-scanner exception, retained as a protected open SMA
-# position (RS%=40.5 at scan time — clearly weak; let the strategy exit it
-# on its own signal, then remove from this list on next refresh).
+# SMA Crossover — 100-name durable-liquidity opportunity pool promoted
+# 2026-09-28 from the completed-session delayed-SIP v3 report.
+# Membership uses durable price, dollar liquidity, company size, affirmative
+# solvency, and preferred share class only. Current technical state, FCF,
+# revenue growth, ATR, and sector are diagnostics rather than membership gates.
+# The strategy and runtime filters decide whether a member is tradable now.
+# Symbols after the ranked 100 are temporary lifecycle-preservation members.
+# See docs/sma-watchlist-selection.md.
+SMA_WATCHLIST_RULE_VERSION = "sma_watchlist_v3_durable_liquid_pool"
+SMA_TARGET_POOL_SIZE = 100
 SMA_WATCHLIST = [
-    "SNDK", "WDC", "STX", "GSAT", "POWL", "VIAV", "VSAT", "CIEN", "ASML", "MSTR",
-    "MU", "FORM", "ALB", "CSTM", "DOCN", "TTMI", "FRO", "MTZ",
-    "DK", "ASX", "CAT", "HUT", "GLW", "AMD", "STRL", "INTC",
-    "BE", "ECG", "MRVL", "NVT", "SQM", "TSEM", "PL", "UBER", "DASH",
-    "NVDA", "ADBE", "ANET", "META", "PLTR", "DUOL",
-    # Scanned additions passing fundamentals check (2026-06-08)
-    # MANUAL OVERRIDE: Added mid-paper-run to capitalize on the active AI/Semiconductor uptrend,
-    # temporarily bypassing the 3-per-sector cap and mid-run freeze per operator direction.
-    "TSM", "DELL", "LSCC", "LRCX", "NOK", "FLEX", "SANM", "ATI", "COHU", "AA",
-    # Operator-directed additions (2026-09-08).
-    "CRWD", "NET", "PWR", "VIST", "VST",
+    "MU", "NVDA", "SNDK", "AAPL", "TSLA", "MSFT", "AMD", "META", "INTC", "AMZN",
+    "AVGO", "GOOG", "PLTR", "MRVL", "TSM", "NBIS", "ORCL", "DELL", "STX", "BE",
+    "AMAT", "WDC", "CRM", "LLY", "LRCX", "MRNA", "NFLX", "WMT", "CRWV", "JPM",
+    "V", "ASML", "NOW", "GEV", "XOM", "CAT", "PANW", "BRK.B", "CSCO", "HOOD",
+    "CRWD", "QCOM", "APP", "GS", "BAC", "COHR", "KLAC", "UNH", "COST", "TXN",
+    "JNJ", "IREN", "CVX", "SMCI", "COIN", "GLW", "MA", "SNOW", "IBM", "VRT",
+    "MRK", "KO", "SHOP", "ADI", "UBER", "CRDO", "GE", "HD", "ADBE", "RKLB",
+    "BA", "MCD", "C", "ALAB", "TMO", "BKNG", "INTU", "PG", "ABBV", "ANET",
+    "T", "WFC", "CRCL", "AMGN", "ISRG", "HPE", "AAOI", "VLO", "TER", "PEP",
+    "NU", "NKE", "NET", "DDOG", "VZ", "TJX", "MS", "RDDT", "AAL", "ACN",
+    # Temporary lifecycle-preservation members from the pre-refresh universe.
+    "DOCN",
 ]
-# Cull deferred 2026-06-06 — an earlier audit (scripts/sma_giveback_audit.py)
-# flagged VIAV, VSAT, CIEN, ALB, INTC as chronic underperformers and removed
-# them. Reviewer correctly pointed out the audit used unit-share, unfiltered,
-# in-sample P&L; production uses ATR-risk sizing plus regime + SPY + SMA edge
-# + sector + earnings filters. The cull was reverted pending a filter-aware,
-# walk-forward, OOS-validated re-audit. See sma_crossover_optimizations.md
-# for the gating conditions before any cull is re-promoted.
 # RSI Reversion — 50-name durable-company opportunity pool promoted from the
 # 2026-09-09 v3 SIP scan, corrected 2026-09-20 for the previously unresolved
 # BRK.B provider symbol. Selection uses price, dollar liquidity, company size,
