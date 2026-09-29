@@ -20,13 +20,13 @@
 
 ## Nested Pool Comparison
 
-| Pool | Breakouts (252d) | Active days | Peak same-day | Days >8 | Zero-breakout names | Median ATR % | Cap-clipped |
+| Pool | Breakouts (252d) | Active days | Peak same-day | Days above hard 8-position count | Zero-breakout names | Median ATR % | Cap-clipped |
 |---:|---:|---:|---:|---:|---:|---:|---:|
 | 50 | 479 | 87 | 18 | 17 | 1 | 3.98% | 26 |
 | 100 | 896 | 89 | 27 | 42 | 6 | 3.79% | 56 |
 | 200 | 1727 | 90 | 41 | 79 | 11 | 3.23% | 136 |
 
-The breakout counts characterize opportunity coverage among companies selected today. They are not a point-in-time backtest and do not decide membership.
+The breakout counts characterize opportunity coverage among companies selected today. They are not a point-in-time backtest and do not decide membership. The hard-position column is an upper-bound count diagnostic, not sleeve-dollar capacity; `SLEEVE_FULL` can bind first.
 
 ## Ranked Candidates
 

@@ -250,7 +250,7 @@ Three signals combine to produce the verdict, **all computed on R-expectancy (no
 - Stale-data incidents (last bar age above threshold per symbol)
 - Reconciliation mismatches (engine state vs broker position)
 - Missing stop repairs (positions without GTC stop after grace window)
-- Ownership conflicts (`SYMBOL_CONFLICT` + `CONTRACT_CONFLICT` events — already alerted at 11.7A and 11.44; surfaced as `symbol_conflicts_24h` / `contract_conflicts_24h` engine-state counters, with `symbol_conflicts_by_pair_24h` identifying the blocked and owning equity strategies for forward-watch attribution)
+- Ownership conflicts (`SYMBOL_CONFLICT` + `CONTRACT_CONFLICT` events — already alerted at 11.7A and 11.44). Equity symbol conflicts are expected shared-pool allocation outcomes: `symbol_conflicts_by_pair_24h` attributes them to the blocked and owning strategy and Health surfaces the blocked strategy's count as informational only. Exact-OCC `contract_conflicts_24h` remain L1 operational faults because an unblocked collision would corrupt broker ownership.
 - External close detections (positions closed outside the engine)
 - Strategy halted / cooldown state (current state, time-in-state)
 - Alert frequency by severity in window (a baseline-aware spike is itself a signal)

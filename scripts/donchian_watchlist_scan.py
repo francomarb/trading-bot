@@ -499,7 +499,7 @@ def render_report(
         "## Nested Pool Comparison",
         "",
         "| Pool | Breakouts (252d) | Active days | "
-        f"Peak same-day | Days >{capacity} | Zero-breakout names | Median ATR % | "
+        f"Peak same-day | Days above hard {capacity}-position count | Zero-breakout names | Median ATR % | "
         "Cap-clipped |",
         "|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
@@ -531,7 +531,8 @@ def render_report(
             "",
             "The breakout counts characterize opportunity coverage among companies "
             "selected today. They are not a point-in-time backtest and do not "
-            "decide membership.",
+            "decide membership. The hard-position column is an upper-bound count "
+            "diagnostic, not sleeve-dollar capacity; `SLEEVE_FULL` can bind first.",
             "",
             "## Ranked Candidates",
             "",

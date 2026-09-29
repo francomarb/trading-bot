@@ -218,36 +218,78 @@ def _l1_checks(
     out.append(_not_yet_wired("stream_disconnects_per_day", Layer.L1))
     out.append(_not_yet_wired("cycle_latency_p95_ms", Layer.L1))
 
-    # ── Ownership conflicts (already alerted, count in engine state) ──
-    # Two parallel buckets (PLAN 11.44):
-    #   * symbol_conflicts_24h   — equity-level slot overlap rejections
-    #     (e.g. two equity strategies both want AAPL).
-    #   * contract_conflicts_24h — leg-level exact-OCC rejections across
-    #     single-leg and MLEG option strategies. Distinct from symbol
-    #     conflicts because the remediation differs (picker tuning vs
-    #     slot config) and an unblocked contract conflict would corrupt
-    #     ownership at the broker (positions aggregate by exact symbol).
-    for field, label in (
-        ("symbol_conflicts_24h", "symbol-conflict"),
-        ("contract_conflicts_24h", "contract-conflict"),
-    ):
-        value = engine_state.get(field)
-        if value is None:
-            continue
+    # ── Equity ownership allocation (informational) ─────────────
+    # Shared equity universes make SYMBOL_CONFLICT a normal admission outcome,
+    # not an operational fault. Attribute only rows where this strategy was
+    # blocked and surface them without moving Health. The aggregate fallback is
+    # retained for old snapshots but is explicitly not fault-graded because it
+    # cannot be assigned to any one strategy.
+    pair_rows = engine_state.get("symbol_conflicts_by_pair_24h")
+    aggregate_symbol_conflicts = engine_state.get("symbol_conflicts_24h")
+    if pair_rows is not None or aggregate_symbol_conflicts is not None:
+        owner_counts: dict[str, int] = {}
+        if isinstance(pair_rows, list):
+            for row in pair_rows:
+                if not isinstance(row, dict):
+                    continue
+                if row.get("blocked_strategy") != strategy_name:
+                    continue
+                owner = row.get("owner_strategy")
+                try:
+                    count = max(int(row.get("count", 0)), 0)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(owner, str) and owner and count:
+                    owner_counts[owner] = owner_counts.get(owner, 0) + count
+            value = float(sum(owner_counts.values()))
+            detail = (
+                ", ".join(
+                    f"{owner}={count}"
+                    for owner, count in sorted(owner_counts.items())
+                )
+                or "none"
+            )
+            finding = (
+                f"{int(value)} expected equity allocation block(s) in last "
+                f"24h for {strategy_name}; owners: {detail}"
+            )
+        else:
+            try:
+                value = float(aggregate_symbol_conflicts or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            finding = (
+                f"{int(value)} global equity allocation block(s) in last 24h; "
+                "per-strategy attribution unavailable in legacy snapshot"
+            )
+        out.append(CheckResult(
+            name="symbol_conflicts_24h",
+            layer=Layer.L1,
+            status=HealthStatus.HEALTHY,
+            numeric_value=value,
+            findings=[finding],
+            informational=True,
+        ))
+
+    # Exact-contract collisions remain operational faults: unlike equity
+    # universe arbitration, two options strategies selecting one OCC would
+    # corrupt broker ownership if the guard did not block it.
+    value = engine_state.get("contract_conflicts_24h")
+    if value is not None:
         try:
             thresh = get_thresholds(strategy_name, "reconciliation_mismatches_24h")
             status = _classify(float(value), thresh, layer=Layer.L1)
             out.append(CheckResult(
-                name=field,
+                name="contract_conflicts_24h",
                 layer=Layer.L1,
                 status=status,
                 numeric_value=float(value),
                 findings=[
-                    f"{int(value)} {label} event(s) in last 24h"
+                    f"{int(value)} contract-conflict event(s) in last 24h"
                 ],
             ))
         except KeyError:
-            out.append(_healthy(field, Layer.L1))
+            out.append(_healthy("contract_conflicts_24h", Layer.L1))
 
     return out
 

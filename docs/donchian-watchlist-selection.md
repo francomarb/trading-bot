@@ -104,7 +104,7 @@ The corrected 2026-09-20 delayed-SIP snapshot compared nested liquidity pools.
 The raw breakout counts use companies selected today, so they characterize
 opportunity coverage and contention; they are not a survivorship-free backtest.
 
-| Pool | Breakouts over trailing 252 sessions | Active breakout days | Peak same-day signals | Days above 8-position capacity | Median ATR% | Conservatively cap-clipped |
+| Pool | Breakouts over trailing 252 sessions | Active breakout days | Peak same-day signals | Days above hard 8-position count | Median ATR% | Conservatively cap-clipped |
 |---:|---:|---:|---:|---:|---:|---:|
 | 50 | 479 | 87 | 18 | 17 | 3.98% | 26 |
 | **100** | **890** | **89** | **26** | **42** | **3.79%** | **56** |
@@ -117,7 +117,9 @@ normally completes a warmed market-hours cycle in roughly 13-23 seconds against
 a five-minute cadence. The 100-name pool raises that count to approximately
 215. Two hundred would raise it to approximately 315, make cold-cache cycles
 materially heavier, and almost double the days on which raw signals exceeded
-the sleeve's eight-position capacity.
+the hard eight-position count. That count is only an upper bound: sleeve
+dollars can produce `SLEEVE_FULL` first, so forward refusals—not the table's
+count ceiling—measure actual candidate starvation.
 
 The 100-name choice is a first paper cohort, not a permanent optimum. Raw
 contention is deliberately reported because the engine does not yet use an
