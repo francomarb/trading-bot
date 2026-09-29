@@ -443,16 +443,10 @@ class AlpacaBroker:
 
     # ── Lifecycle helpers (Operator Controls Phase A) ───────────────────
     #
-    # Every call site is wrapped in try/except → logger.warning so a DB
-    # I/O failure can NEVER abort an order. This is the same discipline
-    # used by `strategies.health.lifecycle` for the signal-lifecycle
-    # counter table. Phase A is purely additive — when
-    # `self._lifecycle_store is None`, these helpers are no-ops and the
-    # broker's behavior is byte-for-byte identical to pre-Phase-A.
-    #
-    # One exception: an async single-leg option entry in `place_order` is
-    # refused when `_lifecycle_begin` returns None. There the uid is not
-    # additive — it is the engine's identity for the position.
+    # Lifecycle creation is optional only for legacy callers that do not wire
+    # a store. Once a store is configured, every entry path fails closed when
+    # `_lifecycle_begin` returns None: submitting without the uid would bypass
+    # restart ownership, operator controls, and cohort accounting.
 
     def _lifecycle_begin(
         self,
@@ -504,6 +498,28 @@ class AlpacaBroker:
                 f"({decision.strategy_name}): {exc}"
             )
             return None
+
+    def _reject_missing_lifecycle_identity(
+        self,
+        decision: "RiskDecision",
+    ) -> OrderResult:
+        """Build the fail-closed result for a configured lifecycle failure."""
+        logger.error(
+            f"{decision.symbol} ({decision.strategy_name}): equity entry "
+            "refused before submission — no durable lifecycle identity "
+            "(create_pending failed)"
+        )
+        return OrderResult(
+            status=OrderStatus.REJECTED,
+            order_id=None,
+            symbol=decision.symbol,
+            requested_qty=decision.qty,
+            filled_qty=0,
+            avg_fill_price=None,
+            raw_status=None,
+            message="entry refused — durable lifecycle identity unavailable",
+            position_uid=None,
+        )
 
     def _lifecycle_mark_filled(
         self,
@@ -1841,6 +1857,8 @@ class AlpacaBroker:
             decision=decision,
             client_order_id=client_order_id,
         )
+        if self._lifecycle_store is not None and position_uid is None:
+            return self._reject_missing_lifecycle_identity(decision)
         # Foundation commit 6 — same dry-run discipline for the per-order
         # substrate: only insert AFTER the dry-run guard. order_class on
         # every equity entry branch above is OTO (stop_loss is always
@@ -2127,6 +2145,8 @@ class AlpacaBroker:
             decision=decision,
             client_order_id=client_order_id,
         )
+        if self._lifecycle_store is not None and position_uid is None:
+            return self._reject_missing_lifecycle_identity(decision)
         # Foundation commit 6 — fractional entries are 'simple' market
         # orders (no order_class / no attached stop_loss); the GTC stop
         # is submitted standalone after the fill below. Reflect that

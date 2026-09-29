@@ -578,6 +578,11 @@ class TestEngineRegimeGate:
             alerts=MagicMock(spec=AlertDispatcher),
             regime_detector=fake_regime,
         )
+        # This fixture exercises regime admission only.  The mocked
+        # TradeLogger returns a MagicMock from _ensure_db(), which is not a
+        # lifecycle database and must not manufacture durable ownership
+        # claims for otherwise valid entries.
+        engine.lifecycle_store = None
         engine._sleep = lambda _seconds: None
 
         return engine, fake_broker

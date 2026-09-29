@@ -490,6 +490,30 @@ class TestReads:
         assert row is not None
         assert row.position_uid == uid_first
 
+    def test_ownership_claim_lookup_includes_error_lock(self, store):
+        uid = new_position_uid()
+        store.create_pending(
+            position_uid=uid,
+            symbol="NVDA",
+            owner_key="NVDA",
+            strategy="donchian_breakout",
+            position_type="single_leg",
+            entry_qty=5.0,
+        )
+        store._conn.execute(
+            "UPDATE position_lifecycle SET status = 'error' "
+            "WHERE position_uid = ?",
+            (uid,),
+        )
+        store._conn.commit()
+
+        claim = store.get_ownership_claim_for_owner_key("NVDA")
+
+        assert claim is not None
+        assert claim.position_uid == uid
+        assert claim.status == "error"
+        assert store.get_open_for_owner_key("NVDA") is None
+
     def test_distinct_option_contracts_share_underlying_but_not_owner_key(
         self, store
     ):

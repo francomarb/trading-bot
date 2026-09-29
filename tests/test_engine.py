@@ -6889,6 +6889,46 @@ class TestSharedSymbolConflict:
         broker.place_order.assert_not_called()
         broker.close_position.assert_not_called()
 
+    def test_entry_blocked_by_other_strategy_pending_lifecycle_claim(
+        self,
+        engine_factory,
+    ):
+        """A resting entry owns the ticker before in-memory registration."""
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        engine.lifecycle_store.create_pending(
+            position_uid="pos_pending_other_strategy",
+            symbol="AAPL",
+            owner_key="AAPL",
+            strategy="donchian_breakout",
+            position_type="single_leg",
+            entry_qty=10.0,
+        )
+        assert engine._get_owner("AAPL") is None
+        engine.alerts = MagicMock()
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+
+        result = self._process(engine, "AAPL", snap)
+
+        assert result is None
+        broker.place_order.assert_not_called()
+        assert engine.alerts.order_rejection.call_args.args[3] == "SYMBOL_CONFLICT"
+
+    def test_lifecycle_claim_lookup_failure_blocks_entry(self, engine_factory):
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        engine.lifecycle_store.get_ownership_claim_for_owner_key = MagicMock(
+            side_effect=RuntimeError("database unavailable")
+        )
+        engine.alerts = MagicMock()
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+
+        result = self._process(engine, "AAPL", snap)
+
+        assert result is None
+        broker.place_order.assert_not_called()
+        assert engine.alerts.order_rejection.call_args.args[3] == "SYMBOL_CONFLICT"
+
     def test_same_strategy_re_entry_not_blocked_by_conflict_check(self, engine_factory):
         """Self-ownership must not trip the cross-strategy conflict rule.
         (Risk DUPLICATE_POSITION handles same-strategy double entries separately.)"""

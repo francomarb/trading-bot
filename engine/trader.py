@@ -2849,6 +2849,45 @@ class TradingEngine:
         is_single_leg_option_strategy = hasattr(strategy, "build_option_execution")
         if not is_mleg_strategy and not is_single_leg_option_strategy:
             existing_owner = self._get_owner(symbol)
+            # A resting equity entry owns the broker aggregation key before it
+            # becomes an in-memory Position. Consult the durable claim so a
+            # later-priority strategy cannot submit into the same ticker while
+            # the first strategy's order is still pending at the broker.
+            if existing_owner is None and self.lifecycle_store is not None:
+                try:
+                    lifecycle_claim = (
+                        self.lifecycle_store.get_ownership_claim_for_owner_key(
+                            symbol
+                        )
+                    )
+                except Exception as exc:
+                    logger.error(
+                        f"[{strategy.name}] {symbol}: entry blocked — durable "
+                        f"ownership lookup failed: {exc}"
+                    )
+                    self.alerts.order_rejection(
+                        symbol,
+                        strategy.name,
+                        "durable ownership lookup failed",
+                        "SYMBOL_CONFLICT",
+                    )
+                    self._symbol_conflicts.append(datetime.now(timezone.utc))
+                    if strategy_statuses is not None:
+                        strategy_statuses[symbol] = "Symbol Conflict"
+                    if strategy_reasons is not None:
+                        strategy_reasons[symbol] = [
+                            "durable ownership unavailable"
+                        ]
+                    self._mark_signal_bar_processed(
+                        signal_key,
+                        signal_bar,
+                        strategy_statuses,
+                        strategy_reasons,
+                        symbol,
+                    )
+                    return None
+                if lifecycle_claim is not None:
+                    existing_owner = lifecycle_claim.strategy
             if existing_owner is not None and existing_owner != strategy.name:
                 logger.info(
                     f"[{strategy.name}] {symbol}: entry blocked — "
