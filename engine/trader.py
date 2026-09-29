@@ -556,6 +556,7 @@ class TradingEngine:
         # store wired (e.g. tests injecting one), don't overwrite.
         # Sharing the TradeLogger's connection keeps all schema in one
         # DB and ensures _ensure_db() has run before the store is used.
+        self._lifecycle_store_init_error: str | None = None
         try:
             from engine.lifecycle import PositionLifecycleStore
             self.lifecycle_store = PositionLifecycleStore(
@@ -567,8 +568,12 @@ class TradingEngine:
             ):
                 self.broker._lifecycle_store = self.lifecycle_store
         except Exception as exc:
-            logger.warning(f"lifecycle store init skipped: {exc}")
+            logger.error(
+                "lifecycle store init failed; new equity entries will remain "
+                f"blocked while exits stay available: {exc}"
+            )
             self.lifecycle_store = None
+            self._lifecycle_store_init_error = f"{type(exc).__name__}: {exc}"
         # Strategy graduation phase 2 — latest daily cohort mark. This shares
         # the trade-log connection so ledger P&L, lifecycle identity, and the
         # broker snapshot are committed into one local evidence store.
@@ -2849,6 +2854,69 @@ class TradingEngine:
         is_single_leg_option_strategy = hasattr(strategy, "build_option_execution")
         if not is_mleg_strategy and not is_single_leg_option_strategy:
             existing_owner = self._get_owner(symbol)
+            if self._lifecycle_store_init_error is not None:
+                reason = (
+                    "durable lifecycle store unavailable: "
+                    f"{self._lifecycle_store_init_error}"
+                )
+                logger.error(f"[{strategy.name}] {symbol}: entry blocked — {reason}")
+                self.alerts.order_rejection(
+                    symbol,
+                    strategy.name,
+                    reason,
+                    "LIFECYCLE_UNAVAILABLE",
+                )
+                if strategy_statuses is not None:
+                    strategy_statuses[symbol] = "Entry Blocked"
+                if strategy_reasons is not None:
+                    strategy_reasons[symbol] = [reason]
+                self._mark_signal_bar_processed(
+                    signal_key,
+                    signal_bar,
+                    strategy_statuses,
+                    strategy_reasons,
+                    symbol,
+                )
+                return None
+            # A resting equity entry owns the broker aggregation key before it
+            # becomes an in-memory Position. Consult the durable claim so a
+            # later-priority strategy cannot submit into the same ticker while
+            # the first strategy's order is still pending at the broker.
+            if existing_owner is None and self.lifecycle_store is not None:
+                try:
+                    lifecycle_claim = (
+                        self.lifecycle_store.get_ownership_claim_for_owner_key(
+                            symbol
+                        )
+                    )
+                except Exception as exc:
+                    logger.error(
+                        f"[{strategy.name}] {symbol}: entry blocked — durable "
+                        f"ownership lookup failed: {exc}"
+                    )
+                    self.alerts.order_rejection(
+                        symbol,
+                        strategy.name,
+                        "durable ownership lookup failed",
+                        "SYMBOL_CONFLICT",
+                    )
+                    self._symbol_conflicts.append(datetime.now(timezone.utc))
+                    if strategy_statuses is not None:
+                        strategy_statuses[symbol] = "Symbol Conflict"
+                    if strategy_reasons is not None:
+                        strategy_reasons[symbol] = [
+                            "durable ownership unavailable"
+                        ]
+                    self._mark_signal_bar_processed(
+                        signal_key,
+                        signal_bar,
+                        strategy_statuses,
+                        strategy_reasons,
+                        symbol,
+                    )
+                    return None
+                if lifecycle_claim is not None:
+                    existing_owner = lifecycle_claim.strategy
             if existing_owner is not None and existing_owner != strategy.name:
                 logger.info(
                     f"[{strategy.name}] {symbol}: entry blocked — "
@@ -3429,6 +3497,35 @@ class TradingEngine:
                     avg_entry_price=fill_price,
                     market_value=fill_qty * fill_price,
                 )
+            if result.status is OrderStatus.REJECTED:
+                reason = result.message or "broker rejected entry"
+                self._update_candidate_observation(
+                    candidate_uid,
+                    selected=True,
+                    disposition="submit_rejected",
+                    disposition_reason=reason,
+                )
+                logger.warning(
+                    f"[{strategy.name}] {symbol}: entry rejected — {reason}"
+                )
+                self.alerts.order_rejection(
+                    symbol,
+                    strategy.name,
+                    reason,
+                    "BROKER_REJECTED",
+                )
+                if strategy_statuses is not None:
+                    strategy_statuses[symbol] = "Order Rejected"
+                if strategy_reasons is not None:
+                    strategy_reasons[symbol] = [reason]
+                self._mark_signal_bar_processed(
+                    signal_key,
+                    signal_bar,
+                    strategy_statuses,
+                    strategy_reasons,
+                    symbol,
+                )
+                return None
             if strategy_statuses is not None:
                 strategy_statuses[symbol] = "Pending Entry"
             if strategy_reasons is not None:

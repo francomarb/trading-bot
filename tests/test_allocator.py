@@ -917,7 +917,7 @@ class TestEngineAllocatorIntegration:
             index=idx,
         )
 
-    def test_engine_blocks_new_entry_when_available_capital_exhausted(self):
+    def test_engine_blocks_new_entry_when_available_capital_exhausted(self, tmp_path):
         from engine.trader import EngineConfig, TradingEngine
         from reporting.alerts import AlertDispatcher
         from reporting.logger import TradeLogger
@@ -953,6 +953,8 @@ class TestEngineAllocatorIntegration:
         broker._with_retry.side_effect = lambda fn, **_: fn()
         broker._api.get_clock.return_value = SimpleNamespace(is_open=True)
 
+        trade_logger = TradeLogger(path=str(tmp_path / "trades.db"))
+        alerts = MagicMock(spec=AlertDispatcher)
         engine = TradingEngine(
             slots=[slot],
             risk=RiskManager(
@@ -971,9 +973,9 @@ class TestEngineAllocatorIntegration:
                 max_bar_age_multiplier=10,
                 market_hours_only=False,
             ),
-            trade_logger=MagicMock(spec=TradeLogger),
+            trade_logger=trade_logger,
             pnl_tracker=MagicMock(spec=PnLTracker),
-            alerts=MagicMock(spec=AlertDispatcher),
+            alerts=alerts,
             allocator=_allocator(),
         )
         engine._register_single_leg(strategy_name="sma_crossover", symbol="MSFT")
@@ -985,3 +987,6 @@ class TestEngineAllocatorIntegration:
             engine.start(max_cycles=1)
 
         broker.place_order.assert_not_called()
+        alerts.order_rejection.assert_called_once()
+        assert alerts.order_rejection.call_args.args[3] == "sleeve_full"
+        trade_logger.close()

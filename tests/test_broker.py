@@ -3484,6 +3484,59 @@ class TestOptionsDurableIdentity:
         assert broker.drain_option_fills() == []
 
 
+# ── Equity lifecycle identity fail-close ───────────────────────────────────
+
+
+class TestEquityDurableIdentity:
+    """A configured lifecycle store must authorize an equity submit."""
+
+    @staticmethod
+    def _broker_with_conflicting_claim(tmp_path, api):
+        trade_logger = TradeLogger(path=str(tmp_path / "trades.db"))
+        lifecycle_store = PositionLifecycleStore(trade_logger._ensure_db())
+        lifecycle_store.create_pending(
+            position_uid="pos_donchian_pending",
+            symbol="AAPL",
+            owner_key="AAPL",
+            strategy="donchian_breakout",
+            position_type="single_leg",
+            entry_qty=10.0,
+        )
+        broker = AlpacaBroker(
+            client=api,
+            max_attempts=1,
+            base_delay=0.0,
+            lifecycle_store=lifecycle_store,
+        )
+        return broker, trade_logger, lifecycle_store
+
+    @pytest.mark.parametrize("qty", [10.0, 10.5])
+    def test_owner_key_conflict_refuses_equity_before_submit(
+        self,
+        tmp_path,
+        qty,
+    ):
+        api = MagicMock()
+        broker, trade_logger, lifecycle_store = self._broker_with_conflicting_claim(
+            tmp_path, api
+        )
+        try:
+            result = broker.place_order(
+                _decision(qty=qty, strategy="sma_crossover"),
+                poll_timeout=0.0,
+            )
+
+            assert result.status is OrderStatus.REJECTED
+            assert result.position_uid is None
+            assert "durable lifecycle identity unavailable" in result.message
+            api.submit_order.assert_not_called()
+            claim = lifecycle_store.get_ownership_claim_for_owner_key("AAPL")
+            assert claim is not None
+            assert claim.strategy == "donchian_breakout"
+        finally:
+            trade_logger.close()
+
+
 # ── PR #60 round 2 fixes ────────────────────────────────────────────────────
 
 
