@@ -592,7 +592,15 @@ Options orders are detected by matching the OCC symbol format (`^[A-Z]{1,6}[0-9]
 
 **Cross-strategy conflict rule.** The guard follows the instrument Alpaca aggregates:
 
-  * **Equities** use ticker identity and retain the ticker-level `SYMBOL_CONFLICT` guard.
+  * **Equities** use ticker identity. The ticker-level `SYMBOL_CONFLICT` guard
+    checks both registered in-memory ownership and the durable lifecycle claim,
+    so a resting entry from one strategy blocks a later strategy before the
+    first fill creates an in-memory Position. As defense in depth, a configured
+    lifecycle store must successfully create the equity position UID before the
+    broker may submit either a whole-share or fractional entry. If the engine
+    cannot initialize that store, it stays available to manage exits but blocks
+    all new equity entries with a `LIFECYCLE_UNAVAILABLE` alert. A broker-level
+    refusal is surfaced as `Order Rejected`, never as a pending entry.
   * **Single-leg options** use lifecycle UID identity. Different OCC contracts on one underlying may coexist, including across strategies. One strategy is initially limited to one active single-leg position per underlying.
   * **MLEG (spread) strategies** key their Positions by UUID `position_id` (`new_spread_id()`), so they never occupy the underlying slot — `_get_owner('SPY')` returns `None` for an MLEG owner of SPY by construction. MLEG strategies skip the underlying-level check entirely; the operative safety net for them is the contract-level guard at dispatch.
   * **Contract-level guard.** `_reject_if_contract_conflict` runs leg-level checks against every tracked position via `_contract_owner` immediately after the option picker resolves the OCC (single-leg path) or `build_spread_execution` returns the plan (MLEG path). It fires the distinct `CONTRACT_CONFLICT` alert code on collision and is direction-agnostic — long-vs-short on the same OCC nets at the broker and would corrupt ownership tracking just as badly. This is the rule that prevents two strategies from dispatching against the *same exact OCC* regardless of who got there first.

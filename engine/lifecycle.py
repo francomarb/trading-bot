@@ -829,6 +829,28 @@ class PositionLifecycleStore:
         ).fetchall()
         return [self._row_with_legs(r) for r in rows]
 
+    def get_ownership_claim_for_owner_key(
+        self,
+        owner_key: str,
+    ) -> PositionLifecycleRow | None:
+        """Return the durable row that currently owns ``owner_key``.
+
+        Unlike :meth:`get_open_for_owner_key`, this includes ``error`` rows.
+        An errored lifecycle retains the database uniqueness lock until an
+        operator resolves it, so entry-conflict checks must treat it as an
+        active ownership claim too.
+        """
+        rows = self._conn.execute(
+            _SELECT_LIFECYCLE_COLUMNS
+            + " WHERE owner_key = ? AND status IN "
+            "('pending', 'open', 'partially_filled', 'error') "
+            "ORDER BY created_at DESC LIMIT 1",
+            (owner_key,),
+        ).fetchall()
+        if not rows:
+            return None
+        return self._row_with_legs(rows[0])
+
     def get_open_for_owner_key(self, owner_key: str) -> PositionLifecycleRow | None:
         """The single open lifecycle row for an owner_key, or None.
 
