@@ -6,6 +6,12 @@
 
 **Status:** Implementation and narrow universe corrections approved on the PR branch
 
+> Historical scope note: this document records the `11.72` contract as it
+> existed on 2026-09-20. The approved SMA `11.75` methodology later superseded
+> SMA's strict FCF/revenue and 18-month-runway policy. Current SMA authority is
+> `docs/sma-watchlist-selection.md`; RSI/Donchian conclusions here remain
+> historical input to their own promoted selectors.
+
 ## Decision Summary
 
 Implement one focused correctness PR for the shared fundamentals boundary, but
@@ -261,10 +267,12 @@ approval.
 - Missing/NaN/non-finite approved rows remain unknown.
 - Profitable, sufficient-runway, insufficient-runway, missing-profitability,
   missing-cash, and fetch-error cases have distinct assessment reasons.
-- Missing required SMA facts produce `UNKNOWN`, never `GOOD FIT`.
+- Missing profitability/solvency data produces `UNKNOWN`, never `GOOD FIT`;
+  SMA FCF and revenue remain diagnostic under the later `11.75` contract.
 - RSI and Donchian map each tri-state outcome to the correct rejection reason
   and requested-symbol explanation.
-- SMA rejects unknown required fundamentals without consulting display text.
+- SMA rejects unknown required size/solvency fundamentals without consulting
+  display text; FCF and revenue do not control durable-pool membership.
 - Historical RSI static selection requires `solvency_ok is True`.
 - Frozen boundary fixtures demonstrate the expected ISRG and BRK.B effects
   without relying on live Yahoo or Alpaca calls in unit tests.
@@ -273,7 +281,9 @@ approval.
 ## Non-Goals
 
 - No change to the $2 billion market-cap floor.
-- No change to the 12- or 18-month runway thresholds.
+- The `11.72` implementation did not change its then-current thresholds. The
+  later approved SMA `11.75` durable-pool contract supersedes the legacy
+  18-month SMA profile with the shared 12-month affirmative-solvency floor.
 - No change to RSI/Donchian pool sizes or liquidity ordering.
 - No fuzzy accounting-row discovery.
 - No new fundamentals cache or provider migration; broader cache and retry

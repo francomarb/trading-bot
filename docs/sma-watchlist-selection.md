@@ -64,16 +64,19 @@ The strategy applies the same signal and gates to every member.
 
 The target of 100 was chosen because the promotion scan found:
 
-| Pool | Raw 20/50 crossovers | Active days | Peak same-day signals | Days above 8-position capacity |
+| Pool | Raw 20/50 crossovers | Active days | Peak same-day signals | Days above hard 8-position count |
 |---:|---:|---:|---:|---:|
 | 50 | 119 | 83 | 4 | 0 |
 | **100** | **243** | **142** | **5** | **0** |
 | 200 | 491 | 193 | 11 | 3 |
 
 These are current-universe opportunity counts, not a survivorship-free return
-backtest. One hundred roughly doubled coverage versus 50 without exceeding the
-sleeve's same-day position capacity. Two hundred introduced contention and
-additional cycle cost.
+backtest. The eight-position column is a hard count ceiling, not the actual
+sleeve-dollar ceiling; risk-sized dollars can produce `SLEEVE_FULL` around
+three to five positions. One hundred was selected because it roughly doubled
+coverage versus 50 with bounded cycle cost and disclosed clipping. Two hundred
+added another 100 evaluations and substantially more clipping. Forward
+`SLEEVE_FULL` refusals determine whether the 100-name pool starves candidates.
 
 ## Diagnostics That Do Not Control Membership
 
@@ -160,7 +163,10 @@ Every refresh must:
     market-data request volume, and errors.
 
 A promotion starts a new strategy configuration-hash evidence cohort. Do not
-pool its paper outcomes with the previous exact configuration.
+pool its paper outcomes with the previous exact configuration. Removing an
+appended lifecycle-preservation member such as `DOCN` also changes the full
+watchlist hash; record that later boundary explicitly rather than treating it
+as the same exact cohort.
 
 ## Implementation And Evidence
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
+from pathlib import Path
 
 from config import settings
 from scripts.sma_entry_quality_audit import (
@@ -18,7 +19,9 @@ from scripts.sma_entry_quality_audit import (
     _stop_fill,
     avoided_and_blocked,
     build_period_specs,
+    cache_manifest_hash,
     evaluate_decisions,
+    filter_ablation_masks,
     paired_policy_deltas,
     prepare_symbol_bars,
     selection_vs_chance,
@@ -72,6 +75,25 @@ class TestInputIntegrity:
         with pytest.raises(ValueError, match="duplicate timestamp"):
             _utc_index(frame)
 
+    def test_cache_manifest_fingerprints_content_and_missing_members(
+        self,
+        tmp_path: Path,
+    ):
+        feed_dir = tmp_path / "sip"
+        feed_dir.mkdir()
+        first = feed_dir / "AAPL_1Day_all.parquet"
+        first.write_bytes(b"first")
+
+        baseline = cache_manifest_hash(
+            ("AAPL", "MISSING"), "sip", historical_root=tmp_path
+        )
+        first.write_bytes(b"second")
+        changed = cache_manifest_hash(
+            ("AAPL", "MISSING"), "sip", historical_root=tmp_path
+        )
+
+        assert baseline != changed
+
 
 class TestValidSignalMask:
     def _inputs(self):
@@ -92,6 +114,23 @@ class TestValidSignalMask:
         regimes.loc[bars.index[3]] = "BEAR"
         result = valid_signal_mask(bars, regimes, symbol="TEST", earnings={})
         assert result.tolist() == [False, False, False, False, True]
+
+    def test_filter_ablation_variants_are_exact_gate_subsets(self):
+        bars, regimes = self._inputs()
+        bars.loc[bars.index[0], "stock_gate"] = False
+        bars.loc[bars.index[1], "volume_gate"] = False
+        regimes.loc[bars.index[2]] = "BEAR"
+
+        masks = filter_ablation_masks(bars, regimes)
+
+        assert masks["raw_crossover"].tolist() == [True] * 5
+        assert masks["stock_sma200_only"].tolist() == [False, True, True, True, True]
+        assert masks["volume_expansion_only"].tolist() == [True, False, True, True, True]
+        assert masks["regime_only"].tolist() == [True, True, False, True, True]
+        assert masks["regime_stock_sma200"].tolist() == [False, True, False, True, True]
+        assert masks["production_except_earnings"].tolist() == [
+            False, False, False, True, True
+        ]
 
     def test_earnings_blocks_event_day_and_prior_two_calendar_days(self):
         bars, regimes = self._inputs()

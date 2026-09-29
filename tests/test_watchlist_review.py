@@ -408,8 +408,8 @@ class TestCheckProfile:
     def test_sma_profile_fields(self):
         assert SMA_PROFILE.strategy_name == "sma_crossover"
         assert SMA_PROFILE.display_name == "SMA Crossover"
-        assert SMA_PROFILE.fcf_required is True
-        assert SMA_PROFILE.revenue_required is True
+        assert SMA_PROFILE.fcf_required is False
+        assert SMA_PROFILE.revenue_required is False
         assert SMA_PROFILE.min_cash_runway_months == MIN_SMA_CASH_RUNWAY_MONTHS
 
     def test_rsi_profile_fields(self):
@@ -474,8 +474,8 @@ class TestStrategyFitnessVerdict:
         assert f.verdict == "⚠️  UNKNOWN"
 
     def test_poor_fit_required_fcf_fails(self):
-        # SMA profile: FCF is required
-        f = _make_fitness(SMA_PROFILE, fcf_ok=False, revenue_ok=True, solvency_ok=True)
+        required = CheckProfile("required", "Required", True, False, 12)
+        f = _make_fitness(required, fcf_ok=False, revenue_ok=True, solvency_ok=True)
         assert f.verdict == "❌ POOR FIT"
 
     def test_marginal_optional_fcf_fails(self):
@@ -484,8 +484,8 @@ class TestStrategyFitnessVerdict:
         assert f.verdict == "⚠️  MARGINAL"
 
     def test_poor_fit_required_revenue_fails(self):
-        # SMA profile: revenue is required
-        f = _make_fitness(SMA_PROFILE, fcf_ok=True, revenue_ok=False, solvency_ok=True)
+        required = CheckProfile("required", "Required", False, True, 12)
+        f = _make_fitness(required, fcf_ok=True, revenue_ok=False, solvency_ok=True)
         assert f.verdict == "❌ POOR FIT"
 
     def test_marginal_optional_revenue_fails(self):
@@ -494,7 +494,7 @@ class TestStrategyFitnessVerdict:
         assert f.verdict == "⚠️  MARGINAL"
 
     def test_poor_fit_solvency_fails_sma_threshold(self):
-        # 14 months runway; SMA needs 18 → solvency_ok=False → POOR FIT
+        # A caller-established solvency failure remains a hard rejection.
         f = _make_fitness(SMA_PROFILE, fcf_ok=True, revenue_ok=True, solvency_ok=False)
         assert f.verdict == "❌ POOR FIT"
 
@@ -545,13 +545,13 @@ class TestAssessFitness:
         assert fitness.solvency_ok is True
         assert fitness.verdict == "✅ GOOD FIT"
 
-    def test_fcf_fail_required_for_sma(self):
+    def test_fcf_fail_is_diagnostic_for_sma(self):
         fund = SymbolFundamentals(
             symbol="RIVN", fcf_annual=-5e9, revenue_growth_pct=10.0, is_profitable=True
         )
         fitness = assess_fitness(fund, SMA_PROFILE)
         assert fitness.fcf_ok is False
-        assert fitness.verdict == "❌ POOR FIT"
+        assert fitness.verdict == "⚠️  MARGINAL"
 
     def test_fcf_fail_informational_for_rsi(self):
         fund = SymbolFundamentals(
@@ -561,13 +561,13 @@ class TestAssessFitness:
         assert fitness.fcf_ok is False
         assert fitness.verdict == "⚠️  MARGINAL"
 
-    def test_revenue_fail_required_for_sma(self):
+    def test_revenue_fail_is_diagnostic_for_sma(self):
         fund = SymbolFundamentals(
             symbol="X", fcf_annual=1e9, revenue_growth_pct=-5.0, is_profitable=True
         )
         fitness = assess_fitness(fund, SMA_PROFILE)
         assert fitness.revenue_ok is False
-        assert fitness.verdict == "❌ POOR FIT"
+        assert fitness.verdict == "⚠️  MARGINAL"
 
     def test_revenue_fail_informational_for_rsi(self):
         fund = SymbolFundamentals(
@@ -577,8 +577,8 @@ class TestAssessFitness:
         assert fitness.revenue_ok is False
         assert fitness.verdict == "⚠️  MARGINAL"
 
-    def test_solvency_threshold_differs_per_profile(self):
-        # 14 months runway: GOOD FIT for RSI (needs 12), POOR FIT for SMA (needs 18)
+    def test_solvency_threshold_matches_active_durable_profiles(self):
+        # 14 months runway clears the shared 12-month durable-company floor.
         # FCF and revenue are positive so they don't affect the verdict
         fund = SymbolFundamentals(
             symbol="X",
@@ -591,8 +591,8 @@ class TestAssessFitness:
         sma_fitness = assess_fitness(fund, SMA_PROFILE)
         assert rsi_fitness.solvency_ok is True
         assert rsi_fitness.verdict == "✅ GOOD FIT"
-        assert sma_fitness.solvency_ok is False
-        assert sma_fitness.verdict == "❌ POOR FIT"
+        assert sma_fitness.solvency_ok is True
+        assert sma_fitness.verdict == "✅ GOOD FIT"
 
     def test_error_propagates(self):
         fund = SymbolFundamentals(symbol="X", error="timeout")

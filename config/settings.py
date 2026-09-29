@@ -476,6 +476,15 @@ for _strat, _steps in MLEG_ENTRY_WALK_PROFILE_OVERRIDES_BY_STRATEGY.items():
     )
 
 # Strategy-specific watchlists
+# Shared durable-company admission contract for the active RSI, Donchian, and
+# SMA report-only selectors. Keep these values centralized: a strategy may add
+# diagnostics or choose a different pool size, but must not silently redefine
+# the common minimum history, price, liquidity, or company-size floor.
+DURABLE_WATCHLIST_MIN_BARS = 260
+DURABLE_WATCHLIST_MIN_MARKET_CAP = 2_000_000_000.0
+DURABLE_WATCHLIST_MIN_PRICE = 10.0
+DURABLE_WATCHLIST_MIN_AVG_DOLLAR_VOLUME_50 = 50_000_000.0
+
 # SMA Crossover — 100-name durable-liquidity opportunity pool promoted
 # 2026-09-28 from the completed-session delayed-SIP v3 report.
 # Membership uses durable price, dollar liquidity, company size, affirmative
@@ -752,7 +761,10 @@ STRATEGY_ALLOCATIONS: dict[str, dict] = {
         "can_stretch": True,
         "hard_max_positions": 8,
         "max_position_pct_of_sleeve": 0.40,
-        "risk_per_trade_pct": 0.006,   # 0.60% — covers watchlist ATR% ≥ 3.0 (all but GSAT)
+        # 0.60% target. Coverage depends on the current watchlist and sleeve
+        # cap; the refresh report recomputes cap clipping. A cap-clipped trade
+        # deliberately carries less than target risk.
+        "risk_per_trade_pct": 0.006,
     },
     "rsi_reversion": {
         "target_pct": 0.15,

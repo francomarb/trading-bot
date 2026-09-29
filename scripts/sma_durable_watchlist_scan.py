@@ -40,9 +40,9 @@ from scripts.watchlist_review import (
 )
 
 
-RULE_VERSION = "sma_watchlist_v3_durable_liquid_pool"
+RULE_VERSION = settings.SMA_WATCHLIST_RULE_VERSION
 DEFAULT_POOL_SIZES = (25, 50, 100, 200)
-DEFAULT_PROMOTION_SIZE = 100
+DEFAULT_PROMOTION_SIZE = settings.SMA_TARGET_POOL_SIZE
 EXCLUDED_SHARE_CLASSES: dict[str, str] = {"GOOGL": "GOOG"}
 DURABLE_PROFILE = CheckProfile(
     strategy_name="sma_crossover",
@@ -57,10 +57,12 @@ DURABLE_PROFILE = CheckProfile(
 class ScanConfig:
     """Durable membership thresholds."""
 
-    min_bars: int = 260
-    min_market_cap: float = 2_000_000_000.0
-    min_price: float = 10.0
-    min_avg_dollar_volume_50: float = 50_000_000.0
+    min_bars: int = settings.DURABLE_WATCHLIST_MIN_BARS
+    min_market_cap: float = settings.DURABLE_WATCHLIST_MIN_MARKET_CAP
+    min_price: float = settings.DURABLE_WATCHLIST_MIN_PRICE
+    min_avg_dollar_volume_50: float = (
+        settings.DURABLE_WATCHLIST_MIN_AVG_DOLLAR_VOLUME_50
+    )
     atr_window: int = settings.ATR_LENGTH
 
 
@@ -446,7 +448,7 @@ def render_report(
         "",
         "## Nested Pool Comparison",
         "",
-        f"| Pool | Crossovers (252d) | Active days | Peak same-day | Days >{capacity} | Zero-cross names | Median ATR% | Cap-clipped |",
+        f"| Pool | Crossovers (252d) | Active days | Peak same-day | Days above hard {capacity}-position count | Zero-cross names | Median ATR% | Cap-clipped |",
         "|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for size in pool_sizes:
@@ -460,7 +462,7 @@ def render_report(
         )
     lines.extend([
         "",
-        "Counts characterize opportunity coverage among companies selected today; they are not a point-in-time backtest.",
+        "Counts characterize opportunity coverage among companies selected today; they are not a point-in-time backtest. The hard-position column is an upper-bound count diagnostic, not sleeve-dollar capacity; `SLEEVE_FULL` can bind first and is the forward starvation metric.",
         "",
         "## Ranked Candidates",
         "",

@@ -54,10 +54,12 @@ DONCHIAN_PROFILE = CheckProfile(
 class ScanConfig:
     """Durable company-eligibility thresholds for Donchian."""
 
-    min_bars: int = 260
-    min_market_cap: float = 2_000_000_000.0
-    min_price: float = 10.0
-    min_avg_dollar_volume_50: float = 50_000_000.0
+    min_bars: int = settings.DURABLE_WATCHLIST_MIN_BARS
+    min_market_cap: float = settings.DURABLE_WATCHLIST_MIN_MARKET_CAP
+    min_price: float = settings.DURABLE_WATCHLIST_MIN_PRICE
+    min_avg_dollar_volume_50: float = (
+        settings.DURABLE_WATCHLIST_MIN_AVG_DOLLAR_VOLUME_50
+    )
     entry_window: int = settings.DONCHIAN_ENTRY_WINDOW
     atr_window: int = settings.ATR_LENGTH
 

@@ -12,12 +12,9 @@ Street* (1993):
                        (Golden Rules: "make sure it has the cash to pay the
                        medical bills")
 
-Each strategy has a different requirement profile:
-  - SMA Crossover (trend-following): FCF and revenue growth are required —
-    deteriorating fundamentals undermine the trend signal.
-  - RSI Reversion (mean-reversion): FCF and revenue growth are informational
-    only — oversold / cash-burning setups are the entry thesis. Solvency is
-    always required (shorter floor: 12 months).
+For the active durable-company pools, FCF and revenue growth are diagnostics,
+not membership gates. SMA and RSI both require affirmative solvency with at
+least 12 months of runway when a company is unprofitable.
 
 Designed to be run every six months before any watchlist change and before the
 Phase 10 live flip. Has zero impact on the running engine — read-only.
@@ -54,7 +51,7 @@ from config import settings
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-MIN_SMA_CASH_RUNWAY_MONTHS: int = 18
+MIN_SMA_CASH_RUNWAY_MONTHS: int = 12
 """Unprofitable companies must have at least this many months of cash runway for SMA."""
 
 MIN_RSI_CASH_RUNWAY_MONTHS: int = 12
@@ -93,8 +90,8 @@ class CheckProfile:
 SMA_PROFILE = CheckProfile(
     strategy_name="sma_crossover",
     display_name="SMA Crossover",
-    fcf_required=True,
-    revenue_required=True,
+    fcf_required=False,
+    revenue_required=False,
     min_cash_runway_months=MIN_SMA_CASH_RUNWAY_MONTHS,
 )
 RSI_PROFILE = CheckProfile(
@@ -403,8 +400,8 @@ def format_report(
         "| Revenue growth | YoY revenue growth > 0% | Ch. 21 |",
         "| Cash solvency | Profitable, or adequate cash runway | Golden Rules |",
         "",
-        "Strategy requirements differ:",
-        "- **SMA Crossover**: FCF and revenue growth are *required* (failing → POOR FIT); "
+        "Active durable-pool requirements:",
+        "- **SMA Crossover**: FCF and revenue growth are *informational* (failing → MARGINAL); "
         f"solvency floor: {MIN_SMA_CASH_RUNWAY_MONTHS} months.",
         "- **RSI Reversion**: FCF and revenue growth are *informational* (failing → MARGINAL); "
         f"solvency floor: {MIN_RSI_CASH_RUNWAY_MONTHS} months.",
@@ -470,7 +467,7 @@ def format_report(
                         else:
                             lines.append(
                                 f"- FCF: {StrategyFitness._chk(False)} {fcf_str} "
-                                "(informational — oversold on cash burn is the entry setup)"
+                                "(diagnostic only — does not control durable-pool membership)"
                             )
                     elif fitness.fcf_ok is True:
                         lines.append(
@@ -491,7 +488,7 @@ def format_report(
                         else:
                             lines.append(
                                 f"- Revenue Growth: {StrategyFitness._chk(False)} {rev_str} YoY "
-                                "(informational — declining revenue is priced into the oversold condition)"
+                                "(diagnostic only — does not control durable-pool membership)"
                             )
                     elif fitness.revenue_ok is True:
                         lines.append(

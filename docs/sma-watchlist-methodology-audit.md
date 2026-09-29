@@ -33,6 +33,15 @@ the ranked pool. Operator approval was recorded on 2026-09-28. The promotion
 starts a new configuration-hash evidence cohort; earlier and later outcomes
 must not be presented as one exact configuration.
 
+Membership is strategy-specific, but runtime ownership is portfolio-wide.
+SMA's ranked 100 overlaps 97 Donchian names and contains all 50 ranked RSI
+names. The other strategies' identity hashes do not include SMA membership,
+so 2026-09-28 is an explicit **effective-conditions boundary** for their
+forward watches even though their hashes did not change. The engine now emits
+rolling `SYMBOL_CONFLICT` counts grouped by `(blocked_strategy,
+owner_strategy)` so this allocation effect is measured rather than attributed
+to the signal in hindsight.
+
 ## Evidence Reviewed
 
 - RSI v3 and Donchian v1 durable-pool procedures and their promoted reports.
@@ -144,7 +153,7 @@ The current-universe snapshot uses delayed SIP bars and durable eligibility.
 Raw 20/50 crossover counts measure opportunity coverage and contention only;
 they are not a survivorship-free backtest or a return forecast.
 
-| Pool | Crossovers (252 sessions) | Active signal days | Peak same-day | Days above 8 | Zero-cross names | Median ATR% | Cap-clipped | Current-list overlap |
+| Pool | Crossovers (252 sessions) | Active signal days | Peak same-day | Days above hard 8-position count | Zero-cross names | Median ATR% | Cap-clipped | Current-list overlap |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | 25 | 62 | 50 | 3 | 0 | 2 | 3.92% | 8 | 14 |
 | 50 | 119 | 83 | 4 | 0 | 3 | 3.63% | 22 | 17 |
@@ -157,11 +166,15 @@ binds at ATR14/close of approximately 3.12%. Calmer names are conservatively
 notional-capped; this reduces risk and is not an eligibility failure.
 
 Twenty-five and 50 names leave a slow signal with limited breadth. One hundred
-roughly doubles the 50-name opportunity coverage while keeping peak same-day
-signals below the eight-position ceiling. Two hundred doubles coverage again,
-but begins to create same-day contention, adds another 100 evaluations to every
-cycle, and cap-clips almost half the pool. One hundred is therefore the bounded
-first paper cohort, not a permanent optimum.
+roughly doubles the 50-name opportunity coverage. The eight-position column is
+only the allocator's hard count ceiling, not usable sleeve-dollar capacity:
+with the observed median ATR and current risk target, dollars commonly bind at
+roughly three to five positions, and paper already produced `SLEEVE_FULL` at
+four. Two hundred doubles raw coverage again, adds another 100 evaluations to
+every cycle, and cap-clips almost half the pool. The 100-name choice therefore
+rests on bounded cycle cost, broader opportunity coverage, and measurable
+clipping—not a claim that five same-day signals all fit. `SLEEVE_FULL`
+refusals are the forward starvation metric.
 
 ### Ranking diagnostics
 
@@ -174,11 +187,14 @@ technical rankings would rotate nearly half the cohort from one snapshot.
 Liquidity remains the v3 default because it is durable, execution-relevant,
 and does not claim to forecast returns.
 
-Moving from 56 to 100 SMA names would add 44 slot-symbol evaluations. Recent
-warmed cycles process 215 combinations in roughly 19-30 seconds; approximately
-259 remains comfortably inside the 300-second cadence. Promotion must still
-verify post-recycle latency, request counts, and errors because the runtime
-cache audit identified burst and cold-cache risks.
+Moving from 56 to 100 SMA names adds 44 slot-symbol evaluations. Recent warm
+cycles before promotion processed 215 combinations in roughly 19-30 seconds.
+Observed healthy cycles on 2026-09-28 made about 220 bar requests for 143 unique
+symbols in roughly 20 seconds; no 429 was observed, showing that request count
+tracks slot-symbol evaluations rather than unique symbols. The required
+market-open check therefore covers both cold first-cycle and warm duration,
+total stock requests, duplicate cross-slot fetches, and explicit 429/retry
+log evidence—not elapsed time alone.
 
 ## Runtime Filter Ablation
 
@@ -188,14 +204,28 @@ historically and therefore omitted exactly as the runtime's fail-open behavior
 would do. Results are fixed-risk R multiples and remain survivor-selected and
 outlier-concentrated.
 
+Reproduction command (uses the frozen universe and cached delayed-SIP bars):
+
+```bash
+./venv/bin/python scripts/sma_entry_quality_audit.py \
+  --feed sip --end 2026-09-04 --filter-ablation
+```
+
 | Variant | Development N / mean R | Held-out N / mean R |
 |---|---:|---:|
-| Raw 20/50 crossover | 772 / +0.43R | 501 / +2.50R |
-| Regime only | 511 / +0.52R | 421 / +2.01R |
-| Stock>SMA200 only | 469 / +0.45R | 350 / +3.16R |
-| Volume expansion only | 352 / +0.44R | 239 / +2.75R |
-| Regime + stock>SMA200 | 352 / +0.38R | 289 / +2.63R |
-| Production gates except earnings | 173 / +0.18R | 150 / +3.54R |
+| Raw 20/50 crossover | 761 / +0.44R | 497 / +2.51R |
+| Regime only | 506 / +0.53R | 417 / +2.02R |
+| Stock>SMA200 only | 462 / +0.46R | 347 / +3.18R |
+| Volume expansion only | 351 / +0.44R | 238 / +2.76R |
+| Regime + stock>SMA200 | 349 / +0.38R | 286 / +2.65R |
+| Production gates except earnings | 172 / +0.18R | 149 / +3.56R |
+
+These values were reproduced on 2026-09-29 with the command above. The script
+reported no cached bars in one or more periods for SNDK, ECG, and DASH and
+prints that coverage on every run. The reproduced cache-manifest SHA-256 was
+`235aa2c9b09abee5f27adcbf2fd26eb00541ca132ca478216a2f47fd7eaf4763`;
+a later run with changed cache bytes therefore identifies itself as different
+evidence rather than silently presenting as the same snapshot.
 
 No gate shows a consistent incremental improvement across both periods. The
 held-out means are dominated by the same extreme runner documented in `11.70`,
@@ -247,10 +277,19 @@ Runtime disposition:
    processing latency during the next market-open cycle.
 8. Treat the promoted list as a new strategy-config-hash paper cohort. Do not
    pool pre- and post-refresh outcomes as one exact configuration.
+9. Segment Donchian and RSI discussion at the same promotion date because
+   cross-strategy ownership changed their effective admission conditions; use
+   pair-level conflict telemetry to quantify the effect.
 
 Refresh quarterly or after a material tradability, data-quality, corporate
 action, or persistent opportunity-starvation event. Do not rotate the pool for
 ordinary one-scan liquidity drift.
+
+`DOCN` remains appended only for lifecycle protection. Removing it after the
+position is flat and terminal changes SMA's full watchlist payload and thus its
+configuration hash. Record that boundary explicitly; until a reviewed
+cross-hash compatibility manifest exists, do not silently pool the pre- and
+post-removal cohorts.
 
 ## Limitations
 

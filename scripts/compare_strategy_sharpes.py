@@ -118,7 +118,7 @@ def main() -> int:
         # (label, watchlist_kind, strategy_factory, watchlist)
         (
             "SMA Crossover (20/50)",
-            "Historical SMA_WATCHLIST snapshot (v3 refresh is separate)",
+            "Current SMA_WATCHLIST (v3 durable-pool survivor snapshot)",
             lambda: SMACrossover(fast=20, slow=50, edge_filter=SMAEdgeFilter()),
             settings.SMA_WATCHLIST,
         ),

@@ -825,6 +825,7 @@ class TradingEngine:
         # ownership tracking if not blocked (positions aggregate at the broker
         # by exact symbol).
         self._symbol_conflicts: list[datetime] = []
+        self._symbol_conflict_pairs: list[tuple[datetime, str, str]] = []
         self._contract_conflicts: list[datetime] = []
 
     # ── Position bookkeeping helpers (PR 11.27) ──────────────────────────
@@ -1061,6 +1062,39 @@ class TradingEngine:
         if keep_from:
             del timestamps[:keep_from]
         return len(timestamps)
+
+    def _record_symbol_conflict(
+        self,
+        *,
+        blocked_strategy: str,
+        owner_strategy: str | None = None,
+    ) -> None:
+        """Record an equity conflict and, when known, its allocation pair."""
+        occurred_at = datetime.now(timezone.utc)
+        self._symbol_conflicts.append(occurred_at)
+        if owner_strategy is not None:
+            self._symbol_conflict_pairs.append(
+                (occurred_at, blocked_strategy, owner_strategy)
+            )
+
+    def _symbol_conflict_pairs_snapshot(self) -> list[dict[str, str | int]]:
+        """Return rolling 24h conflicts grouped by blocked and owning sleeve."""
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        self._symbol_conflict_pairs = [
+            event for event in self._symbol_conflict_pairs if event[0] >= cutoff
+        ]
+        counts: dict[tuple[str, str], int] = {}
+        for _, blocked_strategy, owner_strategy in self._symbol_conflict_pairs:
+            key = (blocked_strategy, owner_strategy)
+            counts[key] = counts.get(key, 0) + 1
+        return [
+            {
+                "blocked_strategy": blocked,
+                "owner_strategy": owner,
+                "count": count,
+            }
+            for (blocked, owner), count in sorted(counts.items())
+        ]
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -2900,7 +2934,7 @@ class TradingEngine:
                         "durable ownership lookup failed",
                         "SYMBOL_CONFLICT",
                     )
-                    self._symbol_conflicts.append(datetime.now(timezone.utc))
+                    self._record_symbol_conflict(blocked_strategy=strategy.name)
                     if strategy_statuses is not None:
                         strategy_statuses[symbol] = "Symbol Conflict"
                     if strategy_reasons is not None:
@@ -2928,7 +2962,10 @@ class TradingEngine:
                     f"symbol already owned by '{existing_owner}'",
                     "SYMBOL_CONFLICT",
                 )
-                self._symbol_conflicts.append(datetime.now(timezone.utc))
+                self._record_symbol_conflict(
+                    blocked_strategy=strategy.name,
+                    owner_strategy=existing_owner,
+                )
                 if strategy_statuses is not None:
                     strategy_statuses[symbol] = "Symbol Conflict"
                 if strategy_reasons is not None:
@@ -14148,6 +14185,9 @@ class TradingEngine:
                 # same exact OCC.
                 "symbol_conflicts_24h": self._prune_window(
                     self._symbol_conflicts, window=timedelta(hours=24)
+                ),
+                "symbol_conflicts_by_pair_24h": (
+                    self._symbol_conflict_pairs_snapshot()
                 ),
                 "contract_conflicts_24h": self._prune_window(
                     self._contract_conflicts, window=timedelta(hours=24)

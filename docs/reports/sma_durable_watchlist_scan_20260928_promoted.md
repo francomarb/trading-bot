@@ -20,14 +20,14 @@
 
 ## Nested Pool Comparison
 
-| Pool | Crossovers (252d) | Active days | Peak same-day | Days >8 | Zero-cross names | Median ATR% | Cap-clipped |
+| Pool | Crossovers (252d) | Active days | Peak same-day | Days above hard 8-position count | Zero-cross names | Median ATR% | Cap-clipped |
 |---:|---:|---:|---:|---:|---:|---:|---:|
 | 25 | 62 | 50 | 3 | 0 | 2 | 3.92% | 8 |
 | 50 | 119 | 83 | 4 | 0 | 3 | 3.63% | 22 |
 | 100 | 243 | 142 | 5 | 0 | 3 | 3.63% | 47 |
 | 200 | 491 | 193 | 11 | 3 | 5 | 3.23% | 97 |
 
-Counts characterize opportunity coverage among companies selected today; they are not a point-in-time backtest.
+Counts characterize opportunity coverage among companies selected today; they are not a point-in-time backtest. The hard-position column is an upper-bound count diagnostic, not sleeve-dollar capacity; `SLEEVE_FULL` can bind first and is the forward starvation metric.
 
 ## Ranked Candidates
 
