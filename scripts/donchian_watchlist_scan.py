@@ -54,10 +54,12 @@ DONCHIAN_PROFILE = CheckProfile(
 class ScanConfig:
     """Durable company-eligibility thresholds for Donchian."""
 
-    min_bars: int = 260
-    min_market_cap: float = 2_000_000_000.0
-    min_price: float = 10.0
-    min_avg_dollar_volume_50: float = 50_000_000.0
+    min_bars: int = settings.DURABLE_WATCHLIST_MIN_BARS
+    min_market_cap: float = settings.DURABLE_WATCHLIST_MIN_MARKET_CAP
+    min_price: float = settings.DURABLE_WATCHLIST_MIN_PRICE
+    min_avg_dollar_volume_50: float = (
+        settings.DURABLE_WATCHLIST_MIN_AVG_DOLLAR_VOLUME_50
+    )
     entry_window: int = settings.DONCHIAN_ENTRY_WINDOW
     atr_window: int = settings.ATR_LENGTH
 
@@ -497,7 +499,7 @@ def render_report(
         "## Nested Pool Comparison",
         "",
         "| Pool | Breakouts (252d) | Active days | "
-        f"Peak same-day | Days >{capacity} | Zero-breakout names | Median ATR % | "
+        f"Peak same-day | Days above hard {capacity}-position count | Zero-breakout names | Median ATR % | "
         "Cap-clipped |",
         "|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
@@ -529,7 +531,8 @@ def render_report(
             "",
             "The breakout counts characterize opportunity coverage among companies "
             "selected today. They are not a point-in-time backtest and do not "
-            "decide membership.",
+            "decide membership. The hard-position column is an upper-bound count "
+            "diagnostic, not sleeve-dollar capacity; `SLEEVE_FULL` can bind first.",
             "",
             "## Ranked Candidates",
             "",

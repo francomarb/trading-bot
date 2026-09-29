@@ -32,7 +32,7 @@ This is a snapshot reference comparing the active strategies under backtest sett
 
 | Strategy | Universe (kind) | Symbols traded / total | Sharpe | MeanRet | MeanDD | Trades | WinRate |
 |----------|-----------------|-----------------------:|------:|------:|-----:|------:|------:|
-| SMA Crossover (20/50) | SMA_WATCHLIST (static, periodically rotated by scripts/sma_watchlist_scan.py) | 18/18 | +0.33 | +37.3% | -20.8% | 58 | 51.7% |
+| SMA Crossover (20/50) | Historical pre-v3 SMA snapshot used by this recorded run | 18/18 | +0.33 | +37.3% | -20.8% | 58 | 51.7% |
 | RSI Reversion (14, 30/70) | Promoted static basket (24 symbols, scanner-selected — see methodology note 2) | 24/24 | +1.08† | +126.5% | -26.3% | 150 | 90.0% |
 | BB Squeeze (bb=10, kc=10, min=6, roc=5) | Sector ETFs (GICS SPDRs — selected by universe research) | 11/11 | +0.22 | +3.5% | -7.7% | 98 | 46.9% |
 | BB Squeeze (aggressive 10/4/3) | AI / Big-Tech / Semis (user thesis universe) | 32/32 | +0.17 | +13.6% | -26.8% | 394 | 40.6% |
@@ -44,7 +44,7 @@ This is a snapshot reference comparing the active strategies under backtest sett
 
 ### SMA Crossover (20/50)
 
-- **Universe kind:** SMA_WATCHLIST (static, periodically rotated by scripts/sma_watchlist_scan.py)
+- **Universe kind:** historical SMA_WATCHLIST snapshot; current refreshes use the v3 durable selector and this report must not be read as evidence for the promoted cohort
 - **Symbols (18):** `TERN, GOOG, WT, GOOGL, TD, IYZ, RY, MS, CM, JAZZ, BK, BMO, WDC, FIGS, VLUE, MU, NVDA, PG`
 - **Symbols that produced any trade:** 18 of 18
 

@@ -2755,6 +2755,13 @@ class TestWatchlistStatuses:
             },
             "unmapped": [],
         }
+        now = datetime.now(timezone.utc)
+        engine._symbol_conflicts = [now, now, now]
+        engine._symbol_conflict_pairs = [
+            (now, "donchian_breakout", "sma_crossover"),
+            (now, "donchian_breakout", "sma_crossover"),
+            (now, "sma_crossover", "rsi_reversion"),
+        ]
         engine._write_state_snapshot()
         with open(settings.STATE_SNAPSHOT_PATH) as fh:
             state = json.load(fh)
@@ -2772,6 +2779,19 @@ class TestWatchlistStatuses:
         assert state["allocator"] == {}
         assert state["capital_pools"] == {}
         assert state["pending_entry_notional"] == {"strategies": {}, "pools": {}}
+        assert state["symbol_conflicts_24h"] == 3
+        assert state["symbol_conflicts_by_pair_24h"] == [
+            {
+                "blocked_strategy": "donchian_breakout",
+                "owner_strategy": "sma_crossover",
+                "count": 2,
+            },
+            {
+                "blocked_strategy": "sma_crossover",
+                "owner_strategy": "rsi_reversion",
+                "count": 1,
+            },
+        ]
 
     def test_attribute_orders_uses_allocator_priority_when_symbols_overlap(
         self, engine_factory
@@ -7035,6 +7055,10 @@ class TestSharedSymbolConflict:
         # 4th positional arg is the rejection code.
         code = engine.alerts.order_rejection.call_args.args[3]
         assert code == "SYMBOL_CONFLICT"
+        assert engine._symbol_conflict_pairs[-1][1:] == (
+            "fake_strategy",
+            "rsi_reversion",
+        )
 
     def test_conflict_marks_watchlist_status(self, engine_factory):
         engine, _broker = engine_factory(entries=[False] * 59 + [True])

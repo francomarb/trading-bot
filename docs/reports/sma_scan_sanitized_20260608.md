@@ -1,5 +1,10 @@
 # SMA Watchlist Scan - 2026-06-08T01:37:11+00:00
 
+> **Historical only:** this report uses retired `sma_watchlist_v2` and must not
+> drive a current watchlist refresh. The active authority is
+> [`../sma-watchlist-selection.md`](../sma-watchlist-selection.md) under
+> `sma_watchlist_v3_durable_liquid_pool`.
+
 - Rule version: `sma_watchlist_v2`
 - Alpaca feed: `sip`
 - Data window: 2025-04-14 to 2026-06-08

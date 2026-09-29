@@ -67,7 +67,7 @@ All gates must pass for an entry to be allowed. Exits are never blocked.
 | Gate | Rule | Rationale |
 |---|---|---|
 | Stock trend | `close > 200-day SMA` | Avoids crossovers in structurally broken names |
-| Volume expansion | 10-day avg volume > 30-day avg volume | Confirms institutional participation |
+| Volume expansion | 10-day median volume > 30-day median volume | Confirms institutional participation without one-day spike distortion |
 | Pre-earnings blackout | No new entry within 2 days before earnings (`days_after=0`) | OTO stop cannot protect against an overnight gap; a 20% earnings miss bypasses the per-trade risk budget (`risk_per_trade_pct`, 11.48) entirely. Post-earnings entries allowed immediately to capture trend acceleration. |
 
 **Sector momentum filter (`strategies/filters/sector_momentum.py` — `SectorMomentumFilter`):**
@@ -96,11 +96,12 @@ There is no fixed take-profit target. The strategy lets winners run for as long 
 
 We intentionally do not add a trailing stop to SMA Crossover. The bearish crossunder already acts as the strategy's trend exit, and the 2x ATR stop already provides downside protection before the crossunder arrives. Adding a second trailing exit tends to reduce drawdown, but in testing it clipped winners more often than it improved overall risk-adjusted returns, so the strategy keeps the simpler crossunder-plus-ATR-stop design.
 
-**Watchlist:** Curated static names in `SMA_WATCHLIST` (`config/settings.py`).
-Originally derived from `scripts/sma_watchlist_scan.py` rule
-`sma_watchlist_v2` (2026-05-11, with 10 fundamentals-sanitized additions on 2026-06-08) with a few manual additions. Treat the
-deployment guide as the live source of truth — the list rotates more
-often than this catalog gets updated.
+**Watchlist:** The active `SMA_WATCHLIST` is the 100-name v3 durable-company
+opportunity pool promoted 2026-09-28, plus temporary lifecycle-preservation
+members. Membership uses price, SIP dollar liquidity, company size,
+affirmative solvency, and preferred share class; technical state and historical
+SMA outcomes do not include, exclude, or rank a company. The retired v2
+technical scanner is historical opt-in only.
 
 **Why this strategy:**
 SMA crossover is the simplest trend-following signal. It captures sustained directional moves and naturally avoids counter-trend entries. It underperforms in sideways/choppy markets, which is why it is paired with RSI Reversion for regime diversification.

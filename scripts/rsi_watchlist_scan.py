@@ -60,10 +60,12 @@ ALWAYS_PRESERVE_SYMBOLS: frozenset[str] = frozenset(
 class ScanConfig:
     """Durable company-eligibility thresholds for the RSI watchlist."""
 
-    min_bars: int = 260
-    min_market_cap: float = 2_000_000_000.0
-    min_price: float = 10.0
-    min_avg_dollar_volume_50: float = 50_000_000.0
+    min_bars: int = settings.DURABLE_WATCHLIST_MIN_BARS
+    min_market_cap: float = settings.DURABLE_WATCHLIST_MIN_MARKET_CAP
+    min_price: float = settings.DURABLE_WATCHLIST_MIN_PRICE
+    min_avg_dollar_volume_50: float = (
+        settings.DURABLE_WATCHLIST_MIN_AVG_DOLLAR_VOLUME_50
+    )
     # These parameters define reference-only historical characterization.
     # They never include, exclude, or rank a company.
     reversion_window_days: int = 10

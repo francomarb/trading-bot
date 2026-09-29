@@ -479,5 +479,7 @@ class TestDonchianReport:
         assert "| 3 |" in report
         assert "Risk sizing binds at ATR14/close" in report
         assert "not a point-in-time backtest" in report
+        assert "Days above hard 8-position count" in report
+        assert "`SLEEVE_FULL` can bind first" in report
         assert "Current overlap" not in report
         assert "| Current |" not in report

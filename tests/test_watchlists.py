@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import pytest
 
 from config import settings
@@ -89,6 +92,44 @@ class TestRSIWatchlistPromotion:
         assert "BRK.B" in ranked_pool
         assert "BAC" not in ranked_pool
         assert SECTOR_MAP["BRK.B"] == "XLF"
+
+
+class TestSMAWatchlistPromotion:
+    def test_generated_pool_precedes_lifecycle_preservation_members(self):
+        assert (
+            settings.SMA_WATCHLIST_RULE_VERSION
+            == "sma_watchlist_v3_durable_liquid_pool"
+        )
+        assert settings.SMA_TARGET_POOL_SIZE == 100
+        assert len(settings.SMA_WATCHLIST) >= settings.SMA_TARGET_POOL_SIZE
+
+    def test_symbols_are_unique_and_use_preferred_alphabet_share_class(self):
+        assert len(settings.SMA_WATCHLIST) == len(set(settings.SMA_WATCHLIST))
+        assert "GOOG" in settings.SMA_WATCHLIST
+        assert "GOOGL" not in settings.SMA_WATCHLIST
+
+    def test_ranked_pool_matches_approved_liquidity_boundary(self):
+        ranked_pool = settings.SMA_WATCHLIST[: settings.SMA_TARGET_POOL_SIZE]
+
+        assert ranked_pool[0] == "MU"
+        assert ranked_pool[-1] == "ACN"
+
+    def test_ranked_pool_matches_approved_scan_artifact(self):
+        report_path = (
+            Path(__file__).resolve().parents[1]
+            / "docs/reports/sma_durable_watchlist_scan_20260928_promoted.md"
+        )
+        table = report_path.read_text(encoding="utf-8").split(
+            "## Ranked Candidates", 1
+        )[1].split("## Risk-Target Coverage", 1)[0]
+        approved = [
+            match.group(2)
+            for line in table.splitlines()
+            if (match := re.match(r"\|\s*(\d+)\s*\|\s*([^| ]+)\s*\|", line))
+            and int(match.group(1)) <= settings.SMA_TARGET_POOL_SIZE
+        ]
+
+        assert approved == settings.SMA_WATCHLIST[: settings.SMA_TARGET_POOL_SIZE]
 
 
 class TestDonchianWatchlistPromotion:

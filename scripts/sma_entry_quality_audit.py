@@ -43,12 +43,18 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import hashlib
 import math
 from pathlib import Path
+import sys
 from typing import Iterable
 
 import numpy as np
 import pandas as pd
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from config import settings
 from indicators.technicals import add_atr, add_sma
@@ -74,6 +80,14 @@ MIN_RETENTION = 0.60
 BOOTSTRAP_SEED = 1170
 POLICIES = ("control", "structure_stop", "pullback", "extension_cap")
 VARIANT_POLICIES = POLICIES[1:]
+FILTER_ABLATION_VARIANTS = (
+    "raw_crossover",
+    "regime_only",
+    "stock_sma200_only",
+    "volume_expansion_only",
+    "regime_stock_sma200",
+    "production_except_earnings",
+)
 
 # Frozen when 11.70 started.  Do not replace this with settings.SMA_WATCHLIST:
 # a drifting universe would make the audit irreproducible.
@@ -259,6 +273,31 @@ def valid_signal_mask(
         & regime_gate.fillna(False)
         & earnings_gate
     ).astype(bool)
+
+
+def filter_ablation_masks(
+    bars: pd.DataFrame,
+    regimes: pd.Series,
+) -> dict[str, pd.Series]:
+    """Return the fixed runtime-gate variants used by the v3 audit table.
+
+    Earnings is intentionally absent: historical point-in-time coverage was
+    unavailable, matching the documented fail-open replay limitation.
+    """
+    raw = bars["golden_cross"].fillna(False).astype(bool)
+    regime = regimes.reindex(bars.index).isin(
+        settings.STRATEGY_ALLOWED_REGIMES["sma_crossover"]
+    ).fillna(False)
+    stock = bars["stock_gate"].fillna(False).astype(bool)
+    volume = bars["volume_gate"].fillna(False).astype(bool)
+    return {
+        "raw_crossover": raw,
+        "regime_only": raw & regime,
+        "stock_sma200_only": raw & stock,
+        "volume_expansion_only": raw & volume,
+        "regime_stock_sma200": raw & regime & stock,
+        "production_except_earnings": raw & regime & stock & volume,
+    }
 
 
 def _stop_fill(row: pd.Series, stop: float) -> float | None:
@@ -613,6 +652,23 @@ def _load_cached_bars(symbol: str, feed: str) -> pd.DataFrame | None:
     return pd.read_parquet(path)
 
 
+def cache_manifest_hash(
+    symbols: Iterable[str],
+    feed: str,
+    *,
+    historical_root: Path = Path("data/historical"),
+) -> str:
+    """Fingerprint the exact cache files used by a reproducibility run."""
+    digest = hashlib.sha256()
+    for symbol in sorted(set(symbols)):
+        path = historical_root / feed / f"{symbol}_1Day_all.parquet"
+        digest.update(symbol.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes() if path.exists() else b"<missing>")
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def _fmt(value: float, *, pct: bool = False) -> str:
     if not np.isfinite(value):
         return "n/a"
@@ -671,6 +727,23 @@ def _print_table(
                 f"P(random omits >= observed winners)="
                 f"{chance.worse_or_equal_p_value:.3f}"
             )
+
+
+def _print_filter_ablation(
+    development: dict[str, tuple[AuditTrade, ...]],
+    held_out: dict[str, tuple[AuditTrade, ...]],
+) -> None:
+    """Print the reproducible table cited by the SMA v3 methodology audit."""
+    print("\nRUNTIME FILTER ABLATION (earnings unavailable / fail-open)")
+    print("variant                         development N / mean R   held-out N / mean R")
+    for variant in FILTER_ABLATION_VARIANTS:
+        dev = summarize(development[variant])
+        holdout = summarize(held_out[variant])
+        print(
+            f"{variant:<31} "
+            f"{int(dev['trades']):>4} / {dev['expectancy_r']:+.2f}R       "
+            f"{int(holdout['trades']):>4} / {holdout['expectancy_r']:+.2f}R"
+        )
 
 
 def evaluate_decisions(
@@ -751,6 +824,14 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         help="Optional point-in-time earnings calendar with symbol,date columns.",
     )
+    parser.add_argument(
+        "--filter-ablation",
+        action="store_true",
+        help=(
+            "Also reproduce the raw/regime/SMA200/volume gate table cited "
+            "by the SMA durable-watchlist methodology audit."
+        ),
+    )
     args = parser.parse_args(argv)
     end = pd.Timestamp(args.end, tz="UTC")
     earnings = load_earnings_csv(args.earnings_csv)
@@ -762,6 +843,7 @@ def main(argv: list[str] | None = None) -> int:
     regimes = classify_spy_regime(_utc_index(spy_raw))
     period_specs = build_period_specs(end)
     all_results: dict[str, dict[str, PeriodResult]] = {}
+    ablation_results: dict[str, dict[str, tuple[AuditTrade, ...]]] = {}
     missing: list[str] = []
     insufficient: list[str] = []
     for period in period_specs:
@@ -770,6 +852,9 @@ def main(argv: list[str] | None = None) -> int:
             name: [] for name in POLICIES
         }
         skips_by_policy: dict[str, list[PolicySkip]] = {name: [] for name in POLICIES}
+        ablation_trades: dict[str, list[AuditTrade]] = {
+            name: [] for name in FILTER_ABLATION_VARIANTS
+        }
         for symbol in AUDIT_UNIVERSE:
             raw = _load_cached_bars(symbol, args.feed)
             if raw is None:
@@ -796,6 +881,19 @@ def main(argv: list[str] | None = None) -> int:
                 trades_by_policy[policy].extend(result.trades)
                 opportunities_by_policy[policy].extend(result.opportunities)
                 skips_by_policy[policy].extend(result.skips)
+            if args.filter_ablation:
+                for variant, variant_signals in filter_ablation_masks(
+                    bars, regimes
+                ).items():
+                    result = simulate_period(
+                        symbol=symbol,
+                        bars=bars,
+                        valid_signals=variant_signals,
+                        start=period.start,
+                        end=period.end,
+                        policy="control",
+                    )
+                    ablation_trades[variant].extend(result.trades)
         all_results[period.role] = {
             policy: PeriodResult(
                 tuple(trades_by_policy[policy]),
@@ -804,9 +902,18 @@ def main(argv: list[str] | None = None) -> int:
             )
             for policy in POLICIES
         }
+        if args.filter_ablation:
+            ablation_results[period.role] = {
+                variant: tuple(trades)
+                for variant, trades in ablation_trades.items()
+            }
 
     print("SMA ENTRY QUALITY AUDIT — PLAN 11.70")
     print(f"feed={args.feed}; frozen universe={len(AUDIT_UNIVERSE)}; end={end.date()}")
+    print(
+        "cache manifest sha256="
+        f"{cache_manifest_hash((*AUDIT_UNIVERSE, 'SPY'), args.feed)}"
+    )
     print(
         "earnings gate="
         + (f"CSV supplied ({len(earnings)} symbols)" if args.earnings_csv else "UNAVAILABLE / production fail-open")
@@ -819,6 +926,11 @@ def main(argv: list[str] | None = None) -> int:
         development=all_results["development"],
         held_out=all_results["held_out"],
     )
+    if args.filter_ablation:
+        _print_filter_ablation(
+            ablation_results["development"],
+            ablation_results["held_out"],
+        )
     print("\nLimitations: current-watchlist survivorship bias; earnings coverage as labeled; ")
     print("realized-exit-sequence drawdown (not daily portfolio MTM); no sleeve/notional caps.")
     return 0

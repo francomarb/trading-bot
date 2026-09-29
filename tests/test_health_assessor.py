@@ -268,6 +268,63 @@ class TestL1Stubs:
         cd = next(c for c in report.checks if c.name == "strategy_cooldown")
         assert cd.status == HealthStatus.HEALTHY
 
+    def test_equity_conflicts_are_informational_and_strategy_scoped(self, db_conn):
+        engine_state = {
+            "symbol_conflicts_24h": 9,
+            "symbol_conflicts_by_pair_24h": [
+                {
+                    "blocked_strategy": "donchian_breakout",
+                    "owner_strategy": "sma_crossover",
+                    "count": 4,
+                },
+                {
+                    "blocked_strategy": "sma_crossover",
+                    "owner_strategy": "rsi_reversion",
+                    "count": 5,
+                },
+            ],
+        }
+
+        donchian = HealthAssessor().assess(_standard_inputs(
+            db_conn,
+            engine_state=engine_state,
+            strategy="donchian_breakout",
+        ))
+        check = next(
+            item for item in donchian.checks
+            if item.name == "symbol_conflicts_24h"
+        )
+        assert check.status == HealthStatus.HEALTHY
+        assert check.informational is True
+        assert check.numeric_value == 4
+        assert "sma_crossover=4" in check.findings[0]
+
+        unrelated = HealthAssessor().assess(_standard_inputs(
+            db_conn,
+            engine_state=engine_state,
+            strategy="credit_spread",
+        ))
+        unrelated_check = next(
+            item for item in unrelated.checks
+            if item.name == "symbol_conflicts_24h"
+        )
+        assert unrelated_check.status == HealthStatus.HEALTHY
+        assert unrelated_check.numeric_value == 0
+
+    def test_legacy_global_equity_conflict_count_never_fault_grades(self, db_conn):
+        report = HealthAssessor().assess(_standard_inputs(
+            db_conn,
+            engine_state={"symbol_conflicts_24h": 99},
+        ))
+        check = next(
+            item for item in report.checks
+            if item.name == "symbol_conflicts_24h"
+        )
+        assert check.status == HealthStatus.HEALTHY
+        assert check.informational is True
+        assert check.numeric_value == 99
+        assert "legacy snapshot" in check.findings[0]
+
 
 # ── L2 slippage and partial-fill ──────────────────────────────────────
 
