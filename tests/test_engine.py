@@ -37,7 +37,7 @@ from loguru import logger
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
@@ -2580,6 +2580,36 @@ class TestWatchlistStatuses:
         assert statuses["AAPL"] == "Regime Blocked"
         assert reasons["AAPL"] == ["regime bear not in allowed set ['trending']"]
         broker.place_order.assert_not_called()
+
+    def test_rejected_entry_alerts_and_is_not_reported_as_pending(
+        self,
+        engine_factory,
+    ):
+        engine, broker = engine_factory(
+            entries=[False] * 59 + [True],
+            place_result=_rejected_result("AAPL", 1),
+        )
+        engine.alerts = MagicMock()
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        statuses = {"AAPL": "No Signal"}
+        reasons = {"AAPL": []}
+        slot = engine.slots[0]
+
+        engine._process_symbol(
+            "AAPL",
+            snap,
+            snap.account,
+            slot.strategy,
+            slot.timeframe,
+            strategy_statuses=statuses,
+            strategy_reasons=reasons,
+        )
+
+        broker.place_order.assert_called_once()
+        assert statuses["AAPL"] == "Order Rejected"
+        assert reasons["AAPL"] == ["rejected"]
+        assert engine.alerts.order_rejection.call_args.args[3] == "BROKER_REJECTED"
 
     def test_filter_blocked_status_when_raw_entry_vetoed(self, engine_factory):
         class _BlockingFilter:
@@ -6928,6 +6958,57 @@ class TestSharedSymbolConflict:
         assert result is None
         broker.place_order.assert_not_called()
         assert engine.alerts.order_rejection.call_args.args[3] == "SYMBOL_CONFLICT"
+
+    def test_lifecycle_store_init_failure_blocks_new_equity_entry(
+        self,
+        engine_factory,
+    ):
+        with patch(
+            "engine.lifecycle.PositionLifecycleStore",
+            side_effect=RuntimeError("disk unavailable"),
+        ):
+            engine, broker = engine_factory(entries=[False] * 59 + [True])
+        engine.alerts = MagicMock()
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        statuses = {"AAPL": "No Signal"}
+        reasons = {"AAPL": []}
+
+        result = engine._process_symbol(
+            "AAPL",
+            snap,
+            snap.account,
+            engine.slots[0].strategy,
+            engine.slots[0].timeframe,
+            strategy_statuses=statuses,
+            strategy_reasons=reasons,
+        )
+
+        assert result is None
+        broker.place_order.assert_not_called()
+        assert statuses["AAPL"] == "Entry Blocked"
+        assert "durable lifecycle store unavailable" in reasons["AAPL"][0]
+        assert (
+            engine.alerts.order_rejection.call_args.args[3]
+            == "LIFECYCLE_UNAVAILABLE"
+        )
+
+    def test_lifecycle_store_init_failure_keeps_equity_exits_available(
+        self,
+        engine_factory,
+    ):
+        with patch(
+            "engine.lifecycle.PositionLifecycleStore",
+            side_effect=RuntimeError("disk unavailable"),
+        ):
+            engine, broker = engine_factory(exits=[False] * 59 + [True])
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1_010.0)}
+        snap = _snapshot(positions=positions)
+        engine._session_start_equity = snap.account.equity
+
+        self._process(engine, "AAPL", snap)
+
+        broker.close_position.assert_called_once_with("AAPL", position_uid=None)
 
     def test_same_strategy_re_entry_not_blocked_by_conflict_check(self, engine_factory):
         """Self-ownership must not trip the cross-strategy conflict rule.
