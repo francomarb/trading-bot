@@ -4102,6 +4102,19 @@ class TestAlertDispatcher:
         assert AlertType.SLIPPAGE_DRIFT in types
         assert AlertType.LOSS_STREAK_COOLDOWN in types
 
+    def test_sleep_gap_is_warning_not_engine_halt(self):
+        """A host sleep misses cycles but halts nothing, so it must not go
+        out as a CRITICAL "engine halted" alert."""
+        backend = _CollectorBackend()
+        dispatcher = AlertDispatcher(backends=[backend], cooldown_seconds=0)
+
+        dispatcher.sleep_gap("bot slept 51 min, ~9 cycle(s) missed")
+
+        [alert] = backend.alerts
+        assert alert.alert_type is AlertType.SLEEP_GAP
+        assert alert.severity is AlertSeverity.WARNING
+        assert alert.message == "sleep gap: bot slept 51 min, ~9 cycle(s) missed"
+
     def test_alert_format(self):
         alert = Alert(
             alert_type=AlertType.ORDER_REJECTION,

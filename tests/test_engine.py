@@ -1680,11 +1680,11 @@ class TestRunOneCycle:
         )
         engine._session_start_equity = 100_000.0
         engine._cycle_count = 1
-        before = time.monotonic()
+        assert engine._last_cycle_end is None
 
         engine._run_one_cycle()
 
-        assert engine._last_cycle_end >= before
+        assert engine._last_cycle_end == T0  # the engine's wall clock
         broker.sync_with_broker.assert_called_once()
 
     def test_sync_failure_skips_cycle_and_records_broker_error(
@@ -1839,6 +1839,65 @@ class TestRunOneCycle:
             and "Traceback" in r
             for r in records
         )
+
+    def _two_cycles_wall_gap(self, engine_factory, gap, **factory_kwargs):
+        """Run two cycles whose wall clocks are ``gap`` apart while almost no
+        monotonic time passes, as when the host sleeps. Returns the engine
+        (alerts mocked) and the second cycle's log lines."""
+        engine, _broker = engine_factory(**factory_kwargs)
+        now = [T0]
+        engine._clock = lambda: now[0]
+        engine.alerts = MagicMock()
+        engine._session_start_equity = 100_000.0
+        engine._cycle_count = 1
+        engine._run_one_cycle()
+        now[0] = T0 + gap
+        records: list[str] = []
+        handler_id = logger.add(lambda msg: records.append(str(msg)), level="INFO")
+        try:
+            engine._cycle_count = 2
+            engine._run_one_cycle()
+        finally:
+            logger.remove(handler_id)
+        return engine, records
+
+    def test_wall_clock_sleep_gap_alerts_when_market_open(self, engine_factory):
+        """time.monotonic() stops while macOS sleeps, so the gap must come
+        from the wall clock (the detector never fired before this)."""
+        engine, records = self._two_cycles_wall_gap(
+            engine_factory, timedelta(minutes=51),
+            config_overrides={"cycle_interval_seconds": 300.0},
+        )
+
+        engine.alerts.sleep_gap.assert_called_once_with(
+            "bot slept 51 min, ~9 cycle(s) missed"
+        )
+        engine.alerts.engine_halt.assert_not_called()
+        assert any("sleep gap detected: 3060s" in r for r in records)
+
+    def test_sleep_gap_with_market_closed_is_logged_not_alerted(
+        self, engine_factory
+    ):
+        engine, records = self._two_cycles_wall_gap(
+            engine_factory, timedelta(minutes=51),
+            market_open=False,
+            config_overrides={
+                "cycle_interval_seconds": 300.0,
+                "market_hours_only": True,
+            },
+        )
+
+        engine.alerts.sleep_gap.assert_not_called()
+        assert any("sleep gap detected: 3060s" in r for r in records)
+
+    def test_normal_cycle_interval_is_not_a_sleep_gap(self, engine_factory):
+        engine, records = self._two_cycles_wall_gap(
+            engine_factory, timedelta(minutes=5),
+            config_overrides={"cycle_interval_seconds": 300.0},
+        )
+
+        engine.alerts.sleep_gap.assert_not_called()
+        assert not any("sleep gap detected" in r for r in records)
 
 
 class TestStartStop:
