@@ -78,6 +78,9 @@ class AlertType(Enum):
     # routine resume-entries looked like an emergency to alerting
     # channels. ENGINE_HALT stays for actual halt + resume-after-halt.
     OPERATOR_ACTION = "operator_action"
+    # Host slept through trading cycles (laptop paper bot). WARNING, not
+    # ENGINE_HALT: nothing is halted, cycles were missed.
+    SLEEP_GAP = "sleep_gap"
     TRADE_EXECUTED = "trade_executed"
     REGIME_SHIFT = "regime_shift"
     EOD_SUMMARY = "eod_summary"
@@ -494,6 +497,13 @@ class AlertDispatcher:
             alert_type=AlertType.BROKER_INFO,
             severity=AlertSeverity.INFO,
             message=f"broker info: {message}",
+        ))
+
+    def sleep_gap(self, message: str) -> bool:
+        return self.fire(Alert(
+            alert_type=AlertType.SLEEP_GAP,
+            severity=AlertSeverity.WARNING,
+            message=f"sleep gap: {message}",
         ))
 
     def mleg_close_walk_started(

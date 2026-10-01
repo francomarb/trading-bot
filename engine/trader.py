@@ -696,7 +696,7 @@ class TradingEngine:
         self._session_start_equity: float | None = None
         self._cycle_count: int = 0
         self._cycle_symbol_error_count: int = 0
-        self._last_cycle_end: float = 0.0  # monotonic timestamp
+        self._last_cycle_end: datetime | None = None  # wall clock (self._clock)
         # Operator Controls Phase B — fast operator-command heartbeat.
         # Daemon thread polls the operator_commands queue every
         # OPERATOR_COMMAND_HEARTBEAT_SECONDS. Started in `start()`,
@@ -1938,8 +1938,7 @@ class TradingEngine:
         the caller, which stops the engine loop.
         """
         cycle_id = self._cycle_count
-        now_mono = time.monotonic()
-        cycle_started_mono = now_mono
+        cycle_started_mono = time.monotonic()
         total_symbols = sum(len(slot.active_symbols()) for slot in self.slots)
         processed_symbols = 0
         new_positions = 0
@@ -1955,8 +1954,13 @@ class TradingEngine:
 
         # Detect sleep gaps — if wall-clock time since the last cycle end is
         # much larger than the configured interval, the machine likely slept.
-        if self._last_cycle_end > 0:
-            gap = now_mono - self._last_cycle_end
+        # Wall clock, not time.monotonic(): monotonic stops while macOS
+        # sleeps, so it never saw a laptop sleep. Every gap is logged; the
+        # alert waits for the market check below and fires only when the
+        # market is open, i.e. when trading cycles were actually missed.
+        sleep_gap_alert: str | None = None
+        if self._last_cycle_end is not None:
+            gap = (self._clock() - self._last_cycle_end).total_seconds()
             expected = self.config.cycle_interval_seconds
             if gap > expected * 3 and gap > 60:
                 missed = int(gap / expected) - 1
@@ -1964,8 +1968,8 @@ class TradingEngine:
                     f"sleep gap detected: {gap:.0f}s elapsed since last cycle "
                     f"(expected ~{expected:.0f}s), ~{missed} cycle(s) missed"
                 )
-                self.alerts.engine_halt(
-                    f"sleep gap: {gap:.0f}s, ~{missed} cycles missed"
+                sleep_gap_alert = (
+                    f"bot slept {gap / 60:.0f} min, ~{missed} cycle(s) missed"
                 )
 
         try:
@@ -1976,6 +1980,8 @@ class TradingEngine:
             else:
                 market_open = True
                 market_state = "not_enforced"
+            if sleep_gap_alert is not None and market_open:
+                self.alerts.sleep_gap(sleep_gap_alert)
 
             logger.info(
                 f"cycle {cycle_id} start: "
@@ -2342,7 +2348,7 @@ class TradingEngine:
             # inter-cycle sleep (5 min default).  Fresh connections are cheap.
             close_connections()
             self.broker.close_connections()
-            self._last_cycle_end = time.monotonic()
+            self._last_cycle_end = self._clock()
 
     def _record_cycle_symbol_error(self, message: str) -> None:
         """Log a handled symbol error and include it in the cycle summary."""
