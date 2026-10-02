@@ -1899,6 +1899,95 @@ class TestRunOneCycle:
         engine.alerts.sleep_gap.assert_not_called()
         assert not any("sleep gap detected" in r for r in records)
 
+    _CLOSED = SimpleNamespace(is_open=False)
+    _OPEN = SimpleNamespace(is_open=True)
+    _CLOCK_DOWN = ConnectionError("Connection aborted.")
+
+    def _cycles_with_clock_answers(self, engine_factory, steps, alerts=None):
+        """Run one cycle per (wall-clock advance, clock answer) step. An
+        exception answer makes the broker clock call fail, as it can right
+        after the host wakes. Returns the engine; alerts default to a mock."""
+        engine, broker = engine_factory(config_overrides={
+            "cycle_interval_seconds": 300.0,
+            "market_hours_only": True,
+        })
+        answer = {}
+
+        def _get_clock():
+            if isinstance(answer["value"], Exception):
+                raise answer["value"]
+            return answer["value"]
+
+        broker._api.get_clock.side_effect = _get_clock
+        now = [T0]
+        engine._clock = lambda: now[0]
+        engine.alerts = alerts if alerts is not None else MagicMock()
+        engine._session_start_equity = 100_000.0
+        for cycle_id, (advance, value) in enumerate(steps, start=1):
+            now[0] += advance
+            answer["value"] = value
+            engine._cycle_count = cycle_id
+            engine._run_one_cycle()
+        return engine
+
+    def test_sleep_gap_alert_held_through_failed_clock_check(
+        self, engine_factory
+    ):
+        """2026-10-02 10:35: the wake after a 3.4 h sleep hit a failed clock
+        check, which reads as closed, and the alert was dropped. It must wait
+        for the next cycle that gets a definite answer."""
+        engine = self._cycles_with_clock_answers(engine_factory, [
+            (timedelta(0), self._CLOSED),
+            (timedelta(minutes=202), self._CLOCK_DOWN),
+            (timedelta(minutes=5), self._OPEN),
+        ])
+
+        engine.alerts.sleep_gap.assert_called_once_with(
+            "bot slept 202 min, ~39 cycle(s) missed"
+        )
+
+    def test_held_sleep_gap_alert_dropped_when_market_confirmed_closed(
+        self, engine_factory
+    ):
+        engine = self._cycles_with_clock_answers(engine_factory, [
+            (timedelta(0), self._CLOSED),
+            (timedelta(minutes=202), self._CLOCK_DOWN),
+            (timedelta(minutes=5), self._CLOSED),
+        ])
+
+        engine.alerts.sleep_gap.assert_not_called()
+
+    def test_held_and_new_sleep_gap_alerts_both_sent_when_market_open(
+        self, engine_factory
+    ):
+        """Today's sequence: the 10:35 wake failed its clock check, the
+        11:17 wake (after another 42 min asleep) saw the market open. The
+        real dispatcher de-duplicates by alert type, so both gaps must go
+        out as one alert to reach the backend."""
+        from reporting.alerts import AlertBackend, AlertDispatcher, AlertType
+
+        class _Collector(AlertBackend):
+            def __init__(self):
+                self.alerts = []
+
+            def send(self, alert):
+                self.alerts.append(alert)
+
+        collector = _Collector()
+        self._cycles_with_clock_answers(engine_factory, [
+            (timedelta(0), self._CLOSED),
+            (timedelta(minutes=202), self._CLOCK_DOWN),
+            (timedelta(minutes=42), self._OPEN),
+        ], alerts=AlertDispatcher(backends=[collector]))
+
+        assert [
+            a.message for a in collector.alerts
+            if a.alert_type is AlertType.SLEEP_GAP
+        ] == [
+            "sleep gap: bot slept 202 min, ~39 cycle(s) missed; "
+            "bot slept 42 min, ~7 cycle(s) missed"
+        ]
+
 
 class TestStartStop:
     def test_max_cycles_terminates_loop(self, engine_factory):
