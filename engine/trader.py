@@ -1989,8 +1989,9 @@ class TradingEngine:
                 self._pending_sleep_gap_alerts.append(sleep_gap_alert)
             if self._pending_sleep_gap_alerts and market_status is not None:
                 if market_open:
-                    for message in self._pending_sleep_gap_alerts:
-                        self.alerts.sleep_gap(message)
+                    # One alert: the dispatcher de-duplicates by alert type,
+                    # so a second call this soon would be suppressed.
+                    self.alerts.sleep_gap("; ".join(self._pending_sleep_gap_alerts))
                 self._pending_sleep_gap_alerts.clear()
 
             logger.info(

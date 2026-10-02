@@ -1903,10 +1903,10 @@ class TestRunOneCycle:
     _OPEN = SimpleNamespace(is_open=True)
     _CLOCK_DOWN = ConnectionError("Connection aborted.")
 
-    def _cycles_with_clock_answers(self, engine_factory, steps):
+    def _cycles_with_clock_answers(self, engine_factory, steps, alerts=None):
         """Run one cycle per (wall-clock advance, clock answer) step. An
         exception answer makes the broker clock call fail, as it can right
-        after the host wakes. Returns the engine with alerts mocked."""
+        after the host wakes. Returns the engine; alerts default to a mock."""
         engine, broker = engine_factory(config_overrides={
             "cycle_interval_seconds": 300.0,
             "market_hours_only": True,
@@ -1921,7 +1921,7 @@ class TestRunOneCycle:
         broker._api.get_clock.side_effect = _get_clock
         now = [T0]
         engine._clock = lambda: now[0]
-        engine.alerts = MagicMock()
+        engine.alerts = alerts if alerts is not None else MagicMock()
         engine._session_start_equity = 100_000.0
         for cycle_id, (advance, value) in enumerate(steps, start=1):
             now[0] += advance
@@ -1961,16 +1961,31 @@ class TestRunOneCycle:
         self, engine_factory
     ):
         """Today's sequence: the 10:35 wake failed its clock check, the
-        11:17 wake (after another 42 min asleep) saw the market open."""
-        engine = self._cycles_with_clock_answers(engine_factory, [
+        11:17 wake (after another 42 min asleep) saw the market open. The
+        real dispatcher de-duplicates by alert type, so both gaps must go
+        out as one alert to reach the backend."""
+        from reporting.alerts import AlertBackend, AlertDispatcher, AlertType
+
+        class _Collector(AlertBackend):
+            def __init__(self):
+                self.alerts = []
+
+            def send(self, alert):
+                self.alerts.append(alert)
+
+        collector = _Collector()
+        self._cycles_with_clock_answers(engine_factory, [
             (timedelta(0), self._CLOSED),
             (timedelta(minutes=202), self._CLOCK_DOWN),
             (timedelta(minutes=42), self._OPEN),
-        ])
+        ], alerts=AlertDispatcher(backends=[collector]))
 
-        assert [c.args for c in engine.alerts.sleep_gap.call_args_list] == [
-            ("bot slept 202 min, ~39 cycle(s) missed",),
-            ("bot slept 42 min, ~7 cycle(s) missed",),
+        assert [
+            a.message for a in collector.alerts
+            if a.alert_type is AlertType.SLEEP_GAP
+        ] == [
+            "sleep gap: bot slept 202 min, ~39 cycle(s) missed; "
+            "bot slept 42 min, ~7 cycle(s) missed"
         ]
 
 
