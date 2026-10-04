@@ -162,6 +162,36 @@ An isolated temporary-directory failure probe confirmed the code-level analysis:
 
 No production cache was altered for these probes.
 
+### 2.5 Post-promotion observation through 2026-10-03
+
+After the SMA durable pool increased the engine to 260 slot-symbol evaluations,
+85 market-open cycles completed at 27.6 seconds median and 47.7 seconds p95.
+Four exceeded 60 seconds and two exceeded 300 seconds; the maximum was 485.2
+seconds. No genuine provider 429 appeared. Normal warmed operation therefore
+remains acceptable, while the long tail still supports the bounded-retry,
+deadline, and telemetry work below. These statistics cover only cycles that
+ran; they do not establish continuous market-hour coverage.
+
+Every post-promotion session through 2026-10-02 had substantial gaps in which
+no engine cycle started. PR #171 was deployed after market on 2026-10-01, so it
+could directly flag only the Oct 2 gaps:
+
+| Session | Market-open cycles | Market minutes inside gaps over 15 minutes |
+|---|---:|---:|
+| 2026-09-29 | 11 | 322 / 390 |
+| 2026-09-30 | 24 | 266 / 390 |
+| 2026-10-01 | 10 | 333 / 390 |
+| 2026-10-02 | 40 | 167 / 390 |
+
+The process remained present and its stream thread logged during portions of
+the gaps, while the main cycle scheduler did not start another cycle. The root
+cause remains unproven. One diagnostic lead is that macOS documents
+`caffeinate -s` as preventing system sleep only on AC power; the host's power
+state during these sessions is unknown. Main-thread blocking and other
+scheduler/host-continuity causes must remain in scope. Until diagnosed, these
+gaps weaken every paper evidence stream and collection cannot be described as
+continuous.
+
 ## 3. Runtime data-path inventory
 
 | Path | Source of truth and key | Current freshness / retry contract | Durability and failure posture | Assessment |
