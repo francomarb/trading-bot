@@ -25,7 +25,7 @@ _CONFIG_FIELDS: dict[str, tuple[str, ...]] = {
     "strategies.sma_crossover.SMACrossover": ("fast", "slow", "_edge_filter"),
     "strategies.rsi_reversion.RSIReversion": (
         "period", "oversold", "overbought", "entry_mode", "exit_sma_window",
-        "quick_exit_rsi", "_edge_filter",
+        "quick_exit_rsi", "stop_anchor_policy", "_edge_filter",
     ),
     "strategies.donchian_breakout.DonchianBreakout": (
         "entry_window", "exit_window", "_edge_filter",

@@ -47,7 +47,7 @@ import pandas as pd
 
 if TYPE_CHECKING:
     from data.watchlists import WatchlistSource
-    from risk.models import PositionRiskProfile
+    from risk.models import PositionRiskProfile, StopAnchor
 
 
 # ── Shared types ─────────────────────────────────────────────────────────────
@@ -344,6 +344,12 @@ class BaseStrategy(ABC):
         from risk.models import PositionRiskProfile
 
         return PositionRiskProfile()
+
+    def stop_anchor(self, symbol: str) -> "StopAnchor":
+        """Return the intended protective-stop basis for a new entry."""
+        from risk.models import StopAnchor
+
+        return StopAnchor.REFERENCE
 
     def candidate_features(self, df: pd.DataFrame) -> dict[str, object]:
         """Return strategy-owned, observation-only facts for the latest bar.

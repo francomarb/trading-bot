@@ -362,6 +362,7 @@ CREATE TABLE position_lifecycle_orders (
     intended_trigger_price        REAL,                -- stop_limit stop price
     intended_limit_price          REAL,                -- limit / capped market / stop_limit
     intended_take_profit_price    REAL,                -- bracket take-profit child
+    stop_anchor                   TEXT NOT NULL DEFAULT 'reference', -- reference | fill
 
     -- Decision-time sizing evidence (captured before submit; immutable)
     risk_budget_dollars           REAL,                -- strategy target

@@ -110,10 +110,10 @@ unless its open proves a pre-cleanup fill; an in-progress boundary session stays
 `awaiting_fill`, because daily resolution cannot invent the ordering. A legacy candidate's exact TIF is recovered from
 the selected peer's durable entry-order row, while its historical configured
 age default is parsed from its immutable commit. The replay contract explicitly
-records that ordinary RSI GTC
-OTO stops currently remain anchored to the entry reference; this matches the
-selected trades rather than assuming the fill-anchoring used by other equity
-entry variants. After a fill, the resolver applies that recorded ATR stop and
+records the stop-anchor policy. Historical v2 contracts retain reference
+anchoring; v3 contracts preserve the ATR distance from the final fill, matching
+RSI 1.1 production without rewriting older evidence. After a fill, the resolver
+applies that recorded ATR stop and
 the production RSI exit rule on completed daily bars; signal exits use the next
 session open and the recorded market-slippage model. Same-bar entry/stop
 ordering is marked `needs_review`, not guessed. A live GTC order remains
