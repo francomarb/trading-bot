@@ -8364,6 +8364,75 @@ class TestPostFillStopReAnchor:
         assert isinstance(engine._last_atr, dict)
 
 
+class TestFillAnchorEngineGuards:
+    """Pin the recurring repair loop's three fill-anchor safety guards."""
+
+    @staticmethod
+    def _engine(engine_factory, *, stop_price, anchor, fill=96.0):
+        old_stop = replace(
+            _open_stop_order("AAPL", stop_price),
+            order_id="attached-stop", qty=10, time_in_force="gtc",
+        )
+        snapshot = _snapshot(
+            positions={"AAPL": Position("AAPL", 10, fill, fill * 10)},
+            open_orders=[old_stop],
+        )
+        engine, broker = engine_factory(snapshot=snapshot)
+        engine._register_single_leg(strategy_name="rsi_reversion", symbol="AAPL")
+        engine.lifecycle_store = MagicMock()
+        engine.lifecycle_store.get_open_for_owner_key.return_value = SimpleNamespace(
+            position_uid="pos-rsi", sizing_model="stop_distance",
+            protection_model="broker_stop",
+        )
+        engine.lifecycle_orders_store = MagicMock()
+        engine.lifecycle_orders_store.get_all_for_position.return_value = [
+            SimpleNamespace(
+                role="entry_primary", status="filled", stop_anchor=anchor,
+                order_id="entry-order", entry_reference_price=100.0,
+                intended_stop_price=90.0, avg_fill_price=fill,
+            )
+        ]
+        engine.trade_logger.rebase_entry_stop = MagicMock(return_value=True)
+        return engine, broker, snapshot, old_stop
+
+    def test_already_correct_fill_anchored_stop_is_left_alone(
+        self, engine_factory
+    ):
+        engine, broker, snapshot, _ = self._engine(
+            engine_factory, stop_price=86.0, anchor="fill"
+        )
+
+        engine._repair_missing_protective_stops(snapshot)
+
+        broker.replace_protective_stop_with_standalone_gtc.assert_not_called()
+
+    def test_grandfathered_reference_row_is_not_repriced(self, engine_factory):
+        engine, broker, snapshot, _ = self._engine(
+            engine_factory, stop_price=90.0, anchor="reference"
+        )
+
+        engine._repair_missing_protective_stops(snapshot)
+
+        broker.replace_protective_stop_with_standalone_gtc.assert_not_called()
+        engine.trade_logger.rebase_entry_stop.assert_not_called()
+
+    def test_restored_fallback_is_not_recorded_as_reanchored(
+        self, engine_factory
+    ):
+        engine, broker, snapshot, old_stop = self._engine(
+            engine_factory, stop_price=90.0, anchor="fill"
+        )
+        broker.replace_protective_stop_with_standalone_gtc.return_value = replace(
+            old_stop, order_id="fallback-stop", stop_price=90.0,
+        )
+        engine.alerts = MagicMock()
+
+        engine._repair_missing_protective_stops(snapshot)
+
+        engine.trade_logger.rebase_entry_stop.assert_not_called()
+        engine.alerts.broker_error.assert_called_once()
+
+
 # ── TestIntradayEquityDrawdown ──────────────────────────────────────────────
 
 
