@@ -137,3 +137,32 @@ must be pre-registered, tested out of sample, and remain explainable from the
 permanent fields. Signal characteristics may be evaluated, but they must not be
 assumed predictive merely because they sound stronger. Existing order behavior
 continues unchanged until a separately reviewed ranking PR is approved.
+
+### Independent strategy evidence pools
+
+RSI, SMA, and Donchian must be evaluated separately. Their signals describe
+different events, so a characteristic that identifies a strong RSI pullback
+cannot be assumed to identify a strong crossover or breakout. Each pool should
+compare only facts available when the decision was made with later percentage
+and R outcomes:
+
+| Pool | Candidate characteristics to evaluate |
+|---|---|
+| RSI | Oversold depth, one- and three-bar decline, distance to the exit SMA, ATR%, liquidity, and same-cycle sector overlap |
+| SMA | Crossover gap, fast/slow slopes, price extension, recent return, ATR%, volume state, and sector context |
+| Donchian | Trigger excess, channel width, volume ratio, ATR%, SMA200 extension, earnings state, and sector heat |
+
+The first resolved RSI contention group is an indication, not a rule. Its two
+capacity-refused candidates finished at about +0.11R and -0.18R, while the two
+selected candidates finished at about -0.50R and -1.04R. The best outcome had
+a shallow oversold reading, low relative volatility, high liquidity, and a
+controlled pullback; the worst selected candidates showed either extreme
+oversold depth or a sharper, more volatile drop. Those observations create
+RSI-specific hypotheses to test against later contention groups. They do not
+authorize a filter or ranking formula, and they say nothing about SMA or
+Donchian candidate quality.
+
+For every pool, first accumulate repeated resolved groups, then describe which
+ex-ante characteristics consistently separate better and worse outcomes. Any
+resulting rule must be pre-registered and tested on later groups rather than
+fit and judged on the same observations.
