@@ -216,6 +216,7 @@ class TestPositionLifecycleOrdersSchema:
         "last_observed_broker_updated_at",
         "last_observed_at",
         "entry_reference_price",
+        "stop_anchor",
     }
 
     EXPECTED_INDEXES = {
@@ -283,6 +284,21 @@ class TestPolicyConstraintMigration:
 
         assert position_policy == ("stop_distance", "broker_stop")
         assert order_policy == ("stop_distance", "broker_stop")
+
+        stop_anchor = conn.execute(
+            "SELECT stop_anchor FROM position_lifecycle_orders "
+            "WHERE client_order_id='legacy-entry'"
+        ).fetchone()
+        assert stop_anchor == ("reference",)
+
+    def test_migrated_order_rejects_invalid_stop_anchor(self, tmp_db_path: str):
+        conn = self._migrated(tmp_db_path)
+
+        with pytest.raises(sqlite3.IntegrityError, match="stop anchor"):
+            conn.execute(
+                "UPDATE position_lifecycle_orders SET stop_anchor='broken' "
+                "WHERE client_order_id='legacy-entry'"
+            )
 
     @pytest.mark.parametrize(
         "sizing,protection",

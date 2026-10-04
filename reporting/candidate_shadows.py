@@ -84,7 +84,7 @@ class RSIReplayContract:
         return contract
 
     def validate(self) -> None:
-        if self.contract_version != 2:
+        if self.contract_version not in {2, 3}:
             raise ValueError(
                 f"unsupported RSI replay contract {self.contract_version}"
             )

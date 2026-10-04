@@ -116,6 +116,7 @@ class TestInsertPending:
         assert row.avg_fill_price is None
         assert row.origin_kind == "bot"
         assert row.operator_command_uid is None
+        assert row.stop_anchor == "reference"
 
     def test_captures_slippage_benchmark_provenance(
         self,

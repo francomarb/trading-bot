@@ -179,7 +179,10 @@ The live slot expresses this as `allowed_regimes=None`.
 
 Unlike the old RSI14 configuration, active RSI3 does not wait for a full RSI70 overbought print. It exits on an earlier bounce so the strategy does not drift back into a slow "wait for bigger recovery" design.
 
-RSI uses LIMIT orders for entry — price is controlled, so no fractional-share path is used (LIMIT/GTC always uses whole-share `floor()`).
+RSI uses whole-share GTC LIMIT orders. The attached OTO stop protects the order
+while it rests; after the final fill, RSI 1.1 preserves the intended 2×ATR
+distance from the actual fill by rebuilding that child as a standalone GTC
+stop. Older open positions keep their historical stop.
 
 **Watchlist:** Curated static names in `RSI_WATCHLIST` (`config/settings.py`).
 Treat the deployment guide as the runtime source of truth — the

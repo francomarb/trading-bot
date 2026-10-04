@@ -113,7 +113,7 @@ from reporting.logger import (
     single_leg_realized_slippage_bps,
 )
 from reporting.pnl import PnLTracker, max_drawdown_from_equity_path
-from risk.models import ProtectionModel, SizingModel, StrategyPauseCause
+from risk.models import ProtectionModel, SizingModel, StopAnchor, StrategyPauseCause
 from strategies.base import (
     BaseStrategy,
     MultiLegTradeRejected,
@@ -3269,6 +3269,7 @@ class TradingEngine:
             entry_trigger_price=entry_trigger_price,
             sizing_model=risk_profile.sizing_model,
             protection_model=risk_profile.protection_model,
+            stop_anchor=strategy.stop_anchor(target_symbol),
             target_notional_pct=risk_profile.target_notional_pct,
             stated_leverage_multiplier=(
                 risk_profile.stated_leverage_multiplier
@@ -9497,6 +9498,67 @@ class TradingEngine:
             stop_qty = abs(int(position.qty))
             existing = self._protective_stop_order(symbol, snapshot)
             if existing is not None:
+                try:
+                    fill_anchor = self._durable_fill_anchor_target(symbol)
+                except Exception as exc:
+                    fill_anchor = None
+                    logger.warning(
+                        f"{symbol}: durable fill-anchor lookup failed; "
+                        f"skipping fill re-anchor this cycle: {exc}"
+                    )
+                if (
+                    fill_anchor is not None
+                    and abs(float(existing.stop_price) - fill_anchor[2]) >= 0.005
+                    and stop_qty >= 1
+                ):
+                    position_uid, entry_order_id, target_stop = fill_anchor
+                    failure_key = (symbol, existing.order_id)
+                    try:
+                        rebuilt = (
+                            self.broker.replace_protective_stop_with_standalone_gtc(
+                                symbol=symbol,
+                                stop_order_id=existing.order_id,
+                                qty=stop_qty,
+                                stop_price=target_stop,
+                                fallback_stop_price=float(existing.stop_price),
+                                client_order_id_prefix=f"{owner}-fill-stop-gtc",
+                                position_uid=position_uid,
+                            )
+                        )
+                        snapshot.open_orders.remove(existing)
+                        snapshot.open_orders.append(rebuilt)
+                        actual_stop = float(rebuilt.stop_price)
+                        if abs(actual_stop - target_stop) < 0.005:
+                            self._reported_stop_rebuild_failures.discard(failure_key)
+                            logger.warning(
+                                f"{symbol}: re-anchored protective stop to fill "
+                                f"at ${target_stop:.2f}"
+                            )
+                            try:
+                                self.trade_logger.rebase_entry_stop(
+                                    order_id=entry_order_id,
+                                    new_stop_price=target_stop,
+                                )
+                            except Exception as log_exc:
+                                logger.warning(
+                                    f"{symbol}: fill-anchored broker stop is live "
+                                    f"but trade-log rebase failed: {log_exc}"
+                                )
+                        else:
+                            raise RuntimeError(
+                                f"target ${target_stop:.2f} failed; prior stop "
+                                f"restored at ${actual_stop:.2f}"
+                            )
+                    except Exception as exc:
+                        msg = f"{symbol}: fill-anchor stop rebuild failed: {exc}"
+                        if failure_key not in self._reported_stop_rebuild_failures:
+                            self._reported_stop_rebuild_failures.add(failure_key)
+                            logger.error(msg)
+                            self.risk.record_broker_error()
+                            self.alerts.broker_error(msg)
+                        else:
+                            logger.debug(f"{msg} (already reported; retrying)")
+                    continue
                 if str(existing.time_in_force or "").lower() != "day":
                     continue
                 if stop_qty < 1:
@@ -9631,6 +9693,45 @@ class TradingEngine:
                 logger.error(msg)
                 self.risk.record_broker_error()
                 self.alerts.broker_error(msg)
+
+    def _durable_fill_anchor_target(
+        self, symbol: str
+    ) -> tuple[str, str, float] | None:
+        """Return persisted final-fill stop intent for a managed position."""
+        if self.lifecycle_store is None or self.lifecycle_orders_store is None:
+            return None
+        lifecycle = self.lifecycle_store.get_open_for_owner_key(symbol)
+        if lifecycle is None:
+            return None
+        entries = [
+            row
+            for row in self.lifecycle_orders_store.get_all_for_position(
+                lifecycle.position_uid
+            )
+            if row.role == "entry_primary"
+            and row.status == "filled"
+            and row.stop_anchor == StopAnchor.FILL.value
+        ]
+        if not entries:
+            return None
+        entry = entries[-1]
+        if (
+            entry.order_id is None
+            or entry.entry_reference_price is None
+            or entry.intended_stop_price is None
+            or entry.avg_fill_price is None
+        ):
+            return None
+        offset = float(entry.entry_reference_price) - float(entry.intended_stop_price)
+        target = round(float(entry.avg_fill_price) - offset, 2)
+        if offset <= 0 or target <= 0 or target >= float(entry.avg_fill_price):
+            logger.error(
+                f"{symbol}: invalid durable fill-anchor intent "
+                f"(reference={entry.entry_reference_price}, "
+                f"fill={entry.avg_fill_price}, stop={entry.intended_stop_price})"
+            )
+            return None
+        return lifecycle.position_uid, entry.order_id, target
 
     def _reconstruct_missing_entry_context(
         self,

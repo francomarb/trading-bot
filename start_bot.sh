@@ -36,8 +36,8 @@ fi
 
 CMD="source venv/bin/activate && python forward_test.py"
 if [[ "$(uname)" == "Darwin" ]]; then
-    CMD="source venv/bin/activate && caffeinate -s python forward_test.py"
-    echo "  caffeinate -s prevents idle sleep while the bot runs (macOS)."
+    CMD="source venv/bin/activate && caffeinate -i -s python forward_test.py"
+    echo "  caffeinate -i -s prevents idle sleep on battery or AC while the bot runs (macOS)."
 fi
 
 tmux new-session -d -s "$SESSION" "$CMD"

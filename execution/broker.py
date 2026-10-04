@@ -705,6 +705,7 @@ class AlpacaBroker:
                 slippage_benchmark_timestamp=slippage_benchmark_timestamp,
                 slippage_measurement_quality=slippage_measurement_quality,
                 entry_reference_price=float(decision.entry_reference_price),
+                stop_anchor=decision.stop_anchor,
             )
         except Exception as exc:
             # Roll back the position-level pending row so the owner-key
@@ -1934,9 +1935,7 @@ class AlpacaBroker:
             )
 
         order_id = str(order.id)
-        capped_stop_leg_id = None
-        if decision.entry_max_price is not None:
-            capped_stop_leg_id = self._find_stop_leg_id(order)
+        attached_stop_leg_id = self._find_stop_leg_id(order)
 
         # Foundation commit 6 — populate the substrate row's broker-assigned
         # order_id immediately on submit return so the WebSocket / cycle
@@ -2002,19 +2001,13 @@ class AlpacaBroker:
                 error=e,
             )
         if (
-            decision.entry_max_price is not None
+            (
+                decision.entry_max_price is not None
+                or decision.stop_anchor.value == "fill"
+            )
             and result.status is OrderStatus.FILLED
         ):
             try:
-                if capped_stop_leg_id is None:
-                    parent = self._with_retry(
-                        lambda: self._api.get_order_by_id(
-                            order_id,
-                            GetOrderByIdRequest(nested=True),
-                        ),
-                        op_desc=f"get_nested_order({order_id})",
-                    )
-                    capped_stop_leg_id = self._find_stop_leg_id(parent)
                 # Alpaca-verified 2026-07-09: OTO child stops cannot be
                 # promoted in-place by changing time_in_force. Rebuild the
                 # durable protection as a standalone GTC stop after the DAY
@@ -2023,23 +2016,42 @@ class AlpacaBroker:
                 # is confirmed, so re-anchor to the real entry while we
                 # are replacing the order anyway.
                 rebuilt_stop = decision.stop_for_fill(result.avg_fill_price)
-                self.replace_day_stop_with_standalone_gtc(
-                    symbol=decision.symbol,
-                    stop_order_id=capped_stop_leg_id,
-                    qty=result.filled_qty,
-                    stop_price=rebuilt_stop,
-                    client_order_id_prefix="equity-stop-gtc",
-                    position_uid=position_uid,
+                needs_durable_rebuild = decision.entry_max_price is not None
+                needs_price_reanchor = (
+                    abs(float(rebuilt_stop) - float(decision.stop_price)) >= 0.005
                 )
-                # Only on success — a failed rebuild leaves the original
-                # OTO child in place, and the log must say so.
-                placed_stop = float(rebuilt_stop)
+                if needs_durable_rebuild or needs_price_reanchor:
+                    if attached_stop_leg_id is None:
+                        parent = self._with_retry(
+                            lambda: self._api.get_order_by_id(
+                                order_id,
+                                GetOrderByIdRequest(nested=True),
+                            ),
+                            op_desc=f"get_nested_order({order_id})",
+                        )
+                        attached_stop_leg_id = self._find_stop_leg_id(parent)
+                    rebuilt = self.replace_protective_stop_with_standalone_gtc(
+                        symbol=decision.symbol,
+                        stop_order_id=attached_stop_leg_id,
+                        qty=result.filled_qty,
+                        stop_price=rebuilt_stop,
+                        fallback_stop_price=float(decision.stop_price),
+                        client_order_id_prefix="equity-stop-gtc",
+                        position_uid=position_uid,
+                    )
+                    # Report the stop that actually survived: either the target
+                    # or the restored fallback returned by the helper.
+                    placed_stop = float(rebuilt.stop_price)
             except Exception as exc:
                 # The entry is already filled. Preserve the truthful fill result
                 # and let engine reconciliation retry durable-stop rebuild.
+                # The attached child may already have been canceled before both
+                # target and fallback submissions failed, so do not report the
+                # old level as live.
+                placed_stop = None
                 logger.error(
-                    f"{decision.symbol}: capped entry filled but attached stop "
-                    f"GTC rebuild failed: {exc}"
+                    f"{decision.symbol}: filled entry but attached stop GTC "
+                    f"rebuild failed: {exc}"
                 )
         # Lifecycle: best-effort fill transition. Returns the result
         # with position_uid attached so the engine can pass it to
@@ -3059,7 +3071,29 @@ class AlpacaBroker:
         client_order_id_prefix: str = "equity-stop-gtc",
         position_uid: str | None = None,
     ) -> OpenOrder:
-        """Replace an attached DAY stop with a standalone GTC stop.
+        """Replace an attached DAY stop with a standalone GTC stop."""
+        return self.replace_protective_stop_with_standalone_gtc(
+            symbol=symbol,
+            stop_order_id=stop_order_id,
+            qty=qty,
+            stop_price=stop_price,
+            fallback_stop_price=stop_price,
+            client_order_id_prefix=client_order_id_prefix,
+            position_uid=position_uid,
+        )
+
+    def replace_protective_stop_with_standalone_gtc(
+        self,
+        *,
+        symbol: str,
+        stop_order_id: str,
+        qty: float,
+        stop_price: float,
+        fallback_stop_price: float,
+        client_order_id_prefix: str = "equity-stop-gtc",
+        position_uid: str | None = None,
+    ) -> OpenOrder:
+        """Replace an exact protective stop, restoring the old level on failure.
 
         Verified against Alpaca docs/SDK on 2026-07-09: advanced OTO child
         orders cannot be promoted by changing ``time_in_force`` via replace.
@@ -3076,26 +3110,50 @@ class AlpacaBroker:
             raise BrokerError(
                 f"equity stop rebuild requires positive stop price: {stop_price}"
             )
+        if fallback_stop_price <= 0:
+            raise BrokerError(
+                "equity stop rebuild requires positive fallback stop price: "
+                f"{fallback_stop_price}"
+            )
         if not stop_order_id:
             raise BrokerError("equity stop rebuild requires existing stop order id")
 
         logger.warning(
-            f"rebuilding DAY protective stop {stop_order_id} as standalone GTC: "
+            f"rebuilding protective stop {stop_order_id} as standalone GTC: "
             f"sell {whole_qty} {symbol} @ ${stop_price:.2f}"
         )
         if not self.cancel_order(stop_order_id):
             raise BrokerError(
-                f"could not cancel DAY protective stop {stop_order_id}"
+                f"could not cancel protective stop {stop_order_id}"
             )
         if self._stream_manager is not None:
             self._stream_manager.unregister_stop_leg(stop_order_id)
-        return self.place_protective_stop(
-            symbol=symbol,
-            qty=whole_qty,
-            stop_price=stop_price,
-            client_order_id_prefix=client_order_id_prefix,
-            position_uid=position_uid,
-        )
+        try:
+            return self.place_protective_stop(
+                symbol=symbol,
+                qty=whole_qty,
+                stop_price=stop_price,
+                client_order_id_prefix=client_order_id_prefix,
+                position_uid=position_uid,
+            )
+        except Exception as primary_exc:
+            logger.critical(
+                f"{symbol}: replacement stop @ ${stop_price:.2f} failed after "
+                f"cancel; restoring prior protection @ ${fallback_stop_price:.2f}"
+            )
+            try:
+                return self.place_protective_stop(
+                    symbol=symbol,
+                    qty=whole_qty,
+                    stop_price=fallback_stop_price,
+                    client_order_id_prefix=f"{client_order_id_prefix}-fallback",
+                    position_uid=position_uid,
+                )
+            except Exception as fallback_exc:
+                raise BrokerError(
+                    f"replacement stop failed ({primary_exc}); restoration also "
+                    f"failed ({fallback_exc})"
+                ) from fallback_exc
 
     def submit_option_gtc_stop(
         self,

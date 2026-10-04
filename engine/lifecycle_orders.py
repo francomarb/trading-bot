@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Sequence
 
-from risk.models import ProtectionModel, SizingModel
+from risk.models import ProtectionModel, SizingModel, StopAnchor
 from utils.option_symbols import is_occ_option
 
 
@@ -129,6 +129,7 @@ CREATE TABLE IF NOT EXISTS position_lifecycle_orders (
     -- passive LIMIT / STOP_LIMIT entries have no arrival benchmark but still
     -- have a genuine strategy reference price.
     entry_reference_price         REAL,
+    stop_anchor                  TEXT NOT NULL DEFAULT 'reference',
 
     FOREIGN KEY(position_uid) REFERENCES position_lifecycle(position_uid),
     CHECK (
@@ -137,6 +138,7 @@ CREATE TABLE IF NOT EXISTS position_lifecycle_orders (
     ),
     CHECK (sizing_model IS NULL OR sizing_model IN ('stop_distance', 'notional', 'defined_max_loss')),
     CHECK (protection_model IS NULL OR protection_model IN ('broker_stop', 'signal_exit_only')),
+    CHECK (stop_anchor IN ('reference', 'fill')),
     CHECK (
         role NOT IN ('entry_primary', 'entry_residual')
         OR (sizing_model = 'stop_distance' AND protection_model = 'broker_stop')
@@ -206,6 +208,24 @@ _CREATE_POSITION_LIFECYCLE_ORDERS_POLICY_TRIGGERS_SQL = (
       )
     BEGIN
         SELECT RAISE(ABORT, 'invalid lifecycle order risk policy');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_lifecycle_orders_stop_anchor_insert
+    BEFORE INSERT ON position_lifecycle_orders
+    FOR EACH ROW
+    WHEN NEW.stop_anchor NOT IN ('reference', 'fill')
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid lifecycle order stop anchor');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_lifecycle_orders_stop_anchor_update
+    BEFORE UPDATE OF stop_anchor ON position_lifecycle_orders
+    FOR EACH ROW
+    WHEN NEW.stop_anchor NOT IN ('reference', 'fill')
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid lifecycle order stop anchor');
     END
     """,
 )
@@ -716,6 +736,7 @@ class PositionLifecycleOrderRow:
     last_observed_broker_updated_at: str | None
     last_observed_at: str
     entry_reference_price: float | None
+    stop_anchor: str
 
 
 _SELECT_LIFECYCLE_ORDER_COLUMNS = (
@@ -734,7 +755,7 @@ _SELECT_LIFECYCLE_ORDER_COLUMNS = (
     "status, filled_qty, avg_fill_price, "
     "created_at, submitted_at, terminal_at, "
     "last_observed_broker_updated_at, last_observed_at, "
-    "entry_reference_price "
+    "entry_reference_price, stop_anchor "
     "FROM position_lifecycle_orders"
 )
 
@@ -783,6 +804,7 @@ def _row_from_tuple(row: tuple) -> PositionLifecycleOrderRow:
         last_observed_broker_updated_at=row[39],
         last_observed_at=row[40],
         entry_reference_price=row[41],
+        stop_anchor=row[42],
     )
 
 
@@ -853,6 +875,7 @@ class PositionLifecycleOrdersStore:
         slippage_benchmark_timestamp: str | None = None,
         slippage_measurement_quality: str | None = None,
         entry_reference_price: float | None = None,
+        stop_anchor: StopAnchor = StopAnchor.REFERENCE,
     ) -> int:
         """Insert a per-order row at ``status='pending'`` BEFORE the
         broker submit goes out. Returns the autoincrement id.
@@ -881,6 +904,8 @@ class PositionLifecycleOrdersStore:
             raise ValueError(
                 f"intended_qty must be positive; got {intended_qty}"
             )
+        if not isinstance(stop_anchor, StopAnchor):
+            raise ValueError(f"invalid stop_anchor: {stop_anchor!r}")
         if role in ENTRY_SIDE_ROLES:
             sizing_model = sizing_model or SizingModel.STOP_DISTANCE
             protection_model = protection_model or ProtectionModel.BROKER_STOP
@@ -913,7 +938,7 @@ class PositionLifecycleOrdersStore:
                 status, filled_qty, avg_fill_price,
                 created_at, submitted_at, terminal_at,
                 last_observed_broker_updated_at, last_observed_at,
-                entry_reference_price
+                entry_reference_price, stop_anchor
             ) VALUES (
                 ?, ?,
                 NULL, ?,
@@ -926,7 +951,7 @@ class PositionLifecycleOrdersStore:
                 ?, ?, ?, ?,
                 'pending', 0.0, NULL,
                 ?, NULL, NULL,
-                NULL, ?, ?
+                NULL, ?, ?, ?
             )
             """,
             (
@@ -951,7 +976,7 @@ class PositionLifecycleOrdersStore:
                 origin_kind, operator_command_uid,
                 slippage_benchmark_price, slippage_benchmark_kind,
                 slippage_benchmark_timestamp, slippage_measurement_quality,
-                now, now, entry_reference_price,
+                now, now, entry_reference_price, stop_anchor.value,
             ),
         )
         self._conn.commit()
@@ -1413,7 +1438,7 @@ class PositionLifecycleOrdersStore:
                    plo.status, plo.filled_qty, plo.avg_fill_price,
                    plo.created_at, plo.submitted_at, plo.terminal_at,
                    plo.last_observed_broker_updated_at, plo.last_observed_at,
-                   plo.entry_reference_price
+                   plo.entry_reference_price, plo.stop_anchor
             FROM position_lifecycle_orders plo
             JOIN position_lifecycle pl ON pl.position_uid = plo.position_uid
             WHERE pl.position_type = 'spread'
@@ -1518,7 +1543,7 @@ class PositionLifecycleOrdersStore:
             "plo.status, plo.filled_qty, plo.avg_fill_price, "
             "plo.created_at, plo.submitted_at, plo.terminal_at, "
             "plo.last_observed_broker_updated_at, plo.last_observed_at, "
-            "plo.entry_reference_price "
+            "plo.entry_reference_price, plo.stop_anchor "
             "FROM position_lifecycle_orders plo "
             "JOIN position_lifecycle pl "
             "  ON pl.position_uid = plo.position_uid "

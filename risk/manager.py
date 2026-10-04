@@ -59,7 +59,7 @@ from typing import Deque
 from loguru import logger
 
 from config import settings
-from risk.models import ProtectionModel, SizingModel, StrategyPauseCause
+from risk.models import ProtectionModel, SizingModel, StopAnchor, StrategyPauseCause
 from strategies.base import OrderType
 
 
@@ -205,6 +205,7 @@ class Signal:
     # stop-distance defaults; stopless strategies must opt in explicitly.
     sizing_model: SizingModel = SizingModel.STOP_DISTANCE
     protection_model: ProtectionModel = ProtectionModel.BROKER_STOP
+    stop_anchor: StopAnchor = StopAnchor.REFERENCE
     # Requested account-equity slice for NOTIONAL sizing. RiskManager applies
     # every universal cash, sleeve, concentration, gross, and halt cap after
     # this request; the strategy never approves its own final size.
@@ -296,6 +297,7 @@ class RiskDecision:
     entry_regime: str | None = None
     sizing_model: SizingModel = SizingModel.STOP_DISTANCE
     protection_model: ProtectionModel = ProtectionModel.BROKER_STOP
+    stop_anchor: StopAnchor = StopAnchor.REFERENCE
     approved_notional_dollars: float | None = None
     stated_leverage_multiplier: float = 1.0
     stress_exposure_multiplier: float = 1.0
@@ -1731,6 +1733,7 @@ class RiskManager:
             applied_size_multiplier=applied_size_multiplier,
             sizing_model=signal.sizing_model,
             protection_model=signal.protection_model,
+            stop_anchor=signal.stop_anchor,
             approved_notional_dollars=approved_notional,
             stated_leverage_multiplier=signal.stated_leverage_multiplier,
             stress_exposure_multiplier=signal.stress_exposure_multiplier,

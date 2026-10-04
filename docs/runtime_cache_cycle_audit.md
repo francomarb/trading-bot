@@ -162,6 +162,43 @@ An isolated temporary-directory failure probe confirmed the code-level analysis:
 
 No production cache was altered for these probes.
 
+### 2.5 Post-promotion observation through 2026-10-03
+
+After the SMA durable pool increased the engine to 260 slot-symbol evaluations,
+85 market-open cycles completed at 27.6 seconds median and 47.7 seconds p95.
+Four exceeded 60 seconds and two exceeded 300 seconds; the maximum was 485.2
+seconds. No genuine provider 429 appeared. Normal warmed operation therefore
+remains acceptable, while the long tail still supports the bounded-retry,
+deadline, and telemetry work below. These statistics cover only cycles that
+ran; they do not establish continuous market-hour coverage.
+
+Every post-promotion session through 2026-10-02 had substantial gaps in which
+no engine cycle started. PR #171 was deployed after market on 2026-10-01, so it
+could directly flag only the Oct 2 gaps:
+
+| Session | Market-open cycles | Market minutes inside gaps over 15 minutes |
+|---|---:|---:|
+| 2026-09-29 | 11 | 322 / 390 |
+| 2026-09-30 | 24 | 266 / 390 |
+| 2026-10-01 | 10 | 333 / 390 |
+| 2026-10-02 | 40 | 167 / 390 |
+
+The macOS power log resolves these historical gaps: it records repeated idle
+sleep and dark-wake periods overlapping the missing cycles, primarily while the
+laptop was on battery. Stream messages during some gaps came from brief
+maintenance wakes and do not demonstrate continuous runtime. After the full
+wake on October 2, the engine detected the wall-clock gap, completed one slow
+recovery cycle, and then returned to its normal five-minute cadence through the
+close. No cycle-scheduler defect was demonstrated.
+
+The launcher previously used `caffeinate -s`, whose system-sleep assertion is
+valid only on AC power. It now uses `caffeinate -i -s`: `-i` prevents ordinary
+idle sleep on battery or AC, while `-s` retains the stronger AC assertion.
+Clamshell sleep, depleted power, deliberate sleep or shutdown, and connectivity
+loss remain accepted limitations of a laptop paper runtime. Wall-clock gap
+detection continues to disclose their effect on evidence coverage; production
+availability belongs to the deferred VPS/systemd work, not to this local audit.
+
 ## 3. Runtime data-path inventory
 
 | Path | Source of truth and key | Current freshness / retry contract | Durability and failure posture | Assessment |

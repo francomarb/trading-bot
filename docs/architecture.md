@@ -552,10 +552,16 @@ A thin wrapper (`AlpacaBroker`) around `alpaca-py`'s `TradingClient`. Translates
 
 | Path | Condition | TIF | Stop |
 |---|---|---|---|
-| OTO GTC | Whole-share MARKET or LIMIT | GTC | Attached stop-loss leg (OTO bracket) |
+| OTO GTC | Whole-share MARKET or LIMIT | GTC | Attached stop-loss leg; fill-anchored policies rebuild it as standalone GTC after the final fill |
 | Fractional DAY | `FRACTIONAL_ENABLED=True` and `floor(qty) ≠ qty` | DAY | Standalone GTC stop submitted after fill confirmation |
 
 **Fractional shares (`FRACTIONAL_ENABLED`):** Alpaca fractional orders require DAY TIF and cannot use OTO order class. The broker routes fractional quantities to `_place_fractional_order()`: DAY market entry first, then a standalone GTC stop for `floor(qty)` whole shares after confirmed fill. If `floor(qty) == 0` (qty < 1 share), no stop is submitted and the position exits via engine signals. Disable `FRACTIONAL_ENABLED` once the account exceeds ~$10k.
+
+RSI 1.1 uses a fill-anchored stop policy. Its OTO child protects the resting
+GTC LIMIT immediately; after a final fill the bot cancels that exact child and
+submits a standalone GTC stop at `fill − (reference − intended stop)`. The
+policy is stored on the entry-order lifecycle row so restart reconciliation can
+finish the same operation. Existing rows default to reference anchoring.
 
 #### Options order path (`execution/options_executor.py`)
 

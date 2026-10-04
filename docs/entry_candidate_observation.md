@@ -81,10 +81,12 @@ return/R, and favorable/adverse excursion through
 a refused candidate because allocation never approved a quantity.
 
 The table is a work queue, not a claim that an untraded position earned or lost
-money. There is deliberately no generic resolver: equity, single-leg option,
-and MLEG fills/exits have different semantics, and applying one price horizon
-would create misleading evidence. RSI is the only supported resolver because
-it is the only strategy with a real contention group so far.
+money. There is deliberately no generic resolver: even equity strategies have
+different entry, protection, and exit semantics, and applying one price horizon
+would create misleading evidence. RSI remains the only supported resolver
+because it was the first observed contention case. SMA and Donchian contention
+groups now exist and require their own reviewed replay contracts before their
+refused candidates can be resolved.
 
 The RSI resolver is an explicit offline command:
 
@@ -108,10 +110,10 @@ unless its open proves a pre-cleanup fill; an in-progress boundary session stays
 `awaiting_fill`, because daily resolution cannot invent the ordering. A legacy candidate's exact TIF is recovered from
 the selected peer's durable entry-order row, while its historical configured
 age default is parsed from its immutable commit. The replay contract explicitly
-records that ordinary RSI GTC
-OTO stops currently remain anchored to the entry reference; this matches the
-selected trades rather than assuming the fill-anchoring used by other equity
-entry variants. After a fill, the resolver applies that recorded ATR stop and
+records the stop-anchor policy. Historical v2 contracts retain reference
+anchoring; v3 contracts preserve the ATR distance from the final fill, matching
+RSI 1.1 production without rewriting older evidence. After a fill, the resolver
+applies that recorded ATR stop and
 the production RSI exit rule on completed daily bars; signal exits use the next
 session open and the recorded market-slippage model. Same-bar entry/stop
 ordering is marked `needs_review`, not guessed. A live GTC order remains
@@ -135,3 +137,56 @@ must be pre-registered, tested out of sample, and remain explainable from the
 permanent fields. Signal characteristics may be evaluated, but they must not be
 assumed predictive merely because they sound stronger. Existing order behavior
 continues unchanged until a separately reviewed ranking PR is approved.
+
+### Independent strategy evidence pools
+
+RSI, SMA, and Donchian must be evaluated separately. Their signals describe
+different events, so a characteristic that identifies a strong RSI pullback
+cannot be assumed to identify a strong crossover or breakout. Each pool should
+compare only facts available when the decision was made with later percentage
+and R outcomes. Outcome quality is broader than the final winner label: include
+whether the order would fill, terminal R, favorable/adverse excursion, time to
+resolution, and stop-versus-signal exit when the strategy resolver can establish
+them truthfully.
+
+| Pool | Candidate characteristics to evaluate |
+|---|---|
+| RSI | Oversold depth, one- and three-bar decline, distance to the exit SMA, ATR%, liquidity, and same-cycle sector overlap |
+| SMA | Crossover gap, fast/slow slopes, price extension, recent return, ATR%, volume state, and sector context |
+| Donchian | Trigger excess, channel width, volume ratio, ATR%, SMA200 extension, earnings state, and sector heat |
+
+These are starting fields, not an approved model or an exhaustive list. Review
+may reveal a useful characteristic that is not currently recorded. When that
+happens, first define why it is available at decision time, add it prospectively
+under a new feature-schema version, and collect later groups. Do not invent a
+historical value or silently reconstruct it with information the engine did not
+have at the time.
+
+Every strategy pool must also be segmented by the regime recorded on the
+candidate decision. A characteristic associated with stronger outcomes in an
+allowed RANGING entry cannot be assumed to behave the same way in TRENDING or
+VOLATILE conditions. Reports should show contention-group count, resolved
+candidate count, and outcomes by regime before pooling them. Sparse regime
+evidence remains explicitly inconclusive; it is not combined merely to reach a
+larger sample.
+
+The first resolved RSI contention group is an indication, not a rule. Its two
+capacity-refused candidates finished at about +0.11R and -0.18R, while the two
+selected candidates finished at about -0.50R and -1.04R. The best outcome had
+a shallow oversold reading, low relative volatility, high liquidity, and a
+controlled pullback; the worst selected candidates showed either extreme
+oversold depth or a sharper, more volatile drop. Those observations create
+RSI-specific hypotheses to test against later contention groups. They do not
+authorize a filter or ranking formula, and they say nothing about SMA or
+Donchian candidate quality.
+
+For every pool, first accumulate repeated resolved groups, then describe which
+ex-ante characteristics consistently separate better and worse outcomes. Any
+resulting rule must be pre-registered and tested on later groups rather than
+fit and judged on the same observations.
+
+The final `11.61` deliverable is an evidence-backed profile of what the
+consistently better-ranked candidates look like for each strategy in each
+regime that strategy is allowed to trade, including the supporting sample size
+and remaining uncertainty. That profile is the basis for an actionable ranking
+proposal; observation alone does not change production ordering.
