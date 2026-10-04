@@ -183,14 +183,21 @@ could directly flag only the Oct 2 gaps:
 | 2026-10-01 | 10 | 333 / 390 |
 | 2026-10-02 | 40 | 167 / 390 |
 
-The process remained present and its stream thread logged during portions of
-the gaps, while the main cycle scheduler did not start another cycle. The root
-cause remains unproven. One diagnostic lead is that macOS documents
-`caffeinate -s` as preventing system sleep only on AC power; the host's power
-state during these sessions is unknown. Main-thread blocking and other
-scheduler/host-continuity causes must remain in scope. Until diagnosed, these
-gaps weaken every paper evidence stream and collection cannot be described as
-continuous.
+The macOS power log resolves these historical gaps: it records repeated idle
+sleep and dark-wake periods overlapping the missing cycles, primarily while the
+laptop was on battery. Stream messages during some gaps came from brief
+maintenance wakes and do not demonstrate continuous runtime. After the full
+wake on October 2, the engine detected the wall-clock gap, completed one slow
+recovery cycle, and then returned to its normal five-minute cadence through the
+close. No cycle-scheduler defect was demonstrated.
+
+The launcher previously used `caffeinate -s`, whose system-sleep assertion is
+valid only on AC power. It now uses `caffeinate -i -s`: `-i` prevents ordinary
+idle sleep on battery or AC, while `-s` retains the stronger AC assertion.
+Clamshell sleep, depleted power, deliberate sleep or shutdown, and connectivity
+loss remain accepted limitations of a laptop paper runtime. Wall-clock gap
+detection continues to disclose their effect on evidence coverage; production
+availability belongs to the deferred VPS/systemd work, not to this local audit.
 
 ## 3. Runtime data-path inventory
 

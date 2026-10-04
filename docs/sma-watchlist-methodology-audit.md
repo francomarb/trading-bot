@@ -278,8 +278,8 @@ Runtime disposition:
    exceeded 300 seconds. No genuine 429 was observed. Long-tail latency and
    request telemetry remain tracked under `11.71` rather than blocking the
    promoted pool. These figures describe only completed cycles that ran; the
-   separate scheduler/host-continuity gaps mean market-hour coverage was not
-   continuous.
+   historical market-hour coverage gaps were later reconciled to macOS laptop
+   sleep rather than a demonstrated scheduler defect.
 8. Treat the promoted list as a new strategy-config-hash paper cohort. Do not
    pool pre- and post-refresh outcomes as one exact configuration.
 9. Segment Donchian and RSI discussion at the same promotion date because
