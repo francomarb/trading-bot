@@ -81,10 +81,12 @@ return/R, and favorable/adverse excursion through
 a refused candidate because allocation never approved a quantity.
 
 The table is a work queue, not a claim that an untraded position earned or lost
-money. There is deliberately no generic resolver: equity, single-leg option,
-and MLEG fills/exits have different semantics, and applying one price horizon
-would create misleading evidence. RSI is the only supported resolver because
-it is the only strategy with a real contention group so far.
+money. There is deliberately no generic resolver: even equity strategies have
+different entry, protection, and exit semantics, and applying one price horizon
+would create misleading evidence. RSI remains the only supported resolver
+because it was the first observed contention case. SMA and Donchian contention
+groups now exist and require their own reviewed replay contracts before their
+refused candidates can be resolved.
 
 The RSI resolver is an explicit offline command:
 

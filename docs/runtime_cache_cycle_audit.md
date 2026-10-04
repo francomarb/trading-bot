@@ -162,6 +162,21 @@ An isolated temporary-directory failure probe confirmed the code-level analysis:
 
 No production cache was altered for these probes.
 
+### 2.5 Post-promotion observation through 2026-10-03
+
+After the SMA durable pool increased the engine to 260 slot-symbol evaluations,
+85 market-open cycles completed at 27.6 seconds median and 47.7 seconds p95.
+Four exceeded 60 seconds and two exceeded 300 seconds; the maximum was 485.2
+seconds. No genuine provider 429 appeared. Normal warmed operation therefore
+remains acceptable, while the long tail still supports the bounded-retry,
+deadline, and telemetry work below.
+
+PR #171 separately exposed wall-clock sleep gaps. On 2026-10-02 the local host
+missed market-hour cycles despite the bot and `caffeinate -s` running. This is a
+host-continuity problem rather than symbol-processing latency, but it weakens
+paper evidence in the same way and must be diagnosed before treating collection
+as continuous.
+
 ## 3. Runtime data-path inventory
 
 | Path | Source of truth and key | Current freshness / retry contract | Durability and failure posture | Assessment |
