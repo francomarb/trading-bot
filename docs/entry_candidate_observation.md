@@ -144,13 +144,31 @@ RSI, SMA, and Donchian must be evaluated separately. Their signals describe
 different events, so a characteristic that identifies a strong RSI pullback
 cannot be assumed to identify a strong crossover or breakout. Each pool should
 compare only facts available when the decision was made with later percentage
-and R outcomes:
+and R outcomes. Outcome quality is broader than the final winner label: include
+whether the order would fill, terminal R, favorable/adverse excursion, time to
+resolution, and stop-versus-signal exit when the strategy resolver can establish
+them truthfully.
 
 | Pool | Candidate characteristics to evaluate |
 |---|---|
 | RSI | Oversold depth, one- and three-bar decline, distance to the exit SMA, ATR%, liquidity, and same-cycle sector overlap |
 | SMA | Crossover gap, fast/slow slopes, price extension, recent return, ATR%, volume state, and sector context |
 | Donchian | Trigger excess, channel width, volume ratio, ATR%, SMA200 extension, earnings state, and sector heat |
+
+These are starting fields, not an approved model or an exhaustive list. Review
+may reveal a useful characteristic that is not currently recorded. When that
+happens, first define why it is available at decision time, add it prospectively
+under a new feature-schema version, and collect later groups. Do not invent a
+historical value or silently reconstruct it with information the engine did not
+have at the time.
+
+Every strategy pool must also be segmented by the regime recorded on the
+candidate decision. A characteristic associated with stronger outcomes in an
+allowed RANGING entry cannot be assumed to behave the same way in TRENDING or
+VOLATILE conditions. Reports should show contention-group count, resolved
+candidate count, and outcomes by regime before pooling them. Sparse regime
+evidence remains explicitly inconclusive; it is not combined merely to reach a
+larger sample.
 
 The first resolved RSI contention group is an indication, not a rule. Its two
 capacity-refused candidates finished at about +0.11R and -0.18R, while the two
