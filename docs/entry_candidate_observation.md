@@ -184,3 +184,9 @@ For every pool, first accumulate repeated resolved groups, then describe which
 ex-ante characteristics consistently separate better and worse outcomes. Any
 resulting rule must be pre-registered and tested on later groups rather than
 fit and judged on the same observations.
+
+The final `11.61` deliverable is an evidence-backed profile of what the
+consistently better-ranked candidates look like for each strategy in each
+regime that strategy is allowed to trade, including the supporting sample size
+and remaining uncertainty. That profile is the basis for an actionable ranking
+proposal; observation alone does not change production ordering.
