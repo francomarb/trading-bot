@@ -8203,6 +8203,52 @@ class TestPostFillStopReAnchor:
         kwargs = broker.replace_day_stop_with_standalone_gtc.call_args.kwargs
         assert kwargs["stop_price"] == 95.0
 
+    def test_repair_finishes_persisted_fill_anchor_after_restart(
+        self, engine_factory
+    ):
+        """A final fill observed after restart must not keep the GTC child
+        at its reference-derived price just because ownership is restored."""
+        old_stop = replace(
+            _open_stop_order("AAPL", 90.0),
+            order_id="attached-stop", qty=10, time_in_force="gtc",
+        )
+        new_stop = replace(
+            old_stop, order_id="fill-stop", stop_price=86.0,
+        )
+        snapshot = _snapshot(
+            positions={"AAPL": Position("AAPL", 10, 96.0, 960.0)},
+            open_orders=[old_stop],
+        )
+        engine, broker = engine_factory(snapshot=snapshot)
+        engine._register_single_leg(strategy_name="rsi_reversion", symbol="AAPL")
+        engine.lifecycle_store = MagicMock()
+        engine.lifecycle_store.get_open_for_owner_key.return_value = SimpleNamespace(
+            position_uid="pos-rsi", sizing_model="stop_distance",
+            protection_model="broker_stop",
+        )
+        engine.lifecycle_orders_store = MagicMock()
+        engine.lifecycle_orders_store.get_all_for_position.return_value = [
+            SimpleNamespace(
+                role="entry_primary", status="filled", stop_anchor="fill",
+                order_id="entry-order", entry_reference_price=100.0,
+                intended_stop_price=90.0, avg_fill_price=96.0,
+            )
+        ]
+        broker.replace_protective_stop_with_standalone_gtc.return_value = new_stop
+        engine.trade_logger.rebase_entry_stop = MagicMock(return_value=True)
+
+        engine._repair_missing_protective_stops(snapshot)
+
+        kwargs = (
+            broker.replace_protective_stop_with_standalone_gtc.call_args.kwargs
+        )
+        assert kwargs["stop_order_id"] == "attached-stop"
+        assert kwargs["stop_price"] == pytest.approx(86.0)
+        assert kwargs["fallback_stop_price"] == pytest.approx(90.0)
+        engine.trade_logger.rebase_entry_stop.assert_called_once_with(
+            order_id="entry-order", new_stop_price=86.0,
+        )
+
     def test_substrate_reconstructed_decision_still_re_anchors(self, engine_factory):
         """The production shape, which an earlier attempt could not handle.
 

@@ -901,6 +901,7 @@ class TradeLogger:
             }
             for column, definition in {
                 "entry_reference_price": "REAL",
+                "stop_anchor": "TEXT NOT NULL DEFAULT 'reference'",
                 "sizing_model": "TEXT",
                 "protection_model": "TEXT",
                 "approved_notional_dollars": "REAL",

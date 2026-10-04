@@ -21,6 +21,13 @@ class ProtectionModel(str, Enum):
     SIGNAL_EXIT_ONLY = "signal_exit_only"
 
 
+class StopAnchor(str, Enum):
+    """Price basis used to preserve a stopped entry's intended distance."""
+
+    REFERENCE = "reference"
+    FILL = "fill"
+
+
 class StrategyPauseCause(str, Enum):
     """Independent durable latches that can block strategy entries."""
 

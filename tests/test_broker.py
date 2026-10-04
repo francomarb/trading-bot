@@ -50,7 +50,7 @@ from risk.manager import (
     RiskDecision,
     Side,
 )
-from risk.models import ProtectionModel, SizingModel
+from risk.models import ProtectionModel, SizingModel, StopAnchor
 from reporting.logger import TradeLogger
 from strategies.base import OrderType
 
@@ -86,6 +86,7 @@ def _decision(
     strategy: str = "sma_crossover",
     entry_max_price: float | None = None,
     entry_trigger_price: float | None = None,
+    stop_anchor: StopAnchor = StopAnchor.REFERENCE,
 ) -> RiskDecision:
     return RiskDecision(
         symbol=symbol,
@@ -99,6 +100,7 @@ def _decision(
         limit_price=limit_price,
         entry_max_price=entry_max_price,
         entry_trigger_price=entry_trigger_price,
+        stop_anchor=stop_anchor,
     )
 
 
@@ -2107,6 +2109,64 @@ class TestFractionalOrders:
         assert req.order_class.value == "oto"
         assert req.stop_loss.stop_price == 96.0
 
+    def test_fill_anchored_whole_share_limit_rebuilds_gtc_stop(self):
+        stop_leg = _alpaca_order(
+            id="attached-stop", status="new", side="sell", type="stop",
+            stop_price="90.0", time_in_force="gtc", legs=None,
+        )
+        parent = _alpaca_order(
+            id="entry", status="filled", filled_qty=10,
+            filled_avg_price=96.0, type="limit", limit_price="100.0",
+            legs=[stop_leg],
+        )
+        replacement = _alpaca_order(
+            id="standalone-stop", status="new", side="sell", type="stop",
+            stop_price="86.0", time_in_force="gtc",
+        )
+        api = MagicMock()
+        api.submit_order.side_effect = [parent, replacement]
+        api.get_order_by_id.return_value = parent
+        broker = _broker_with_mock(api)
+
+        result = broker.place_order(
+            _decision(
+                entry=100.0, stop=90.0, order_type=OrderType.LIMIT,
+                limit_price=100.0, strategy="rsi_reversion",
+                stop_anchor=StopAnchor.FILL,
+            ),
+            poll_timeout=0.1,
+        )
+
+        api.cancel_order_by_id.assert_called_once_with("attached-stop")
+        replacement_request = api.submit_order.call_args_list[1].args[0]
+        assert replacement_request.stop_price == 86.0
+        assert replacement_request.time_in_force.value == "gtc"
+        assert result.placed_stop_price == pytest.approx(86.0)
+
+    def test_fill_anchor_does_not_churn_an_already_correct_gtc_stop(self):
+        parent = _alpaca_order(
+            id="entry", status="filled", filled_qty=10,
+            filled_avg_price=100.0, type="limit", limit_price="100.0",
+            legs=None,
+        )
+        api = MagicMock()
+        api.submit_order.return_value = parent
+        api.get_order_by_id.return_value = parent
+        broker = _broker_with_mock(api)
+
+        result = broker.place_order(
+            _decision(
+                entry=100.0, stop=90.0, order_type=OrderType.LIMIT,
+                limit_price=100.0, strategy="rsi_reversion",
+                stop_anchor=StopAnchor.FILL,
+            ),
+            poll_timeout=0.1,
+        )
+
+        api.cancel_order_by_id.assert_not_called()
+        assert api.submit_order.call_count == 1
+        assert result.placed_stop_price == pytest.approx(90.0)
+
     def test_fractional_dry_run_returns_filled_without_submit(self):
         """DRY_RUN: fractional path logs and returns FILLED without hitting API."""
         api = MagicMock()
@@ -4074,6 +4134,26 @@ class TestDayStopRebuildSubstrate:
             position_uid="pos-X",
         )
         assert result is not None
+
+    def test_failed_reanchor_restores_the_prior_stop(self):
+        api = MagicMock()
+        api.submit_order.side_effect = [
+            APIError("target rejected"),
+            self._gtc_stop(id="fallback-stop", cli="fallback-cli"),
+        ]
+        broker = self._broker(api, MagicMock())
+
+        result = broker.replace_protective_stop_with_standalone_gtc(
+            symbol="AAPL",
+            stop_order_id="attached-stop",
+            qty=10,
+            stop_price=90.0,
+            fallback_stop_price=95.0,
+        )
+
+        assert api.submit_order.call_count == 2
+        assert api.submit_order.call_args_list[1].args[0].stop_price == 95.0
+        assert result.stop_price == pytest.approx(95.0)
 
 
 # ── P-6 (consumer wiring): exit substrate insert ───────────────────────────

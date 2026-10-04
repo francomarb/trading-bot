@@ -714,7 +714,7 @@ STRATEGY_ALLOWED_REGIMES: dict[str, set[str]] = {
 # at deployment of the graduation report; they do not relabel older history.
 STRATEGY_VERSIONS: dict[str, str] = {
     "sma_crossover": "1.0",
-    "rsi_reversion": "1.0",
+    "rsi_reversion": "1.1",
     "donchian_breakout": "1.0",
     "leveraged_trend": "1.0",
     "spy_options_reversion": "1.0",

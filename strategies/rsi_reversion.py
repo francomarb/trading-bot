@@ -32,6 +32,7 @@ from __future__ import annotations
 import pandas as pd
 
 from indicators.technicals import add_rsi, add_sma
+from risk.models import StopAnchor
 from strategies.base import BaseStrategy, EdgeFilter, OrderType, SignalFrame
 
 
@@ -39,6 +40,7 @@ class RSIReversion(BaseStrategy):
     name = "rsi_reversion"
     preferred_order_type = OrderType.LIMIT
     candidate_feature_schema_version = 2
+    stop_anchor_policy = StopAnchor.FILL
 
     def __init__(
         self,
@@ -183,7 +185,7 @@ class RSIReversion(BaseStrategy):
         from config import settings
 
         return {
-            "contract_version": 2,
+            "contract_version": 3,
             "strategy": self.name,
             "timeframe": "1Day",
             "period": self.period,
@@ -197,14 +199,15 @@ class RSIReversion(BaseStrategy):
             # shorter local stale-entry policy.  Freeze the resolved runtime
             # value so offline replay cannot borrow a later configuration.
             "max_entry_age_seconds": settings.STALE_LIMIT_MAX_AGE_SECONDS,
-            # Ordinary whole-share GTC LIMIT + OTO entries retain the stop
-            # submitted from the signal reference. Capped/fractional paths
-            # differ, but RSI currently reaches this ordinary broker path.
-            "stop_anchor": "reference",
+            "stop_anchor": self.stop_anchor_policy.value,
             "atr_stop_multiplier": settings.ATR_STOP_MULTIPLIER,
             "exit_order_type": "market",
             "modeled_exit_slippage_bps": settings.SLIPPAGE_MODEL_MARKET_BPS,
         }
+
+    def stop_anchor(self, symbol: str) -> StopAnchor:
+        """Preserve RSI's ATR stop distance from the actual limit fill."""
+        return self.stop_anchor_policy
 
     def __repr__(self) -> str:
         return (
