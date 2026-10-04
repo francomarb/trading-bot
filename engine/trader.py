@@ -697,6 +697,7 @@ class TradingEngine:
         self._cycle_count: int = 0
         self._cycle_symbol_error_count: int = 0
         self._last_cycle_end: datetime | None = None  # wall clock (self._clock)
+        self._pending_sleep_gap_alerts: list[str] = []
         # Operator Controls Phase B — fast operator-command heartbeat.
         # Daemon thread polls the operator_commands queue every
         # OPERATOR_COMMAND_HEARTBEAT_SECONDS. Started in `start()`,
@@ -1975,13 +1976,23 @@ class TradingEngine:
         try:
             market_state = "not_checked"
             if self.config.market_hours_only:
-                market_open = self._market_open()
+                market_status = self._market_open_status()
+                market_open = bool(market_status)
                 market_state = "open" if market_open else "closed"
             else:
-                market_open = True
+                market_status = market_open = True
                 market_state = "not_enforced"
-            if sleep_gap_alert is not None and market_open:
-                self.alerts.sleep_gap(sleep_gap_alert)
+            # A failed clock check is common right after a wake, before the
+            # network is back, and is not an answer: hold sleep-gap alerts
+            # until a cycle gets one, then send them (open) or drop them.
+            if sleep_gap_alert is not None:
+                self._pending_sleep_gap_alerts.append(sleep_gap_alert)
+            if self._pending_sleep_gap_alerts and market_status is not None:
+                if market_open:
+                    # One alert: the dispatcher de-duplicates by alert type,
+                    # so a second call this soon would be suppressed.
+                    self.alerts.sleep_gap("; ".join(self._pending_sleep_gap_alerts))
+                self._pending_sleep_gap_alerts.clear()
 
             logger.info(
                 f"cycle {cycle_id} start: "
@@ -14412,6 +14423,11 @@ class TradingEngine:
         falls back to "closed" — better to skip a cycle than to trade in
         the dark on a clock-API blip.
         """
+        return bool(self._market_open_status())
+
+    def _market_open_status(self) -> bool | None:
+        """Like `_market_open`, but returns None when the clock call fails,
+        so a caller can tell "unknown" from "closed"."""
         try:
             clock = self.broker._with_retry(
                 self.broker._api.get_clock, op_desc="get_clock"
@@ -14419,7 +14435,7 @@ class TradingEngine:
             return bool(clock.is_open)
         except Exception as e:
             logger.warning(f"get_clock failed ({e}); treating market as closed")
-            return False
+            return None
 
     # ── Sleep / signals / shutdown ───────────────────────────────────────
 
