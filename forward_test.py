@@ -242,6 +242,7 @@ def main() -> None:
         valid_sectors=set(settings.SECTOR_ETFS),
         max_age_days=settings.SECTOR_CACHE_MAX_AGE_DAYS,
         max_refreshes_per_hydrate=settings.SECTOR_CACHE_REFRESH_LIMIT,
+        total_timeout=settings.SECTOR_CACHE_TOTAL_TIMEOUT_SECONDS,
     )
     all_symbols = list(dict.fromkeys(
         settings.SMA_WATCHLIST + settings.RSI_WATCHLIST + settings.DONCHIAN_WATCHLIST

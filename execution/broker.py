@@ -26,8 +26,9 @@ Contract guarantees
    of account / positions / open orders straight from Alpaca. Phase 8's
    engine calls this on every cycle and on startup before any decision.
 
-5. **Rate-limit aware.** All Alpaca calls are wrapped in `_with_retry`
-   (exponential backoff on 429 / 5xx / network), with a configurable max.
+5. **Bounded transport.** alpaca-py owns its native 429/504 retries. Safe
+   reads have one small outer retry budget for uncovered transport/5xx
+   failures; mutations are never blindly repeated by the bot.
 
 Hard-risk exits (engine-initiated stop-outs, kill-switch liquidations) go
 through `close_position`, which always uses MARKET regardless of the
@@ -90,11 +91,14 @@ with warnings.catch_warnings():
         StopLossRequest,
     )
 from loguru import logger
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import Timeout as RequestsTimeout
 
-from data.fetcher import _install_timeout
+from utils.alpaca_transport import configure_alpaca_client
 
 import math
 
+from config import settings
 from config.settings import (
     ALPACA_API_KEY,
     ALPACA_PAPER,
@@ -319,13 +323,13 @@ class AlpacaBroker:
         entry_allowed: Callable[[], bool] | None = None,
         option_data_client: object | None = None,
     ) -> None:
-        self._api = client or TradingClient(
-            api_key=ALPACA_API_KEY,
-            secret_key=ALPACA_SECRET_KEY,
-            paper=ALPACA_PAPER,
+        self._api = client or configure_alpaca_client(
+            TradingClient(
+                api_key=ALPACA_API_KEY,
+                secret_key=ALPACA_SECRET_KEY,
+                paper=ALPACA_PAPER,
+            )
         )
-        if client is None:
-            _install_timeout(self._api._session)
         self._max_attempts = max_attempts
         self._base_delay = base_delay
         self._time_in_force = time_in_force
@@ -938,33 +942,56 @@ class AlpacaBroker:
 
     # ── Retry wrapper ────────────────────────────────────────────────────
 
-    def _with_retry(self, fn, *, op_desc: str = "broker call"):
+    def _with_retry(
+        self, fn, *, op_desc: str = "broker call", retry_safe: bool = True
+    ):
+        """Call Alpaca with a bounded outer retry only for safe reads.
+
+        alpaca-py owns its native 429/504 retries.  Mutations are attempted
+        once by this layer because repeating a timed-out submit/cancel/close
+        can duplicate an order; their durable client-order identity and
+        reconciliation paths resolve ambiguous outcomes instead.
         """
-        Call `fn()` with exponential backoff on rate-limit (HTTP 429),
-        transient 5xx, and network errors. 4xx errors other than 429 raise
-        immediately — they're our bug, not a transient blip.
-        """
+        max_attempts = (
+            min(self._max_attempts, settings.ALPACA_SAFE_READ_MAX_ATTEMPTS)
+            if retry_safe
+            else 1
+        )
         delay = self._base_delay
         last_exc: Exception | None = None
-        for attempt in range(1, self._max_attempts + 1):
+        for attempt in range(1, max_attempts + 1):
             try:
                 return fn()
             except APIError as e:
                 status = e.status_code
                 last_exc = e
-                if status == 429 or (status is not None and 500 <= status < 600):
+                retryable = (
+                    retry_safe
+                    and status not in {429, 504}
+                    and status is not None
+                    and 500 <= status < 600
+                    and attempt < max_attempts
+                )
+                if retryable:
                     logger.warning(
-                        f"{op_desc} attempt {attempt}/{self._max_attempts} "
+                        f"{op_desc} attempt {attempt}/{max_attempts} "
                         f"failed (status={status}): {e}. Sleeping {delay:.1f}s."
                     )
                     time.sleep(delay)
                     delay *= 2
                     continue
                 raise
-            except (ConnectionError, TimeoutError) as e:
+            except (
+                RequestsConnectionError,
+                RequestsTimeout,
+                ConnectionError,
+                TimeoutError,
+            ) as e:
                 last_exc = e
+                if not retry_safe or attempt >= max_attempts:
+                    raise
                 logger.warning(
-                    f"{op_desc} attempt {attempt}/{self._max_attempts} network "
+                    f"{op_desc} attempt {attempt}/{max_attempts} network "
                     f"error: {e}. Sleeping {delay:.1f}s."
                 )
                 time.sleep(delay)
@@ -1014,13 +1041,12 @@ class AlpacaBroker:
             if self._option_data_api is None:
                 from alpaca.data.historical.option import OptionHistoricalDataClient
 
-                self._option_data_api = OptionHistoricalDataClient(
-                    ALPACA_API_KEY,
-                    ALPACA_SECRET_KEY,
+                self._option_data_api = configure_alpaca_client(
+                    OptionHistoricalDataClient(
+                        ALPACA_API_KEY,
+                        ALPACA_SECRET_KEY,
+                    )
                 )
-                session = getattr(self._option_data_api, "_session", None)
-                if session is not None:
-                    _install_timeout(session)
 
             from alpaca.data.requests import OptionLatestQuoteRequest
 
@@ -1916,8 +1942,27 @@ class AlpacaBroker:
             order = self._with_retry(
                 lambda: self._api.submit_order(order_request),
                 op_desc=f"submit_order({decision.symbol})",
+                retry_safe=False,
             )
-        except APIError as e:
+        except (
+            APIError,
+            RequestsConnectionError,
+            RequestsTimeout,
+            ConnectionError,
+            TimeoutError,
+        ) as e:
+            if self._is_ambiguous_write_error(e):
+                if self._stream_manager is not None:
+                    self._stream_manager.unwatch(client_order_id)
+                return self._unknown_at_submit(
+                    client_order_id=client_order_id,
+                    symbol=decision.symbol,
+                    requested_qty=decision.qty,
+                    error=e,
+                    position_uid=position_uid,
+                )
+            if self._stream_manager is not None:
+                self._stream_manager.unwatch(client_order_id)
             logger.error(f"broker rejected {decision.symbol}: {e}")
             # Lifecycle: zero-fill rejection — mark canceled so the row
             # doesn't sit indefinitely as 'pending'.
@@ -2210,8 +2255,27 @@ class AlpacaBroker:
             order = self._with_retry(
                 lambda: self._api.submit_order(order_request),
                 op_desc=f"submit_frac_order({decision.symbol})",
+                retry_safe=False,
             )
-        except APIError as e:
+        except (
+            APIError,
+            RequestsConnectionError,
+            RequestsTimeout,
+            ConnectionError,
+            TimeoutError,
+        ) as e:
+            if self._is_ambiguous_write_error(e):
+                if self._stream_manager is not None:
+                    self._stream_manager.unwatch(client_order_id)
+                return self._unknown_at_submit(
+                    client_order_id=client_order_id,
+                    symbol=decision.symbol,
+                    requested_qty=decision.qty,
+                    error=e,
+                    position_uid=position_uid,
+                )
+            if self._stream_manager is not None:
+                self._stream_manager.unwatch(client_order_id)
             logger.error(f"broker rejected fractional {decision.symbol}: {e}")
             self._lifecycle_mark_canceled(position_uid)
             return OrderResult(
@@ -2300,6 +2364,7 @@ class AlpacaBroker:
                     stop_order = self._with_retry(
                         lambda: self._api.submit_order(stop_request),
                         op_desc=f"submit_frac_stop({decision.symbol})",
+                        retry_safe=False,
                     )
                     self._register_standalone_stop_leg(stop_order)
                     # Broker accepted it — this is the stop that exists.
@@ -2491,8 +2556,22 @@ class AlpacaBroker:
             order = self._with_retry(
                 lambda: self._api.submit_order(req),
                 op_desc=f"place_spread_order({rep_symbol})",
+                retry_safe=False,
             )
-        except APIError as e:
+        except (
+            APIError,
+            RequestsConnectionError,
+            RequestsTimeout,
+            ConnectionError,
+            TimeoutError,
+        ) as e:
+            if self._is_ambiguous_write_error(e):
+                return self._unknown_at_submit(
+                    client_order_id=client_order_id,
+                    symbol=rep_symbol,
+                    requested_qty=qty,
+                    error=e,
+                )
             logger.error(f"place_spread_order({rep_symbol}) rejected: {e}")
             return OrderResult(
                 status=OrderStatus.REJECTED,
@@ -2770,6 +2849,7 @@ class AlpacaBroker:
             self._with_retry(
                 lambda: self._api.cancel_order_by_id(order_id),
                 op_desc=f"cancel_order({order_id})",
+                retry_safe=False,
             )
             logger.info(f"canceled order {order_id}")
             return True
@@ -2873,11 +2953,13 @@ class AlpacaBroker:
                         symbol, close_options=_CPR(qty=str(qty)),
                     ),
                     op_desc=f"close_position({symbol}, partial={qty})",
+                    retry_safe=False,
                 )
             else:
                 order = self._with_retry(
                     lambda: self._api.close_position(symbol),
                     op_desc=f"close_position({symbol})",
+                    retry_safe=False,
                 )
         except APIError as e:
             logger.error(f"close_position({symbol}) failed: {e}")
@@ -3044,6 +3126,7 @@ class AlpacaBroker:
         order = self._with_retry(
             lambda: self._api.submit_order(order_request),
             op_desc=f"submit_repair_stop({symbol})",
+            retry_safe=False,
         )
         self._register_standalone_stop_leg(order)
         # P-4: record the substrate row AFTER the broker accepts the
@@ -3205,6 +3288,7 @@ class AlpacaBroker:
         order = self._with_retry(
             lambda: self._api.submit_order(order_request),
             op_desc=f"submit_option_gtc_stop({symbol})",
+            retry_safe=False,
         )
         self._register_standalone_stop_leg(order)
         # Options-side P-4: substrate row is the foundation-owned
@@ -3273,6 +3357,7 @@ class AlpacaBroker:
         order = self._with_retry(
             lambda: self._api.replace_order_by_id(order_id, request),
             op_desc=f"replace_option_stop({order_id})",
+            retry_safe=False,
         )
         if self._stream_manager is not None:
             self._stream_manager.unregister_stop_leg(order_id)
@@ -3315,9 +3400,16 @@ class AlpacaBroker:
 
         If no stream is wired, delegates directly to _poll_until_terminal.
         """
+        wait_started = time.monotonic()
+        stream_seconds = 0.0
+        rest_seconds = 0.0
+        path = "rest_only"
         try:
             if stream_event is not None:
+                path = "stream"
+                stream_started = time.monotonic()
                 fired = stream_event.wait(timeout=timeout)
+                stream_seconds = time.monotonic() - stream_started
                 if fired:
                     update = (
                         self._stream_manager.get_update(order_id)
@@ -3327,25 +3419,39 @@ class AlpacaBroker:
                     if update is not None:
                         return self._build_result_from_stream(update, symbol, requested_qty)
                 # Stream timed out or update was None — fall back to a short REST check.
+                path = "stream_then_rest"
                 logger.debug(
                     f"{symbol} order {order_id}: stream timeout, falling back to REST"
                 )
+                rest_started = time.monotonic()
+                try:
+                    return self._poll_until_terminal(
+                        order_id=order_id,
+                        symbol=symbol,
+                        requested_qty=requested_qty,
+                        timeout=interval * 3,
+                        interval=interval,
+                    )
+                finally:
+                    rest_seconds = time.monotonic() - rest_started
+
+            rest_started = time.monotonic()
+            try:
                 return self._poll_until_terminal(
                     order_id=order_id,
                     symbol=symbol,
                     requested_qty=requested_qty,
-                    timeout=interval * 3,
+                    timeout=timeout,
                     interval=interval,
                 )
-
-            return self._poll_until_terminal(
-                order_id=order_id,
-                symbol=symbol,
-                requested_qty=requested_qty,
-                timeout=timeout,
-                interval=interval,
-            )
+            finally:
+                rest_seconds = time.monotonic() - rest_started
         finally:
+            logger.info(
+                f"order wait {symbol}: path={path}, "
+                f"stream={stream_seconds:.3f}s, rest={rest_seconds:.3f}s, "
+                f"total={time.monotonic() - wait_started:.3f}s"
+            )
             if self._stream_manager is not None:
                 self._stream_manager.unwatch(order_id)
 
@@ -3456,6 +3562,44 @@ class AlpacaBroker:
             message=msg,
             submitted_at=AlpacaBroker._parse_datetime(getattr(order, "submitted_at", None)),
             filled_at=AlpacaBroker._parse_datetime(getattr(order, "filled_at", None)),
+        )
+
+    @staticmethod
+    def _is_ambiguous_write_error(error: BaseException) -> bool:
+        """Return whether Alpaca may have accepted a write before failure."""
+        if isinstance(
+            error,
+            (RequestsConnectionError, RequestsTimeout, ConnectionError, TimeoutError),
+        ):
+            return True
+        status = getattr(error, "status_code", None)
+        return status == 429 or (status is not None and 500 <= status < 600)
+
+    @staticmethod
+    def _unknown_at_submit(
+        *,
+        client_order_id: str,
+        symbol: str,
+        requested_qty: float,
+        error: Exception,
+        position_uid: str | None = None,
+    ) -> OrderResult:
+        """Preserve an ambiguous write for client-id/lifecycle recovery."""
+        msg = (
+            f"submit outcome unknown for client_order_id={client_order_id}: {error}; "
+            "query Alpaca by client order id before any retry"
+        )
+        logger.critical(f"{symbol}: {msg}")
+        return OrderResult(
+            status=OrderStatus.UNKNOWN,
+            order_id=None,
+            symbol=symbol,
+            requested_qty=requested_qty,
+            filled_qty=0,
+            avg_fill_price=None,
+            raw_status="submit_unknown",
+            message=msg,
+            position_uid=position_uid,
         )
 
     @staticmethod

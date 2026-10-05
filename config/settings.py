@@ -146,6 +146,30 @@ STREAM_RECONNECT_MAX_DELAY_SECONDS: float = float(
     os.getenv("STREAM_RECONNECT_MAX_DELAY_SECONDS", "30")
 )
 
+# alpaca-py does not currently expose REST request timeouts on its concrete
+# TradingClient / historical-data client constructors.  A thin shared requests
+# adapter applies these connect/read ceilings to every runtime Alpaca client.
+# SDK-native 429/504 retries remain authoritative; bot-side retrying is limited
+# to safe reads for transport/other transient failures.
+ALPACA_HTTP_CONNECT_TIMEOUT_SECONDS: float = float(
+    os.getenv("ALPACA_HTTP_CONNECT_TIMEOUT_SECONDS", "5")
+)
+ALPACA_HTTP_READ_TIMEOUT_SECONDS: float = float(
+    os.getenv("ALPACA_HTTP_READ_TIMEOUT_SECONDS", "20")
+)
+ALPACA_SAFE_READ_MAX_ATTEMPTS: int = int(
+    os.getenv("ALPACA_SAFE_READ_MAX_ATTEMPTS", "2")
+)
+ALPACA_SAFE_READ_RETRY_DELAY_SECONDS: float = float(
+    os.getenv("ALPACA_SAFE_READ_RETRY_DELAY_SECONDS", "1")
+)
+
+# Startup-only Yahoo sector classification is optional metadata. Keep it from
+# delaying broker safety work or the first trading cycle indefinitely.
+SECTOR_CACHE_TOTAL_TIMEOUT_SECONDS: float = float(
+    os.getenv("SECTOR_CACHE_TOTAL_TIMEOUT_SECONDS", "30")
+)
+
 # Broker order confirmation window
 # Give Alpaca enough time to stream or surface slower fills before we classify
 # an order as timed out. This especially matters for fractional entries, which

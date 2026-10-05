@@ -27,6 +27,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from loguru import logger
+from utils.alpaca_transport import configure_alpaca_client
 
 _CACHE_PATH = Path(__file__).resolve().parent / "historical" / ".market_calendar.json"
 
@@ -73,7 +74,9 @@ def _fetch(lo: date, hi: date) -> set[date] | None:
             ALPACA_API_KEY, ALPACA_PAPER, ALPACA_SECRET_KEY,
         )
 
-        client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=ALPACA_PAPER)
+        client = configure_alpaca_client(
+            TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=ALPACA_PAPER)
+        )
         days = client.get_calendar(GetCalendarRequest(start=lo, end=hi))
         return {d.date if isinstance(d.date, date) else date.fromisoformat(str(d.date))
                 for d in days}

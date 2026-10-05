@@ -63,6 +63,11 @@ from loguru import logger
 from config import settings
 from config.settings import SLIPPAGE_MODEL_MARKET_BPS
 from data.fetcher import StaleDataError, close_connections, fetch_symbol, require_fresh
+from utils.alpaca_transport import (
+    http_attempt_marker,
+    http_attempts_since,
+    rolling_http_attempt_count,
+)
 from engine.positions import (
     Position as EnginePosition,
     PositionLeg,
@@ -1127,6 +1132,8 @@ class TradingEngine:
         self._install_signal_handlers()
         self._running = True
         self._cycle_count = 0
+        startup_started = time.monotonic()
+        startup_request_marker = http_attempt_marker()
 
         self._seed_slippage_monitor()
 
@@ -1250,12 +1257,14 @@ class TradingEngine:
         self._sync_managed_stop_legs(startup_snapshot)
         self._sync_option_trailing_stops(startup_snapshot)
         self._repair_missing_protective_stops(startup_snapshot)
+        safety_ready_seconds = time.monotonic() - startup_started
 
         # Optional provider metadata and prewarm work belongs after the complete
         # broker-safety bootstrap. Failure is deliberately isolated: existing
         # cache/fail-open semantics allow the first cycle to proceed, while a
         # Yahoo or historical-data outage must never undo ownership restoration
         # or protective-stop repair.
+        metadata_started = time.monotonic()
         if post_safety_startup_hook is not None:
             try:
                 post_safety_startup_hook()
@@ -1264,6 +1273,7 @@ class TradingEngine:
                     "post_safety_startup_hook failed (trading continues): "
                     f"{exc}"
                 )
+        metadata_seconds = time.monotonic() - metadata_started
 
         slot_desc = ", ".join(
             f"{s.strategy.name}({len(s.active_symbols())})"
@@ -1275,6 +1285,13 @@ class TradingEngine:
             f"session_start_equity=${self._session_start_equity:,.2f}, "
             f"open_positions={len(startup_snapshot.account.open_positions)}, "
             f"open_orders={len(startup_snapshot.open_orders)}"
+        )
+        startup_attempts = http_attempts_since(startup_request_marker)
+        logger.info(
+            f"runtime startup: safety_ready={safety_ready_seconds:.3f}s, "
+            f"metadata={metadata_seconds:.3f}s, "
+            f"total={time.monotonic() - startup_started:.3f}s, "
+            f"http_attempts={len(startup_attempts)}"
         )
 
         try:
@@ -1294,12 +1311,18 @@ class TradingEngine:
                 # the trading loop — same hard rule as
                 # _flush_lifecycle_counters.
                 if post_cycle_hook is not None:
+                    hook_started = time.monotonic()
                     try:
                         post_cycle_hook()
                     except Exception as exc:  # noqa: BLE001
                         logger.warning(
                             f"post_cycle_hook failed (trading not "
                             f"affected): {exc}"
+                        )
+                    finally:
+                        logger.info(
+                            "runtime post_cycle_hook: "
+                            f"duration={time.monotonic() - hook_started:.3f}s"
                         )
                 if max_cycles is not None and self._cycle_count >= max_cycles:
                     logger.info(f"reached max_cycles={max_cycles}, stopping")
@@ -1940,6 +1963,12 @@ class TradingEngine:
         """
         cycle_id = self._cycle_count
         cycle_started_mono = time.monotonic()
+        cycle_started_wall = self._clock()
+        request_marker = http_attempt_marker()
+        phase_started = cycle_started_mono
+        phase_seconds: dict[str, float] = {}
+        owned_eval_seconds: list[tuple[str, float]] = []
+        start_lag_seconds = 0.0
         total_symbols = sum(len(slot.active_symbols()) for slot in self.slots)
         processed_symbols = 0
         new_positions = 0
@@ -1963,6 +1992,7 @@ class TradingEngine:
         if self._last_cycle_end is not None:
             gap = (self._clock() - self._last_cycle_end).total_seconds()
             expected = self.config.cycle_interval_seconds
+            start_lag_seconds = max(0.0, gap - expected)
             if gap > expected * 3 and gap > 60:
                 missed = int(gap / expected) - 1
                 logger.warning(
@@ -1982,6 +2012,7 @@ class TradingEngine:
             else:
                 market_status = market_open = True
                 market_state = "not_enforced"
+            phase_seconds["market_clock"] = time.monotonic() - phase_started
             # A failed clock check is common right after a wake, before the
             # network is back, and is not an answer: hold sleep-gap alerts
             # until a cycle gets one, then send them (open) or drop them.
@@ -2051,9 +2082,11 @@ class TradingEngine:
                 return
 
             try:
+                phase_started = time.monotonic()
                 snapshot = self.broker.sync_with_broker(
                     session_start_equity=self._session_start_equity
                 )
+                phase_seconds["broker_sync"] = time.monotonic() - phase_started
                 self._observe_equity(snapshot.account.equity)
                 self._last_snapshot = snapshot
             except Exception as e:
@@ -2071,6 +2104,8 @@ class TradingEngine:
                 f"open_orders={len(snapshot.open_orders)}, "
                 f"risk={risk_state}"
             )
+
+            phase_started = time.monotonic()
 
             self._sync_managed_stop_legs(snapshot)
             self._observe_stream_health()
@@ -2140,6 +2175,9 @@ class TradingEngine:
             # in the same cycle — not just what the broker reported at cycle start.
             running_account = snapshot.account
 
+            phase_seconds["reconciliation"] = time.monotonic() - phase_started
+            phase_started = time.monotonic()
+
             # Regime detection — runs once per cycle, before any slot.
             # Exits are never blocked by regime; only new entries are gated.
             current_regime = None
@@ -2203,6 +2241,9 @@ class TradingEngine:
             # already dispatched the close.
             if current_regime is MarketRegime.BEAR:
                 self._sweep_bear_spread_exits()
+
+            phase_seconds["regime"] = time.monotonic() - phase_started
+            phase_started = time.monotonic()
 
             # Order attribution — computed once per cycle for sleeve accounting.
             # Maps order_id → strategy_name for pending buy entries using
@@ -2276,6 +2317,7 @@ class TradingEngine:
                     strategy_reasons[symbol] = []
                     try:
                         processed_symbols += 1
+                        symbol_started = time.monotonic()
                         filled = self._process_symbol(
                             symbol,
                             snapshot,
@@ -2296,6 +2338,13 @@ class TradingEngine:
                             watchlist_ordinal=watchlist_ordinal,
                             evaluation_ordinal=current_evaluation_ordinal,
                         )
+                        if (
+                            symbol in snapshot.account.open_positions
+                            and self._get_owner(symbol) == slot.strategy.name
+                        ):
+                            owned_eval_seconds.append(
+                                (symbol, time.monotonic() - symbol_started)
+                            )
                         if filled is not None:
                             new_positions += 1
                             # Merge the new position into the running account so
@@ -2315,6 +2364,7 @@ class TradingEngine:
                         # Never let one symbol kill the cycle.
                         self._cycle_symbol_error_count += 1
                         logger.exception(f"{symbol}: cycle step failed: {e}")
+            phase_seconds["strategy_evaluation"] = time.monotonic() - phase_started
         except Exception as exc:
             # A cycle-level phase (drains, reconciles) is outside the
             # per-symbol isolation above. Record the traceback in the log
@@ -2360,6 +2410,42 @@ class TradingEngine:
             close_connections()
             self.broker.close_connections()
             self._last_cycle_end = self._clock()
+            active_seconds = time.monotonic() - cycle_started_mono
+            wall_seconds = max(
+                0.0, (self._last_cycle_end - cycle_started_wall).total_seconds()
+            )
+            suspended_seconds = max(0.0, wall_seconds - active_seconds)
+            attempts = http_attempts_since(request_marker)
+            failed_attempts = sum(
+                attempt.error_type is not None
+                or (attempt.status_code is not None and attempt.status_code >= 400)
+                for attempt in attempts
+            )
+            slow_attempts = sorted(
+                attempts, key=lambda attempt: attempt.elapsed_ms, reverse=True
+            )[:3]
+            slow_text = ",".join(
+                f"{attempt.method}:{attempt.endpoint}:{attempt.elapsed_ms:.0f}ms"
+                for attempt in slow_attempts
+            ) or "none"
+            phase_text = ",".join(
+                f"{name}:{elapsed:.3f}s"
+                for name, elapsed in phase_seconds.items()
+            ) or "none"
+            owned_text = ",".join(
+                f"{symbol}:{elapsed:.3f}s"
+                for symbol, elapsed in sorted(
+                    owned_eval_seconds, key=lambda item: item[1], reverse=True
+                )[:5]
+            ) or "none"
+            logger.info(
+                f"runtime cycle {cycle_id}: active={active_seconds:.3f}s, "
+                f"wall={wall_seconds:.3f}s, suspended={suspended_seconds:.3f}s, "
+                f"start_lag={start_lag_seconds:.3f}s, phases={phase_text}, "
+                f"http_attempts={len(attempts)}, http_failures={failed_attempts}, "
+                f"http_attempts_60s={rolling_http_attempt_count()}, "
+                f"slow_http={slow_text}, owned_evaluations={owned_text}"
+            )
 
     def _record_cycle_symbol_error(self, message: str) -> None:
         """Log a handled symbol error and include it in the cycle summary."""

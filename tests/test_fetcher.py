@@ -238,6 +238,46 @@ class TestCacheRoundTrip:
         (tmp_cache_dir / "iex" / "ABC_1Day_all.meta.json").write_text("not-json{{")
         assert _read_meta("ABC", "1Day", "all", "iex") == (None, None)
 
+    def test_corrupt_parquet_and_meta_are_quarantined(self, tmp_cache_dir):
+        feed_dir = tmp_cache_dir / "iex"
+        feed_dir.mkdir(parents=True)
+        parquet = feed_dir / "BAD_1Day_all.parquet"
+        meta = feed_dir / "BAD_1Day_all.meta.json"
+        parquet.write_bytes(b"not parquet")
+        meta.write_text('{"covered_start": "2026-01-01T00:00:00+00:00"}')
+
+        assert _read_cache("BAD", "1Day", "all", "iex").empty
+        assert not parquet.exists()
+        assert not meta.exists()
+        quarantined = list((tmp_cache_dir / "quarantine").rglob("BAD_1Day_all.*"))
+        assert len(quarantined) == 2
+
+    def test_failed_atomic_write_preserves_existing_pair(
+        self, tmp_cache_dir, clean_ohlcv, utc_now, monkeypatch
+    ):
+        _write_cache(
+            clean_ohlcv, "SAFE", "1Day", "all",
+            utc_now - timedelta(days=10), utc_now, "iex",
+        )
+        cache_path = tmp_cache_dir / "iex" / "SAFE_1Day_all.parquet"
+        meta_path = tmp_cache_dir / "iex" / "SAFE_1Day_all.meta.json"
+        prior_data = cache_path.read_bytes()
+        prior_meta = meta_path.read_text()
+
+        def fail_write(*args, **kwargs):
+            raise OSError("interrupted")
+
+        monkeypatch.setattr(pd.DataFrame, "to_parquet", fail_write)
+        with pytest.raises(OSError, match="interrupted"):
+            _write_cache(
+                clean_ohlcv, "SAFE", "1Day", "all",
+                utc_now - timedelta(days=20), utc_now, "iex",
+            )
+
+        assert cache_path.read_bytes() == prior_data
+        assert meta_path.read_text() == prior_meta
+        assert not list(cache_path.parent.glob(".*.tmp"))
+
 
 class TestFeedAwareCacheLayout:
     """
@@ -558,11 +598,12 @@ class TestWithRetry:
         assert _with_retry(fn, max_attempts=3, base_delay=0) == "ok"
         assert fn.call_count == 1
 
-    def test_retries_on_429_then_succeeds(self, monkeypatch):
+    def test_does_not_multiply_sdk_429_retries(self, monkeypatch):
         monkeypatch.setattr(fetcher.time, "sleep", lambda *_: None)
         fn = MagicMock(side_effect=[_api_error(429), _api_error(429), "ok"])
-        assert _with_retry(fn, max_attempts=5, base_delay=0) == "ok"
-        assert fn.call_count == 3
+        with pytest.raises(fetcher.APIError):
+            _with_retry(fn, max_attempts=5, base_delay=0)
+        assert fn.call_count == 1
 
     def test_retries_on_5xx(self, monkeypatch):
         monkeypatch.setattr(fetcher.time, "sleep", lambda *_: None)
@@ -577,12 +618,12 @@ class TestWithRetry:
             _with_retry(fn, max_attempts=5, base_delay=0)
         assert fn.call_count == 1  # no retry
 
-    def test_gives_up_after_max_attempts(self, monkeypatch):
+    def test_sdk_exhausted_429_is_not_retried(self, monkeypatch):
         monkeypatch.setattr(fetcher.time, "sleep", lambda *_: None)
         fn = MagicMock(side_effect=_api_error(429))
         with pytest.raises(fetcher.APIError):
             _with_retry(fn, max_attempts=3, base_delay=0)
-        assert fn.call_count == 3
+        assert fn.call_count == 1
 
     def test_retries_on_connection_error(self, monkeypatch):
         monkeypatch.setattr(fetcher.time, "sleep", lambda *_: None)

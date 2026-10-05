@@ -16,6 +16,7 @@ import contextlib
 import json
 import os
 import tempfile
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -100,18 +101,24 @@ class SectorResolver:
         max_retries: int = 2,
         max_age_days: int = 90,
         max_refreshes_per_hydrate: int = 10,
+        total_timeout: float = 30.0,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if max_age_days <= 0:
             raise ValueError("max_age_days must be positive")
         if max_refreshes_per_hydrate <= 0:
             raise ValueError("max_refreshes_per_hydrate must be positive")
+        if per_symbol_timeout <= 0:
+            raise ValueError("per_symbol_timeout must be positive")
+        if total_timeout <= 0:
+            raise ValueError("total_timeout must be positive")
         self._cache_path = cache_path
         self._valid_sectors = valid_sectors or set()
         self._per_symbol_timeout = per_symbol_timeout
         self._max_retries = max_retries
         self._max_age = timedelta(days=max_age_days)
         self._max_refreshes_per_hydrate = max_refreshes_per_hydrate
+        self._total_timeout = total_timeout
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._cache: dict[str, dict[str, object]] = self._load_cache()
 
@@ -169,8 +176,19 @@ class SectorResolver:
         )
         resolved = 0
         failed = 0
+        hydration_started = time.monotonic()
         for symbol in selected:
-            entry = self._lookup_with_retry(symbol)
+            remaining = self._total_timeout - (time.monotonic() - hydration_started)
+            if remaining <= 0:
+                logger.warning(
+                    "sector resolver: total hydration deadline reached; "
+                    f"deferring {len(selected) - resolved - failed} lookup(s)"
+                )
+                break
+            completed, entry = self._lookup_with_deadline(
+                symbol,
+                timeout=min(self._per_symbol_timeout, remaining),
+            )
             attempted_at = self._utc_now_iso()
             if entry is not None:
                 self._cache[symbol] = {
@@ -196,6 +214,13 @@ class SectorResolver:
                 }
                 failed += 1
             self._save_cache()
+            if not completed:
+                logger.warning(
+                    f"sector resolver: {symbol} exceeded its "
+                    f"{min(self._per_symbol_timeout, remaining):.1f}s deadline; "
+                    "stopping this hydration pass to avoid abandoned lookup buildup"
+                )
+                break
 
         logger.info(
             f"sector resolver: refreshed {resolved} symbols, {failed} failed, "
@@ -260,6 +285,39 @@ class SectorResolver:
         return parsed.astimezone(timezone.utc)
 
     # ── Lookup chain ─────────────────────────────────────────────────────
+
+    def _lookup_with_deadline(
+        self, symbol: str, *, timeout: float
+    ) -> tuple[bool, dict[str, object] | None]:
+        """Run one optional provider lookup behind a real elapsed deadline.
+
+        yfinance does not expose a stable per-``Ticker.info`` timeout. A daemon
+        worker lets startup proceed if that call hangs. After one abandonment
+        the hydration pass stops, so repeated timeouts cannot accumulate a
+        fleet of stuck workers.
+        """
+        outcome: dict[str, object] = {}
+
+        def run() -> None:
+            try:
+                outcome["value"] = self._lookup_with_retry(symbol)
+            except BaseException as exc:  # propagate interrupts after join
+                outcome["error"] = exc
+
+        worker = threading.Thread(
+            target=run,
+            name=f"sector-lookup-{symbol}",
+            daemon=True,
+        )
+        worker.start()
+        worker.join(timeout=timeout)
+        if worker.is_alive():
+            return False, None
+        error = outcome.get("error")
+        if isinstance(error, BaseException):
+            raise error
+        value = outcome.get("value")
+        return True, value if isinstance(value, dict) else None
 
     def _lookup_with_retry(self, symbol: str) -> dict[str, object] | None:
         """Attempt yfinance lookup with retries and timeout."""

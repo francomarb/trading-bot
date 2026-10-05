@@ -1858,24 +1858,24 @@ class TestReadSide:
 
 
 class TestRetry:
-    def test_retries_on_429_then_succeeds(self):
+    def test_mutating_submit_is_not_blindly_retried(self):
         api = MagicMock()
         api.submit_order.side_effect = [_api_error(429), _alpaca_order(status="filled")]
         api.get_order_by_id.return_value = _alpaca_order(status="filled")
         result = _broker_with_mock(api).place_order(_decision(), poll_timeout=0.0)
-        assert result.status is OrderStatus.FILLED
-        assert api.submit_order.call_count == 2
+        assert result.status is OrderStatus.UNKNOWN
+        assert result.raw_status == "submit_unknown"
+        assert api.submit_order.call_count == 1
 
     def test_retries_on_503(self):
         api = MagicMock()
         api.get_all_positions.side_effect = [
             _api_error(503),
-            _api_error(502),
             [],
         ]
         positions = _broker_with_mock(api).get_positions()
         assert positions == {}
-        assert api.get_all_positions.call_count == 3
+        assert api.get_all_positions.call_count == 2
 
     def test_4xx_other_than_429_raises_immediately(self):
         api = MagicMock()
@@ -1890,7 +1890,7 @@ class TestRetry:
         broker = AlpacaBroker(client=api, max_attempts=2, base_delay=0.0)
         with pytest.raises(APIError):
             broker.get_positions()
-        assert api.get_all_positions.call_count == 2
+        assert api.get_all_positions.call_count == 1
 
     def test_network_error_retried(self):
         api = MagicMock()
