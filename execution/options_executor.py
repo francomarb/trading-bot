@@ -49,6 +49,7 @@ from execution.stream import StreamManager
 from execution.mleg_close import MlegCloseScheduler, MlegQuote
 from execution.mleg_entry import MlegEntryWalk
 from config.settings import MLEG_ENTRY_WATCH_TIMEOUT_SECONDS
+from utils.alpaca_transport import is_ambiguous_write_error
 
 # Type alias: returns a fresh quote of the spread (net mid/bid/ask) each call.
 # Required when a walk-and-market close is used so the worker can recompute
@@ -528,10 +529,20 @@ class OptionsExecutionWorker(_BaseExecutionWorker):
             order = self.api.submit_order(req)
             logger.info(f"[{self.name}] Submitted option limit order {order.id}")
         except Exception as e:
-            logger.error(f"[{self.name}] Failed to submit option limit order: {e}")
             if self.stream_manager is not None:
                 self.stream_manager.unwatch(client_order_id)
-            self._report_fill("rejected", client_order_id)
+            if is_ambiguous_write_error(e):
+                logger.critical(
+                    f"[{self.name}] Option submit outcome UNKNOWN for "
+                    f"client_order_id={client_order_id}: {e}; preserving "
+                    "the durable pending row for reconciliation"
+                )
+                self._report_fill("unknown", None)
+            else:
+                logger.error(
+                    f"[{self.name}] Failed to submit option limit order: {e}"
+                )
+                self._report_fill("rejected", client_order_id)
             return
 
         if self.stream_manager is not None:
@@ -690,10 +701,9 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
     def _fire_on_submitted(self, broker_order_id: str) -> None:
         """Emit the per-submit attach event if the engine wired it.
 
-        Tagged with ``self._substrate_cloid`` (the engine's substrate
-        row client_order_id), NOT the worker-generated broker cloid —
-        the substrate row was inserted before dispatch with the
-        engine's cloid as its key.
+        Tagged with ``self._substrate_cloid``: the engine's original key on
+        the first rung, or the worker-generated key durably published before
+        a later walk rung.
 
         §10.7 fix-up R3: writes durably first (own sqlite connection)
         so the substrate row carries the broker order_id even on a
@@ -728,7 +738,66 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
         if self._substrate_cloid is not None and not self._substrate_cloid_used:
             self._substrate_cloid_used = True
             return self._substrate_cloid
+        if self._substrate_cloid is not None and self._substrate_db_path is not None:
+            if not self._durably_rekey_substrate(generated):
+                raise RuntimeError(
+                    "could not persist the next spread walk client_order_id; "
+                    "refusing broker submission"
+                )
+            self._substrate_cloid = generated
         return generated
+
+    def _durably_rekey_substrate(self, client_order_id: str) -> bool:
+        """Publish the next walk rung's exact recovery key before submit.
+
+        A walk reuses one logical substrate row while Alpaca requires a fresh
+        client ID for every rung. Clear the prior terminal rung's broker ID and
+        atomically move the row to the next client ID before the POST. A crash
+        or ambiguous response then leaves a NULL-order-id row that the existing
+        client-ID sweep can resolve exactly.
+        """
+        if self._substrate_db_path is None or self._substrate_cloid is None:
+            return True
+        import sqlite3 as _sqlite3
+        from datetime import datetime as _dt, timezone as _tz
+
+        try:
+            conn = _sqlite3.connect(self._substrate_db_path, timeout=5.0)
+        except Exception as exc:
+            logger.critical(
+                f"[{self.name}] substrate rekey connect FAILED: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return False
+        try:
+            now = _dt.now(_tz.utc).isoformat()
+            with conn:
+                cursor = conn.execute(
+                    "UPDATE position_lifecycle_orders "
+                    "SET client_order_id = ?, order_id = NULL, "
+                    "    status = 'pending', filled_qty = 0, "
+                    "    avg_fill_price = NULL, submitted_at = NULL, "
+                    "    terminal_at = NULL, last_observed_at = ? "
+                    "WHERE client_order_id = ? "
+                    "  AND status NOT IN ('filled', 'canceled', 'rejected')",
+                    (client_order_id, now, self._substrate_cloid),
+                )
+            if cursor.rowcount != 1:
+                logger.critical(
+                    f"[{self.name}] substrate rekey updated "
+                    f"{cursor.rowcount} rows for cloid={self._substrate_cloid}"
+                )
+                return False
+            return True
+        except Exception as exc:
+            logger.critical(
+                f"[{self.name}] substrate rekey FAILED "
+                f"{self._substrate_cloid} → {client_order_id}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return False
+        finally:
+            conn.close()
 
     def _durably_attach_order_id_to_substrate(
         self, broker_order_id: str,
@@ -853,10 +922,18 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
             order = self.api.submit_order(req)
             logger.info(f"[{self.name}] Submitted MLEG combo order {order.id}")
         except Exception as e:
-            logger.error(f"[{self.name}] Failed to submit MLEG combo order: {e}")
             if self.stream_manager is not None:
                 self.stream_manager.unwatch(client_order_id)
-            self._report_fill("rejected", None)
+            if is_ambiguous_write_error(e):
+                logger.critical(
+                    f"[{self.name}] MLEG submit outcome UNKNOWN for "
+                    f"client_order_id={client_order_id}: {e}; preserving "
+                    "the durable pending row for reconciliation"
+                )
+                self._report_fill("unknown", None)
+            else:
+                logger.error(f"[{self.name}] Failed to submit MLEG combo order: {e}")
+                self._report_fill("rejected", None)
             return
 
         # §10.7 fix-up — eager attach the broker order_id to the
@@ -885,14 +962,22 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
     def _submit_walk_step(self, *, step) -> tuple[str, "object | None"]:
         """Submit one walk step (limit or market). Returns (status, latest_order).
 
-        ``status`` is one of "filled", "canceled", "rejected", "skipped".
+        ``status`` is one of "filled", "canceled", "rejected", "unknown",
+        or "skipped".
         ``latest_order`` is the most recent Alpaca order object for
         telemetry, or None if the submit itself failed.
         """
-        client_order_id = self._broker_client_order_id(
-            f"spr-{self.strategy_name}-walk{step.step_number:02d}-"
-            f"{uuid.uuid4().hex[:6]}"
-        )
+        try:
+            client_order_id = self._broker_client_order_id(
+                f"spr-{self.strategy_name}-walk{step.step_number:02d}-"
+                f"{uuid.uuid4().hex[:6]}"
+            )
+        except Exception as exc:
+            logger.error(
+                f"[{self.name}] walk step {step.step_number}/{step.total_steps} "
+                f"aborted before submit: {exc}"
+            )
+            return "rejected", None
         try:
             if step.is_market:
                 req = build_mleg_market_request(
@@ -921,12 +1006,20 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
         try:
             order = self.api.submit_order(req)
         except Exception as exc:
+            if self.stream_manager is not None:
+                self.stream_manager.unwatch(client_order_id)
+            if is_ambiguous_write_error(exc):
+                logger.critical(
+                    f"[{self.name}] walk step {step.step_number}/"
+                    f"{step.total_steps} submit outcome UNKNOWN for "
+                    f"client_order_id={client_order_id}: {exc}; preserving "
+                    "the durable row for reconciliation"
+                )
+                return "unknown", None
             logger.error(
                 f"[{self.name}] walk step {step.step_number}/{step.total_steps} "
                 f"submit failed: {exc}"
             )
-            if self.stream_manager is not None:
-                self.stream_manager.unwatch(client_order_id)
             return "rejected", None
 
         if step.is_market:
@@ -1068,6 +1161,10 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
 
                 if status == "rejected":
                     terminal_status = "rejected"
+                    terminal_order = latest_order
+                    break
+                if status == "unknown":
+                    terminal_status = "unknown"
                     terminal_order = latest_order
                     break
                 if latest_order is not None:

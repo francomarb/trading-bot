@@ -48,8 +48,10 @@ are treated as stale and migrate gradually through the same bounded budget.
 The focused reliability slice now also applies one connect/read timeout policy to
 every runtime Alpaca REST client, leaves alpaca-py's native 429/504 retries in
 charge, limits the outer retry to safe reads, and never blindly retries a write.
-An ambiguous entry submit remains `UNKNOWN` and is recovered by its durable
-`client_order_id`. Bar files are written through same-directory atomic replacement;
+An ambiguous equity, single-leg-option, or MLEG entry/close submit remains
+`UNKNOWN`, retains ownership, and is recovered by its durable `client_order_id`.
+Each MLEG walk rung publishes its client ID before the write, so recovery targets
+the exact attempted order. Bar files are written through same-directory atomic replacement;
 an unreadable or structurally invalid Parquet/metadata pair is moved to quarantine
 and refetched from the same feed.
 
@@ -348,8 +350,9 @@ installed alpaca-py client already retries HTTP 429 and 504 responses internally
 The former outer five-attempt loop could multiply those attempts and is removed.
 The SDK contract remains authoritative, with a small outer retry only for safe
 reads and uncovered transport/other 5xx failures. The bot never blindly retries
-order submission; mutating calls continue to use `client_order_id` plus broker
-reconciliation.
+order submission. Equity, single-leg-option, and MLEG workers make one bot-level
+attempt; transport, 429, and 5xx ambiguity keeps the durable row non-terminal
+until exact `client_order_id` reconciliation proves whether Alpaca accepted it.
 
 ### 4.6 Candidate non-overlapping fixed-rate scheduling — deferred
 
@@ -409,6 +412,10 @@ stop-protection, and restart-reconciliation guarantee before behavior changes.
   data, and calendar clients. Emit phase durations, physical HTTP attempts and
   failures, rolling-minute volume, slow endpoints, order-wait time, start lag,
   active-versus-suspended time, and direct managed position-to-evaluation latency.
+- Preserve ambiguous equity, single-leg-option, and MLEG entry/close submissions
+  as non-terminal. Publish each spread-walk rung's exact client ID before submit,
+  retain ownership/close locks, and reconcile against Alpaca rather than retrying
+  or treating an uncertain write as rejection.
 - Add deterministic slow/hung Yahoo, 429/504, corrupt-Parquet, interruption, and
   slow-order tests.
 

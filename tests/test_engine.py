@@ -5154,6 +5154,32 @@ class TestOptionsEngineFixes:
         assert not engine._has_position(occ)
         assert occ not in engine._entry_prices
 
+    def test_drain_option_unknown_preserves_ownership_for_reconciliation(
+        self, tmp_path,
+    ):
+        engine = self._engine(tmp_path)
+        occ = "SPY260516C00520000"
+        engine.alerts = MagicMock()
+        engine._register_single_leg(
+            strategy_name="spy_options_reversion",
+            symbol=occ,
+            position_id="pos_unknown",
+        )
+        engine._entry_prices[occ] = 12.15
+        engine.broker.drain_option_fills = MagicMock(return_value=[(
+            SimpleNamespace(
+                symbol=occ, qty=3, entry_reference_price=12.15,
+                strategy_name="spy_options_reversion", side=Side.BUY,
+            ),
+            "unknown", 0.0, None, None, "pos_unknown",
+        )])
+
+        engine._drain_option_fills()
+
+        assert engine._has_position(occ)
+        assert engine._entry_prices[occ] == pytest.approx(12.15)
+        engine.alerts.broker_error.assert_called_once()
+
     def test_drain_option_filled_calls_register_fill_on_strategy(self, tmp_path):
         """A3 — confirmed BUY fill must anchor the strategy's trailing-stop base
         via register_fill(occ, avg_fill_price)."""

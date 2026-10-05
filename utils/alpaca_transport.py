@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 from requests.adapters import HTTPAdapter
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import Timeout as RequestsTimeout
 
 from config import settings
 
@@ -66,6 +68,24 @@ def rolling_http_attempt_count(window_seconds: float = 60.0) -> int:
     cutoff = time.monotonic() - window_seconds
     with _ATTEMPT_LOCK:
         return sum(attempt.observed_at_monotonic >= cutoff for attempt in _ATTEMPTS)
+
+
+def is_ambiguous_write_error(error: BaseException) -> bool:
+    """Return whether a failed write may still have reached Alpaca.
+
+    A connection/read timeout gives no trustworthy answer about server-side
+    acceptance. Likewise, alpaca-py surfaces 429/5xx only after exhausting its
+    native retry policy. Callers must reconcile these outcomes by the submitted
+    client order ID instead of labeling them rejected or replaying the write.
+    """
+
+    if isinstance(
+        error,
+        (RequestsConnectionError, RequestsTimeout, ConnectionError, TimeoutError),
+    ):
+        return True
+    status = getattr(error, "status_code", None)
+    return status == 429 or (status is not None and 500 <= status < 600)
 
 
 def _record_attempt(

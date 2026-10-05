@@ -1185,7 +1185,7 @@ class PositionLifecycleOrdersStore:
         progress.
 
         Behavior:
-          - status='pending' AND order_id IS NULL → UPDATE to
+          - status IN ('pending', 'unknown') AND order_id IS NULL → UPDATE to
             'rejected', set terminal_at, last_observed_at; run the
             position-status CTE so the parent position transitions
             (typically pending → canceled if no fill ever landed).
@@ -1222,7 +1222,7 @@ class PositionLifecycleOrdersStore:
             if (
                 current_status in TERMINAL_ORDER_STATUSES
                 or current_order_id is not None
-                or current_status != "pending"
+                or current_status not in {"pending", "unknown"}
             ):
                 # Already resolved out of band; sweep treats as no-op.
                 return False
@@ -1464,10 +1464,10 @@ class PositionLifecycleOrdersStore:
           - all single-leg rows, plus spread ``entry_primary`` rows. Spread
             closes retain their dedicated crash-durable path and the
             intentional NULL-id partial-close placeholder remains excluded.
-          - ``status = 'pending'`` — once a row reaches
-            working/partially_filled/filled the broker order_id is
-            already known by definition; this query targets rows the
-            attach queue never got to.
+          - single-leg rows are ``pending``; spread entry rows may also be
+            ``unknown`` after an ambiguous worker submit. Once a row reaches
+            working/partially_filled/filled the broker order_id is already
+            known by definition.
           - ``order_id IS NULL`` — by construction the attach failed
             or the bot crashed between submit return and the next
             cycle's drain.
@@ -1547,10 +1547,11 @@ class PositionLifecycleOrdersStore:
             "FROM position_lifecycle_orders plo "
             "JOIN position_lifecycle pl "
             "  ON pl.position_uid = plo.position_uid "
-            "WHERE (pl.position_type = 'single_leg' "
+            "WHERE ((pl.position_type = 'single_leg' "
+            "        AND plo.status = 'pending') "
             "       OR (pl.position_type = 'spread' "
-            "           AND plo.role = 'entry_primary')) "
-            "  AND plo.status = 'pending' "
+            "           AND plo.role = 'entry_primary' "
+            "           AND plo.status IN ('pending', 'unknown'))) "
             "  AND plo.order_id IS NULL "
             "  AND plo.client_order_id IS NOT NULL "
             "  AND plo.created_at <= ? "
@@ -1561,6 +1562,42 @@ class PositionLifecycleOrdersStore:
             sql += " LIMIT ?"
             params = (cutoff, int(limit))
         rows = self._conn.execute(sql, params).fetchall()
+        return [_row_from_tuple(r) for r in rows]
+
+    def get_orphaned_unknown_spread_close_orders(
+        self,
+        *,
+        min_age_seconds: int,
+    ) -> list[PositionLifecycleOrderRow]:
+        """Spread closes whose submit outcome is unknown and has no order id.
+
+        These are distinct from the intentional ``pending`` partial-close
+        placeholder: only a worker-reported ambiguous POST is moved to
+        ``unknown``.  That narrow status gate lets the client-ID sweep recover
+        accepted close orders without ever treating a residual placeholder as
+        something submitted to Alpaca.
+        """
+        if min_age_seconds < 0:
+            raise ValueError(
+                f"min_age_seconds must be >= 0; got {min_age_seconds}"
+            )
+        cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=int(min_age_seconds))
+        ).isoformat()
+        rows = self._conn.execute(
+            _SELECT_LIFECYCLE_ORDER_COLUMNS
+            + " WHERE position_uid IN ("
+            "      SELECT position_uid FROM position_lifecycle "
+            "      WHERE position_type = 'spread'"
+            "  ) "
+            "  AND role IN ('exit', 'partial_close') "
+            "  AND status = 'unknown' "
+            "  AND order_id IS NULL "
+            "  AND created_at <= ? "
+            "ORDER BY id ASC",
+            (cutoff,),
+        ).fetchall()
         return [_row_from_tuple(r) for r in rows]
 
     def get_non_terminal_by_role(

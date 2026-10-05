@@ -18,6 +18,9 @@ from execution.options_executor import (
     SpreadLeg,
     build_mleg_request,
 )
+from engine.lifecycle import PositionLifecycleStore
+from engine.lifecycle_orders import PositionLifecycleOrdersStore
+from reporting.logger import TradeLogger
 from risk.manager import RiskDecision, Side
 from strategies.base import OrderType
 
@@ -208,6 +211,23 @@ class TestOptionsExecutionWorker:
         watched_client_id = stream.watch.call_args.args[0]
         stream.unwatch.assert_called_once_with(watched_client_id)
         on_fill.assert_called_once_with("rejected", 0.0, None, watched_client_id)
+
+    def test_ambiguous_submit_reports_unknown_and_is_not_retried(self):
+        api = MagicMock()
+        api.submit_order.side_effect = TimeoutError("response timed out")
+        stream = MagicMock()
+        stream.watch.return_value = MagicMock()
+        on_fill = MagicMock()
+
+        worker = OptionsExecutionWorker(
+            decision=_decision(), api=api, stream_manager=stream,
+            on_fill=on_fill, client_order_id="opt-test",
+        )
+        worker.run()
+
+        assert api.submit_order.call_count == 1
+        stream.unwatch.assert_called_once_with("opt-test")
+        on_fill.assert_called_once_with("unknown", 0.0, None, None)
 
     def test_timeout_reconciles_broker_state_before_canceling(self):
         api = MagicMock()
@@ -479,6 +499,25 @@ class TestSpreadExecutionWorker:
         stream.unwatch.assert_called_once_with(watched_client_id)
         on_fill.assert_called_once_with("rejected", 0.0, None, None)
 
+    def test_ambiguous_submit_reports_unknown_and_is_not_retried(self):
+        api = MagicMock()
+        api.submit_order.side_effect = TimeoutError("response timed out")
+        stream = MagicMock()
+        stream.watch.return_value = MagicMock()
+        on_fill = MagicMock()
+
+        worker = SpreadExecutionWorker(
+            legs=_open_legs(), qty=1, limit_price=3.25,
+            strategy_name="credit_spread", api=api,
+            stream_manager=stream, on_fill=on_fill,
+            substrate_cloid="spread-entry-cloid",
+        )
+        worker.run()
+
+        assert api.submit_order.call_count == 1
+        stream.unwatch.assert_called_once_with("spread-entry-cloid")
+        on_fill.assert_called_once_with("unknown", 0.0, None, None)
+
     def test_binds_real_order_id_after_submit(self):
         api = MagicMock()
         api.submit_order.return_value = _mleg_submitted("combo-1")
@@ -704,6 +743,24 @@ class TestSpreadExecutionWorkerWalkAndMarket:
 
         api.submit_order.assert_called_once()
         on_fill.assert_called_once_with("rejected", 0.0, None, None)
+
+    def test_ambiguous_close_submit_stops_walk_and_reports_unknown(self):
+        api = MagicMock()
+        api.submit_order.side_effect = TimeoutError("response timed out")
+        on_fill = MagicMock()
+        sched = self._scheduler([("mid", 30), ("ask", 30), ("market", 0)])
+        worker = SpreadExecutionWorker(
+            legs=_open_legs(), qty=1, limit_price=3.25,
+            strategy_name="credit_spread", api=api,
+            on_fill=on_fill, close_scheduler=sched,
+            quote_provider=lambda: self._quote(),
+            substrate_cloid="spread-close-cloid",
+        )
+
+        worker.run()
+
+        assert api.submit_order.call_count == 1
+        on_fill.assert_called_once_with("unknown", 0.0, None, None)
 
     def test_exhausted_close_walk_reports_last_real_order_id(self):
         api = MagicMock()
@@ -1030,6 +1087,50 @@ class TestSpreadExecutionWorkerEntryWalk:
     def _submitted_limits(self, api):
         return [c.kwargs.get("order_data", c.args[0] if c.args else None)
                 for c in api.submit_order.call_args_list]
+
+    def test_each_later_rung_publishes_its_client_id_before_submit(
+        self, tmp_path,
+    ):
+        db_path = str(tmp_path / "trades.db")
+        trade_logger = TradeLogger(path=db_path)
+        conn = trade_logger._ensure_db()
+        lifecycle = PositionLifecycleStore(conn)
+        orders = PositionLifecycleOrdersStore(conn)
+        lifecycle.create_pending(
+            position_uid="pos_walk_rekey",
+            symbol="SPY260618P00568000",
+            owner_key="walk-rekey",
+            strategy="credit_spread",
+            position_type="spread",
+            entry_qty=1.0,
+        )
+        orders.insert_pending(
+            position_uid="pos_walk_rekey",
+            role="exit",
+            client_order_id="close-rung-1",
+            order_type="limit",
+            order_class="mleg",
+            time_in_force="day",
+            side="buy",
+            intended_qty=1.0,
+        )
+        worker = SpreadExecutionWorker(
+            legs=_open_legs(), qty=1, limit_price=3.25,
+            strategy_name="credit_spread", api=MagicMock(),
+            substrate_cloid="close-rung-1",
+            substrate_db_path=db_path,
+        )
+        try:
+            assert worker._broker_client_order_id("unused") == "close-rung-1"
+            assert worker._broker_client_order_id("close-rung-2") == "close-rung-2"
+
+            assert orders.get_by_client_order_id("close-rung-1") is None
+            row = orders.get_by_client_order_id("close-rung-2")
+            assert row is not None
+            assert row.status == "pending"
+            assert row.order_id is None
+        finally:
+            trade_logger.close()
 
     def test_mode_off_by_default(self):
         w = SpreadExecutionWorker(

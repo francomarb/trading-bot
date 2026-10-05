@@ -94,7 +94,7 @@ from loguru import logger
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import Timeout as RequestsTimeout
 
-from utils.alpaca_transport import configure_alpaca_client
+from utils.alpaca_transport import configure_alpaca_client, is_ambiguous_write_error
 
 import math
 
@@ -1951,7 +1951,7 @@ class AlpacaBroker:
             ConnectionError,
             TimeoutError,
         ) as e:
-            if self._is_ambiguous_write_error(e):
+            if is_ambiguous_write_error(e):
                 if self._stream_manager is not None:
                     self._stream_manager.unwatch(client_order_id)
                 return self._unknown_at_submit(
@@ -2264,7 +2264,7 @@ class AlpacaBroker:
             ConnectionError,
             TimeoutError,
         ) as e:
-            if self._is_ambiguous_write_error(e):
+            if is_ambiguous_write_error(e):
                 if self._stream_manager is not None:
                     self._stream_manager.unwatch(client_order_id)
                 return self._unknown_at_submit(
@@ -2565,7 +2565,7 @@ class AlpacaBroker:
             ConnectionError,
             TimeoutError,
         ) as e:
-            if self._is_ambiguous_write_error(e):
+            if is_ambiguous_write_error(e):
                 return self._unknown_at_submit(
                     client_order_id=client_order_id,
                     symbol=rep_symbol,
@@ -2842,6 +2842,36 @@ class AlpacaBroker:
             fills = list(self._pending_spread_fills)
             self._pending_spread_fills.clear()
         return fills
+
+    def queue_recovered_spread_outcome(
+        self,
+        *,
+        position_id: str,
+        strategy_name: str,
+        closing: bool,
+        status: str,
+        filled_qty: float,
+        avg_fill_price: float | None,
+        order_id: str | None,
+        submitted_limit_price: float | None,
+    ) -> None:
+        """Queue broker truth recovered without a live MLEG worker.
+
+        Ambiguous submit responses are reconciled later by client order ID.
+        Feeding that result through the ordinary spread drain keeps ownership,
+        trade logging, and lifecycle transitions identical to a worker report.
+        """
+        with self._pending_spread_lock:
+            self._pending_spread_fills.append((
+                position_id,
+                strategy_name,
+                closing,
+                status,
+                float(filled_qty),
+                avg_fill_price,
+                order_id,
+                submitted_limit_price,
+            ))
 
     def cancel_order(self, order_id: str) -> bool:
         """Cancel an order by id. Returns True on success, False on failure."""
@@ -3563,17 +3593,6 @@ class AlpacaBroker:
             submitted_at=AlpacaBroker._parse_datetime(getattr(order, "submitted_at", None)),
             filled_at=AlpacaBroker._parse_datetime(getattr(order, "filled_at", None)),
         )
-
-    @staticmethod
-    def _is_ambiguous_write_error(error: BaseException) -> bool:
-        """Return whether Alpaca may have accepted a write before failure."""
-        if isinstance(
-            error,
-            (RequestsConnectionError, RequestsTimeout, ConnectionError, TimeoutError),
-        ):
-            return True
-        status = getattr(error, "status_code", None)
-        return status == 429 or (status is not None and 500 <= status < 600)
 
     @staticmethod
     def _unknown_at_submit(

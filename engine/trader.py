@@ -10504,12 +10504,13 @@ class TradingEngine:
               unknown_to_broker`` so the position-status CTE
               advances the parent out of pending.
 
-        Scope (excluded by ``get_orphaned_pending_single_leg_orders``):
-          - Spreads (PR #72 §10.7 has its own crash-durable path) —
-            the ``position_type='single_leg'`` JOIN filters BOTH
-            the spread ``exit`` row AND the intentional
-            ``partial_close`` residual placeholder, which is the
-            only load-bearing exclusion.
+        Scope:
+          - Single-leg rows and spread entry rows are read from
+            ``get_orphaned_pending_single_leg_orders`` (the historical method
+            name predates spread-entry substrate support).
+          - Spread close rows participate only at ``status='unknown'`` after
+            an ambiguous submit. The intentional ``pending`` partial-close
+            residual placeholder is never queried at Alpaca.
           - Rows newer than ``_SUBSTRATE_NULL_ATTACH_SWEEP_MIN_AGE_
             SECONDS`` (let the normal attach queue drain naturally).
 
@@ -10557,7 +10558,7 @@ class TradingEngine:
             # _reconcile_substrate_via_rest's pattern. With LIMIT
             # at SQL, a persistently-failing oldest row would
             # repeatedly fill the budget and starve newer orphans.
-            orphans = (
+            orphans = list(
                 self.lifecycle_orders_store
                 .get_orphaned_pending_single_leg_orders(
                     min_age_seconds=(
@@ -10566,6 +10567,23 @@ class TradingEngine:
                     limit=None,
                 )
             )
+            spread_close_orphans = (
+                self.lifecycle_orders_store
+                .get_orphaned_unknown_spread_close_orders(
+                    min_age_seconds=(
+                        _SUBSTRATE_NULL_ATTACH_SWEEP_MIN_AGE_SECONDS
+                    ),
+                )
+            )
+            orphans.extend(spread_close_orphans)
+            spread_close_cloids = {
+                row.client_order_id for row in spread_close_orphans
+            }
+            flexible_attach_cloids = spread_close_cloids | {
+                row.client_order_id
+                for row in orphans
+                if row.role == "entry_primary" and row.status == "unknown"
+            }
         except Exception as exc:
             logger.critical(
                 f"substrate {reason} null-attach sweep: orphan query "
@@ -10703,11 +10721,24 @@ class TradingEngine:
             # as benign by re-checking the row.
             attached = False
             try:
-                self.lifecycle_orders_store.attach_broker_order_id(
-                    client_order_id=cli,
-                    order_id=broker_order_id,
-                )
-                attached = True
+                if cli in flexible_attach_cloids:
+                    attached = (
+                        self.lifecycle_orders_store
+                        .attach_or_update_order_id_for_walk_step(
+                            client_order_id=cli,
+                            order_id=broker_order_id,
+                        )
+                    )
+                    if not attached:
+                        raise ValueError(
+                            "spread close row was resolved before attach"
+                        )
+                else:
+                    self.lifecycle_orders_store.attach_broker_order_id(
+                        client_order_id=cli,
+                        order_id=broker_order_id,
+                    )
+                    attached = True
             except ValueError as exc:
                 refreshed = (
                     self.lifecycle_orders_store
@@ -10759,6 +10790,13 @@ class TradingEngine:
                     f"{broker_order_id} role={row.role}"
                 )
 
+            # Spread closes have a dedicated accounting reconciler.  Once
+            # the exact broker ID is attached, leave both live and terminal
+            # outcomes to that path later in this same cycle; the generic
+            # dispatch helpers are deliberately single-leg only.
+            if cli in spread_close_cloids:
+                continue
+
             # Build the broker-state event and apply it. Alpaca
             # status 'new' / 'accepted' maps to substrate 'working'
             # (see _ALPACA_STATUS_TO_SUBSTRATE_STATUS above), so an
@@ -10808,6 +10846,12 @@ class TradingEngine:
                 self._maybe_dispatch_substrate_stop_fill(
                     event=event, snapshot=snapshot,
                 )
+                if row.status == "unknown":
+                    self._queue_recovered_spread_outcome(
+                        row=row,
+                        event=event,
+                        closing=False,
+                    )
 
     def _release_resolved_order_watch(
         self,
@@ -10990,11 +11034,59 @@ class TradingEngine:
                 self._maybe_dispatch_substrate_stop_fill(
                     event=event, snapshot=snapshot,
                 )
+                if row.status == "unknown":
+                    self._queue_recovered_spread_outcome(
+                        row=row,
+                        event=event,
+                        closing=False,
+                    )
             else:
                 logger.debug(
                     f"substrate {reason} reconcile: order_id={oid} "
                     f"no-op ({outcome.reason})"
                 )
+
+    def _queue_recovered_spread_outcome(
+        self,
+        *,
+        row: "Any",
+        event: "Any",
+        closing: bool,
+    ) -> None:
+        """Route a recovered ambiguous spread write through its normal drain.
+
+        Normal MLEG submissions are reported by their worker and must not be
+        duplicated here.  Callers therefore invoke this only when the row was
+        already ``unknown`` before broker reconciliation.  Terminal broker
+        truth is queued into the same engine path the worker would have used.
+        """
+        if event.status not in {"filled", "canceled", "rejected"}:
+            return
+        expected_roles = (
+            {"exit", "partial_close"} if closing else {"entry_primary"}
+        )
+        if row.role not in expected_roles or self.lifecycle_store is None:
+            return
+        try:
+            parent = self.lifecycle_store.get_by_position_uid(row.position_uid)
+            if parent is None or parent.position_type != "spread":
+                return
+            self.broker.queue_recovered_spread_outcome(
+                position_id=parent.owner_key,
+                strategy_name=parent.strategy,
+                closing=closing,
+                status=event.status,
+                filled_qty=float(event.filled_qty or 0.0),
+                avg_fill_price=event.avg_fill_price,
+                order_id=event.order_id,
+                submitted_limit_price=row.intended_limit_price,
+            )
+        except Exception as exc:
+            logger.critical(
+                f"recovered spread outcome could not be queued for "
+                f"client_order_id={row.client_order_id}: "
+                f"{type(exc).__name__}: {exc}"
+            )
 
     @staticmethod
     def _build_substrate_event_from_broker_order(
@@ -11131,6 +11223,12 @@ class TradingEngine:
                     f"role={row.role} advanced to status={event.status} "
                     f"qty={event.filled_qty}"
                 )
+                if row.status == "unknown":
+                    self._queue_recovered_spread_outcome(
+                        row=row,
+                        event=event,
+                        closing=True,
+                    )
             except Exception as exc:
                 logger.critical(
                     f"spread close {reason} reconcile: "
@@ -11151,9 +11249,11 @@ class TradingEngine:
         """
         fills = self.broker.drain_option_fills()
         for decision, status_str, filled_qty, avg_fill_price, order_id, position_uid in fills:
-            mapped = {"filled": OrderStatus.FILLED, "partially_filled": OrderStatus.PARTIAL}.get(
-                status_str, OrderStatus.CANCELED
-            )
+            mapped = {
+                "filled": OrderStatus.FILLED,
+                "partially_filled": OrderStatus.PARTIAL,
+                "unknown": OrderStatus.UNKNOWN,
+            }.get(status_str, OrderStatus.CANCELED)
             result = OrderResult(
                 status=mapped,
                 order_id=order_id,
@@ -11165,6 +11265,16 @@ class TradingEngine:
                 message=f"options async fill: {status_str}",
                 position_uid=position_uid,
             )
+            if result.status is OrderStatus.UNKNOWN:
+                message = (
+                    f"[{decision.strategy_name}] option entry submit outcome "
+                    f"UNKNOWN for {decision.symbol}; ownership and durable "
+                    "order row preserved for client-order-id reconciliation"
+                )
+                logger.critical(message)
+                self.risk.record_broker_error()
+                self.alerts.broker_error(message)
+                continue
             if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
                 self.broker._lifecycle_mark_filled(
                     position_uid=position_uid,
@@ -12739,6 +12849,24 @@ class TradingEngine:
                         f"spread close substrate lookup failed for "
                         f"position_id={position_id[:8]}: {exc}"
                     )
+            if status == "unknown":
+                if substrate_close_row is not None:
+                    self._lifecycle_orders_finalize_spread_close(
+                        client_order_id=substrate_close_row.client_order_id,
+                        broker_order_id=order_id,
+                        status="unknown",
+                        filled_qty=float(filled_qty or 0.0),
+                        avg_fill_price=avg_fill_price,
+                    )
+                message = (
+                    f"[{strategy_name}] spread close submit outcome UNKNOWN — "
+                    f"position_id={position_id[:8]}; position and close lock "
+                    "preserved for client-order-id reconciliation"
+                )
+                logger.critical(message)
+                self.risk.record_broker_error()
+                self.alerts.broker_error(message)
+                continue
             if filled:
                 # PR #56 R5: peek at the open spread BEFORE releasing so
                 # we can detect a partial close (close_qty < released.qty)

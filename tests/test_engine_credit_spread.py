@@ -824,6 +824,30 @@ class TestDrainSpreadFills:
         assert not _has_pending_close_substrate(engine, "p1")
         assert len(strategy.open_spreads) == 1
 
+    def test_close_unknown_preserves_position_and_close_lock(self, tmp_path):
+        from engine.positions import spread_substrate_uid
+
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        engine.alerts = MagicMock()
+        self._pre_register(engine, strategy, "p1")
+        _mark_close_pending_in_substrate(engine, "p1")
+        broker.drain_spread_fills.return_value = [
+            ("p1", "credit_spread", True, "unknown", 0.0, None, None, 0.60),
+        ]
+
+        engine._drain_spread_fills()
+
+        assert "p1" in engine._positions
+        assert _has_pending_close_substrate(engine, "p1")
+        rows = engine.lifecycle_orders_store.get_non_terminal_by_role(
+            spread_substrate_uid("p1"),
+            ("exit", "partial_close"),
+        )
+        assert len(rows) == 1
+        assert rows[0].status == "unknown"
+        engine.alerts.broker_error.assert_called_once()
+
 
 # ── Exit path ───────────────────────────────────────────────────────────────
 
@@ -2316,6 +2340,40 @@ class TestSpreadCloseReconciler:
         assert row.status == "filled"
         assert row.filled_qty == 1.0
         assert row.avg_fill_price == pytest.approx(0.60)
+
+    def test_recovered_unknown_close_is_queued_for_normal_accounting(
+        self, tmp_path,
+    ):
+        engine, broker, _ = self._setup_with_pending_close_row(tmp_path)
+        engine.lifecycle_orders_store.mark_terminal_after_dispatch(
+            client_order_id="close-cloid",
+            broker_order_id="b-1",
+            status="unknown",
+            filled_qty=0.0,
+            avg_fill_price=None,
+        )
+        broker._api = MagicMock()
+        broker._api.get_order_by_id.return_value = SimpleNamespace(
+            status="filled", id="b-1", filled_qty="1",
+            filled_avg_price="0.60",
+            updated_at="2026-06-20T15:00:00Z",
+        )
+        broker._with_retry = lambda fn, op_desc=None: fn()
+
+        engine._reconcile_substrate_spread_closes(
+            SimpleNamespace(open_orders=[]), reason="cycle",
+        )
+
+        broker.queue_recovered_spread_outcome.assert_called_once_with(
+            position_id="p1",
+            strategy_name="credit_spread",
+            closing=True,
+            status="filled",
+            filled_qty=1.0,
+            avg_fill_price=0.60,
+            order_id="b-1",
+            submitted_limit_price=None,
+        )
 
     def test_cycle_reconciler_skips_open_order(self, tmp_path):
         """Row whose order_id is still in broker.open_orders is left
