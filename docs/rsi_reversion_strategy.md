@@ -43,9 +43,11 @@ expiry while preserving this boundary-session behavior.
 
 The active `RSI_WATCHLIST` contains the 50-name v3 durable-company opportunity
 pool promoted on 2026-09-09 and narrowly corrected on 2026-09-20 by replacing
-the falsely excluded BRK.B ranked slot. Temporary lifecycle-preservation
-members remain after the ranked pool. The additional evaluated symbols do not
-change the eight-position ceiling or any runtime gate. See
+the falsely excluded BRK.B ranked slot. BAC's temporary lifecycle-preservation
+membership ended on 2026-10-05 after its RSI position became flat and terminal;
+the active list is now exactly the ranked 50. This removal starts a new
+configuration-hash evidence cohort without changing the eight-position ceiling
+or any runtime gate. See
 [`rsi-watchlist-selection.md`](rsi-watchlist-selection.md).
 
 `RSIReversion` keeps backward-compatible defaults (`period=14`, cross-below-30 entry, cross-above-70 exit) for generic tests and research scripts. Production opts into the RSI3 quick-exit behavior through explicit parameters.

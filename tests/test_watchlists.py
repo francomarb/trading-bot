@@ -89,8 +89,9 @@ class TestRSIWatchlistPromotion:
     def test_ranked_pool_contains_provider_correction(self):
         ranked_pool = settings.RSI_WATCHLIST[:50]
 
+        assert len(settings.RSI_WATCHLIST) == 50
         assert "BRK.B" in ranked_pool
-        assert "BAC" not in ranked_pool
+        assert "BAC" not in settings.RSI_WATCHLIST
         assert SECTOR_MAP["BRK.B"] == "XLF"
 
 

@@ -516,9 +516,9 @@ SMA_WATCHLIST = [
 # reference-only. Sector concentration is accepted. GOOG is the required
 # Alphabet share class; GOOGL is forbidden by the scanner contract.
 #
-# Symbols after the ranked 50 are temporary lifecycle-preservation members.
-# Remove each only after it is flat and terminal; they do not consume the
-# 8-position cap.
+# The temporary BAC lifecycle-preservation member was removed on 2026-10-05
+# after its RSI position was confirmed flat and terminal. The active list is
+# now exactly the ranked 50.
 RSI_WATCHLIST = [
     "MU", "NVDA", "SNDK", "AAPL", "TSLA", "MSFT", "AMD", "META", "INTC",
     "AMZN", "AVGO", "GOOG", "PLTR", "MRVL", "TSM", "NBIS", "ORCL", "AMAT",
@@ -526,8 +526,6 @@ RSI_WATCHLIST = [
     "WMT", "V", "JPM", "GEV", "CAT", "NOW", "CRWV", "KLAC", "APP", "CSCO",
     "MRNA", "PANW", "HOOD", "XOM", "BRK.B", "IBM", "QCOM", "UNH", "GS",
     "GLW", "COST", "TXN", "CRWD",
-    # Temporary lifecycle-preservation member outside the ranked 50.
-    "BAC",
 ]
 # Legacy/reference RSI macro-gate tolerance used by the historical
 # `scripts/rsi_filter_variant_backtest.py` SPY50 study. The active RSI3

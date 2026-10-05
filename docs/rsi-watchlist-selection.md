@@ -11,14 +11,14 @@ symbols with open RSI positions.
 **Approved correction:** BRK.B replaces BAC in the ranked 50. On the frozen
 2026-09-09 promotion window, resolving Yahoo's `BRK.B`/`BRK-B` boundary placed
 BRK.B around rank 42 and moved BAC from rank 50 to 51. The displaced boundary
-member remains temporarily after the ranked pool where required for lifecycle
-protection. The broader current-snapshot
+member remained temporarily after the ranked pool for lifecycle protection,
+then was removed on 2026-10-05 after becoming flat and terminal. The broader current-snapshot
 proposal in `docs/reports/rsi_watchlist_scan_11_72_candidate.md` was not
 promoted: COHR/JNJ versus COST/GLW/TXN was ordinary liquidity drift too soon
 after promotion.
 
-The current runtime list is the corrected 50-candidate pool plus temporary
-lifecycle-preservation members, which remain only until flat and terminal.
+The current runtime list is exactly the corrected 50-candidate pool. Any future
+lifecycle-preservation member must remain only until it is flat and terminal.
 
 ## Purpose
 
