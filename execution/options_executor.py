@@ -1310,6 +1310,14 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
                     terminal_status = "rejected"
                     terminal_order = latest_order
                     break
+                if status == "unknown" and latest_order is None:
+                    # This rung's own submit was ambiguous. Its exact client
+                    # ID is already durable; reporting the previous rung's
+                    # canceled order would attach that stale broker ID over
+                    # it and hide this rung from client-ID recovery.
+                    terminal_status = "unknown"
+                    terminal_order = None
+                    break
                 if latest_order is not None:
                     terminal_order = latest_order
                 if status in ("filled", "partially_filled", "unknown"):

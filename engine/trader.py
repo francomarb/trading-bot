@@ -10108,6 +10108,24 @@ class TradingEngine:
                 self._external_close_suspects.pop(position_id, None)
                 continue
 
+            # A pre-registered entry that never filled cannot have been
+            # closed externally. While its durable lifecycle is still
+            # pending, the order may be walking at a worker, awaiting
+            # client-order-id recovery after an ambiguous submit, or resting
+            # at Alpaca. Once every entry order is terminal without a fill,
+            # no worker will report it again: release the ownership the same
+            # way the fill drains roll back a rejected entry.
+            unfilled_status = self._unfilled_entry_status(
+                position_id, tracked_position,
+            )
+            if unfilled_status is not None:
+                self._external_close_suspects.pop(position_id, None)
+                if unfilled_status == "canceled":
+                    self._release_unfilled_pre_registration(
+                        position_id, tracked_position,
+                    )
+                continue
+
             count = self._external_close_suspects.get(position_id, 0) + 1
             self._external_close_suspects[position_id] = count
 
@@ -10246,6 +10264,65 @@ class TradingEngine:
                     self._entry_prices.pop(broker_symbol, None)
             except Exception as e:
                 logger.error(f"{broker_symbol}: failed to log external close: {e}")
+
+    def _unfilled_entry_status(
+        self,
+        position_id: str,
+        tracked_position: EnginePosition,
+    ) -> str | None:
+        """Identify a durable entry that has never produced a position.
+
+        ``pending`` means an entry is still unresolved; ``canceled`` means
+        reconciliation proved every entry attempt terminal without a fill.
+        Any fill evidence, other lifecycle state, absent row, or read failure
+        falls back to ordinary external-close handling.
+        """
+        if self.lifecycle_store is None:
+            return None
+        position_uid = (
+            spread_substrate_uid(position_id)
+            if tracked_position.is_spread
+            else position_id
+        )
+        try:
+            row = self.lifecycle_store.get_by_position_uid(position_uid)
+        except Exception as exc:
+            logger.warning(
+                f"{position_id}: lifecycle lookup for external-close check "
+                f"failed: {type(exc).__name__}: {exc}"
+            )
+            return None
+        if row is None or row.status not in {"pending", "canceled"}:
+            return None
+        if row.first_fill_at is not None or float(row.current_qty or 0.0) != 0.0:
+            return None
+        return row.status
+
+    def _release_unfilled_pre_registration(
+        self,
+        position_id: str,
+        tracked_position: EnginePosition,
+    ) -> None:
+        """Release ownership of an entry reconciled terminal with no fill.
+
+        This mirrors the option/spread drain rollback when broker truth arrives
+        through client-ID reconciliation instead of a live worker callback.
+        No trade row is written because nothing traded.
+        """
+        self._pop_position(position_id)
+        if tracked_position.is_spread:
+            self._pending_spread_plans.pop(position_id, None)
+            strategy = self._spread_owner_strategy.pop(position_id, None)
+            if strategy is not None and hasattr(strategy, "release_spread"):
+                strategy.release_spread(position_id)
+        else:
+            leg = tracked_position.primary_leg
+            if leg is not None:
+                self._entry_prices.pop(leg.symbol, None)
+        logger.info(
+            f"{position_id}: entry owned by '{tracked_position.strategy_name}' "
+            "resolved without a fill — pre-registered ownership released"
+        )
 
     def _drain_lifecycle_attaches(self) -> None:
         """Apply per-order substrate attaches enqueued by background
@@ -12635,11 +12712,19 @@ class TradingEngine:
                         filled_qty=float(filled_qty or 0.0),
                         avg_fill_price=avg_fill_price,
                     )
-                    message = (
-                        f"[{strategy_name}] spread entry unresolved after "
-                        f"partial fill — position_id={position_id[:8]} "
-                        f"order={order_id}; manual broker reconciliation required"
-                    )
+                    if float(filled_qty or 0.0) > 0:
+                        message = (
+                            f"[{strategy_name}] spread entry unresolved after "
+                            f"partial fill — position_id={position_id[:8]} "
+                            f"order={order_id}; manual broker reconciliation required"
+                        )
+                    else:
+                        message = (
+                            f"[{strategy_name}] spread entry submit outcome "
+                            f"UNKNOWN — position_id={position_id[:8]}; "
+                            "pre-registration preserved for client-order-id "
+                            "reconciliation"
+                        )
                     logger.critical(message)
                     self.risk.record_broker_error()
                     self.alerts.broker_error(message)

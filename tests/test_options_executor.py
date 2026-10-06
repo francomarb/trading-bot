@@ -1132,6 +1132,74 @@ class TestSpreadExecutionWorkerEntryWalk:
         finally:
             trade_logger.close()
 
+    def test_ambiguous_later_rung_stays_recoverable_by_client_id(
+        self, tmp_path,
+    ):
+        """A timed-out later rung must not inherit the prior rung's ID."""
+        db_path = str(tmp_path / "trades.db")
+        trade_logger = TradeLogger(path=db_path)
+        conn = trade_logger._ensure_db()
+        lifecycle = PositionLifecycleStore(conn)
+        orders = PositionLifecycleOrdersStore(conn)
+        lifecycle.create_pending(
+            position_uid="pos_walk_unknown",
+            symbol=_SHORT_OCC,
+            owner_key="walk-unknown",
+            strategy="credit_spread",
+            position_type="spread",
+            entry_qty=1.0,
+        )
+        orders.insert_pending(
+            position_uid="pos_walk_unknown",
+            role="entry_primary",
+            client_order_id="entry-rung-1",
+            order_type="limit",
+            order_class="mleg",
+            time_in_force="day",
+            side="sell",
+            intended_qty=1.0,
+        )
+        api = MagicMock()
+        api.submit_order.side_effect = [
+            _mleg_submitted("combo-1"),
+            TimeoutError("read timed out"),
+        ]
+        api.get_order_by_id.return_value = _mleg_submitted(
+            "combo-1", status="canceled",
+        )
+        on_fill = MagicMock()
+        worker = SpreadExecutionWorker(
+            legs=_open_legs(), qty=1, limit_price=-2.01,
+            strategy_name="credit_spread", api=api,
+            stream_manager=self._stream([False, False]),
+            on_fill=on_fill, entry_walk=self._walk(),
+            quote_provider=lambda: self._quote(),
+            substrate_cloid="entry-rung-1",
+            substrate_db_path=db_path,
+        )
+        try:
+            worker.run()
+
+            assert api.submit_order.call_count == 2
+            rung_2_client_id = self._submitted_limits(api)[1].client_order_id
+            on_fill.assert_called_once_with("unknown", 0.0, None, None)
+            orders.mark_terminal_after_dispatch(
+                client_order_id=rung_2_client_id,
+                broker_order_id=on_fill.call_args.args[3],
+                status="unknown",
+                filled_qty=0.0,
+                avg_fill_price=None,
+            )
+            assert orders.get_by_client_order_id(rung_2_client_id).order_id is None
+            orphans = orders.get_orphaned_pending_single_leg_orders(
+                min_age_seconds=0, limit=None,
+            )
+            assert [row.client_order_id for row in orphans] == [
+                rung_2_client_id
+            ]
+        finally:
+            trade_logger.close()
+
     def test_mode_off_by_default(self):
         w = SpreadExecutionWorker(
             legs=_open_legs(), qty=1, limit_price=-2.01,

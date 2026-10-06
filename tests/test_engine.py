@@ -5573,6 +5573,125 @@ class TestAsyncOptionEntryIdentity:
         ] == []
 
 
+class TestAmbiguousAsyncOptionEntryResolution:
+    """Ambiguous option entries must not become false external closes."""
+
+    OCC = "SPY261016C00764000"
+
+    def _dispatch_ambiguous(self, engine_factory):
+        from unittest.mock import patch
+
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        slot = engine.slots[0]
+        slot.strategy.build_option_execution = (
+            lambda *_args, **_kwargs: (self.OCC, 11.60, 34.80, 8.70)
+        )
+        slot.strategy.preferred_order_type = OrderType.LIMIT
+        engine._reject_if_contract_conflict = MagicMock(return_value=None)
+        engine.risk.evaluate = MagicMock(return_value=RiskDecision(
+            symbol=self.OCC, side=Side.BUY, qty=3,
+            entry_reference_price=11.60, stop_price=8.70,
+            strategy_name=slot.strategy.name, reason="opt entry",
+            order_type=OrderType.LIMIT, limit_price=11.60,
+        ))
+        real_broker = AlpacaBroker(
+            client=MagicMock(), max_attempts=1, base_delay=0.0,
+            lifecycle_orders_store=engine.lifecycle_orders_store,
+            lifecycle_store=engine.lifecycle_store,
+        )
+        broker.place_order.side_effect = real_broker.place_order
+        broker.drain_option_fills.side_effect = real_broker.drain_option_fills
+        captured = {}
+
+        def _capture_worker(*, on_fill, client_order_id, **_kwargs):
+            captured["on_fill"] = on_fill
+            captured["client_order_id"] = client_order_id
+            return MagicMock()
+
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        with patch(
+            "execution.broker.OptionsExecutionWorker",
+            side_effect=_capture_worker,
+        ):
+            engine._process_symbol(
+                "AAPL", snap, snap.account, slot.strategy, slot.timeframe,
+            )
+        captured["on_fill"]("unknown", 0.0, None, None)
+        engine._drain_option_fills()
+        assert engine._has_position(self.OCC)
+        client_order_id = captured["client_order_id"]
+        aged = (
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        ).isoformat()
+        conn = engine.lifecycle_orders_store._conn
+        conn.execute(
+            "UPDATE position_lifecycle_orders SET created_at = ? "
+            "WHERE client_order_id = ?",
+            (aged, client_order_id),
+        )
+        conn.commit()
+        return engine, broker, client_order_id
+
+    @staticmethod
+    def _detect_past_confirmation(engine) -> None:
+        empty = _snapshot()
+        for _ in range(engine.config.external_close_confirm_cycles + 1):
+            engine._detect_external_closes(empty)
+
+    @staticmethod
+    def _external_close_rows(engine) -> list[dict]:
+        return [
+            row for row in engine.trade_logger.read_all()
+            if row["reason"] == "external_close_detected"
+        ]
+
+    def test_order_alpaca_never_accepted_releases_ownership(
+        self, engine_factory,
+    ):
+        engine, broker, _ = self._dispatch_ambiguous(engine_factory)
+        broker.get_order_by_client_id_for_sweep.return_value = None
+        engine._sweep_null_order_id_attaches(
+            _snapshot(), reason="cycle", budget=5,
+        )
+
+        self._detect_past_confirmation(engine)
+
+        assert self._external_close_rows(engine) == []
+        assert not engine._has_position(self.OCC)
+        assert self.OCC not in engine._entry_prices
+
+    def test_order_resting_at_alpaca_is_not_externally_closed(
+        self, engine_factory,
+    ):
+        engine, broker, client_order_id = self._dispatch_ambiguous(
+            engine_factory
+        )
+        broker.get_order_by_client_id_for_sweep.return_value = SimpleNamespace(
+            id="alpaca-opt-1",
+            status=SimpleNamespace(value="new"),
+            filled_qty="0",
+            filled_avg_price=None,
+            updated_at="2026-06-20T14:30:00+00:00",
+            submitted_at="2026-06-20T14:29:30+00:00",
+            filled_at=None,
+        )
+        engine._sweep_null_order_id_attaches(
+            _snapshot(), reason="cycle", budget=5,
+        )
+
+        self._detect_past_confirmation(engine)
+
+        assert engine._has_position(self.OCC)
+        assert self._external_close_rows(engine) == []
+        row = engine.lifecycle_orders_store.get_by_client_order_id(
+            client_order_id
+        )
+        assert row.status == "working"
+        parent = engine.lifecycle_store.get_by_position_uid(row.position_uid)
+        assert parent.status == "pending"
+
+
 class TestGenericSingleLegOptionTrailingStops:
     class GenericOptionStrategy(FakeStrategy):
         name = "generic_single_leg_options"

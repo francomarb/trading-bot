@@ -51,7 +51,11 @@ charge, limits the outer retry to safe reads, and never blindly retries a write.
 An ambiguous equity, single-leg-option, or MLEG entry/close submit remains
 `UNKNOWN`, retains ownership, and is recovered by its durable `client_order_id`.
 Each MLEG walk rung publishes its client ID before the write, so recovery targets
-the exact attempted order. Bar files are written through same-directory atomic replacement;
+the exact attempted order. A pre-registered entry whose durable lifecycle shows
+no fill is never declared externally closed: while unresolved, its absence from
+broker positions is expected; once it terminates without a fill, ownership is
+released without an external-close record. Bar files are written through
+same-directory atomic replacement;
 an unreadable or structurally invalid Parquet/metadata pair is moved to quarantine
 and refetched from the same feed.
 
@@ -415,7 +419,9 @@ stop-protection, and restart-reconciliation guarantee before behavior changes.
 - Preserve ambiguous equity, single-leg-option, and MLEG entry/close submissions
   as non-terminal. Publish each spread-walk rung's exact client ID before submit,
   retain ownership/close locks, and reconcile against Alpaca rather than retrying
-  or treating an uncertain write as rejection.
+  or treating an uncertain write as rejection. Release a pre-registration whose
+  entry reconciles without a fill, and never count a never-filled entry toward
+  external-close detection.
 - Add deterministic slow/hung Yahoo, 429/504, corrupt-Parquet, interruption, and
   slow-order tests.
 
@@ -435,6 +441,12 @@ earnings/IV persistence, or asynchronous order settlement is included.
 - **Yahoo metadata:** move earnings/IV refresh to shared durable prewarm only if
   the new phase/endpoint logs show it remains a material recurring delay. Preserve
   each strategy's current fail-open/fallback semantics in that separate design.
+- **Recovered option-fill completeness:** when an ambiguous single-leg option
+  entry later fills, route the recovered fill through the normal option-fill
+  effects so the execution alert, exact entry basis, and trailing-state seed are
+  populated. The current fallback still installs broker stop protection on the
+  next cycle, so this is accounting/observability completeness rather than an
+  unprotected-position defect.
 - **Cycle scheduling and evaluation order:** consider fixed-rate non-overlapping
   starts or owned-position-first processing only after start-lag and owned-position
   telemetry demonstrate a decision-relevant breach.
