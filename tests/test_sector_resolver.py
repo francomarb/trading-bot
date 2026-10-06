@@ -7,6 +7,7 @@ All tests are offline; yfinance and Alpaca API calls are mocked.
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -427,6 +428,30 @@ class TestSectorResolverHydrate:
         saved = json.loads(cache_file.read_text())
         assert saved["AMD"]["normalized"] == "semiconductors"
         assert "NVDA" not in saved
+
+    def test_hydrate_stops_after_real_lookup_deadline(self, tmp_path):
+        r = SectorResolver(
+            cache_path=tmp_path / "cache.json",
+            valid_sectors=VALID_SECTORS,
+            per_symbol_timeout=0.01,
+            total_timeout=1.0,
+        )
+
+        def hang(_symbol):
+            import time
+            time.sleep(1.0)
+            return None
+
+        with patch.object(r, "_lookup_with_retry", side_effect=hang) as lookup:
+            started = time.monotonic()
+            r.hydrate(["SLOW", "DEFERRED"])
+            elapsed = time.monotonic() - started
+
+        assert elapsed < 0.25
+        assert lookup.call_count == 1
+        saved = json.loads((tmp_path / "cache.json").read_text())
+        assert len(saved) == 1
+        assert set(saved).issubset({"SLOW", "DEFERRED"})
 
     def test_hydrate_retries_on_failure(self, tmp_path):
         r = SectorResolver(

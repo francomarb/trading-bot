@@ -63,6 +63,11 @@ from loguru import logger
 from config import settings
 from config.settings import SLIPPAGE_MODEL_MARKET_BPS
 from data.fetcher import StaleDataError, close_connections, fetch_symbol, require_fresh
+from utils.alpaca_transport import (
+    http_attempt_marker,
+    http_attempts_since,
+    rolling_http_attempt_count,
+)
 from engine.positions import (
     Position as EnginePosition,
     PositionLeg,
@@ -1127,6 +1132,8 @@ class TradingEngine:
         self._install_signal_handlers()
         self._running = True
         self._cycle_count = 0
+        startup_started = time.monotonic()
+        startup_request_marker = http_attempt_marker()
 
         self._seed_slippage_monitor()
 
@@ -1250,12 +1257,14 @@ class TradingEngine:
         self._sync_managed_stop_legs(startup_snapshot)
         self._sync_option_trailing_stops(startup_snapshot)
         self._repair_missing_protective_stops(startup_snapshot)
+        safety_ready_seconds = time.monotonic() - startup_started
 
         # Optional provider metadata and prewarm work belongs after the complete
         # broker-safety bootstrap. Failure is deliberately isolated: existing
         # cache/fail-open semantics allow the first cycle to proceed, while a
         # Yahoo or historical-data outage must never undo ownership restoration
         # or protective-stop repair.
+        metadata_started = time.monotonic()
         if post_safety_startup_hook is not None:
             try:
                 post_safety_startup_hook()
@@ -1264,6 +1273,7 @@ class TradingEngine:
                     "post_safety_startup_hook failed (trading continues): "
                     f"{exc}"
                 )
+        metadata_seconds = time.monotonic() - metadata_started
 
         slot_desc = ", ".join(
             f"{s.strategy.name}({len(s.active_symbols())})"
@@ -1275,6 +1285,13 @@ class TradingEngine:
             f"session_start_equity=${self._session_start_equity:,.2f}, "
             f"open_positions={len(startup_snapshot.account.open_positions)}, "
             f"open_orders={len(startup_snapshot.open_orders)}"
+        )
+        startup_attempts = http_attempts_since(startup_request_marker)
+        logger.info(
+            f"runtime startup: safety_ready={safety_ready_seconds:.3f}s, "
+            f"metadata={metadata_seconds:.3f}s, "
+            f"total={time.monotonic() - startup_started:.3f}s, "
+            f"http_attempts={len(startup_attempts)}"
         )
 
         try:
@@ -1294,12 +1311,18 @@ class TradingEngine:
                 # the trading loop — same hard rule as
                 # _flush_lifecycle_counters.
                 if post_cycle_hook is not None:
+                    hook_started = time.monotonic()
                     try:
                         post_cycle_hook()
                     except Exception as exc:  # noqa: BLE001
                         logger.warning(
                             f"post_cycle_hook failed (trading not "
                             f"affected): {exc}"
+                        )
+                    finally:
+                        logger.info(
+                            "runtime post_cycle_hook: "
+                            f"duration={time.monotonic() - hook_started:.3f}s"
                         )
                 if max_cycles is not None and self._cycle_count >= max_cycles:
                     logger.info(f"reached max_cycles={max_cycles}, stopping")
@@ -1940,6 +1963,12 @@ class TradingEngine:
         """
         cycle_id = self._cycle_count
         cycle_started_mono = time.monotonic()
+        cycle_started_wall = self._clock()
+        request_marker = http_attempt_marker()
+        phase_started = cycle_started_mono
+        phase_seconds: dict[str, float] = {}
+        owned_eval_seconds: list[tuple[str, float]] = []
+        start_lag_seconds = 0.0
         total_symbols = sum(len(slot.active_symbols()) for slot in self.slots)
         processed_symbols = 0
         new_positions = 0
@@ -1963,6 +1992,7 @@ class TradingEngine:
         if self._last_cycle_end is not None:
             gap = (self._clock() - self._last_cycle_end).total_seconds()
             expected = self.config.cycle_interval_seconds
+            start_lag_seconds = max(0.0, gap - expected)
             if gap > expected * 3 and gap > 60:
                 missed = int(gap / expected) - 1
                 logger.warning(
@@ -1982,6 +2012,7 @@ class TradingEngine:
             else:
                 market_status = market_open = True
                 market_state = "not_enforced"
+            phase_seconds["market_clock"] = time.monotonic() - phase_started
             # A failed clock check is common right after a wake, before the
             # network is back, and is not an answer: hold sleep-gap alerts
             # until a cycle gets one, then send them (open) or drop them.
@@ -2051,9 +2082,11 @@ class TradingEngine:
                 return
 
             try:
+                phase_started = time.monotonic()
                 snapshot = self.broker.sync_with_broker(
                     session_start_equity=self._session_start_equity
                 )
+                phase_seconds["broker_sync"] = time.monotonic() - phase_started
                 self._observe_equity(snapshot.account.equity)
                 self._last_snapshot = snapshot
             except Exception as e:
@@ -2071,6 +2104,8 @@ class TradingEngine:
                 f"open_orders={len(snapshot.open_orders)}, "
                 f"risk={risk_state}"
             )
+
+            phase_started = time.monotonic()
 
             self._sync_managed_stop_legs(snapshot)
             self._observe_stream_health()
@@ -2140,6 +2175,9 @@ class TradingEngine:
             # in the same cycle — not just what the broker reported at cycle start.
             running_account = snapshot.account
 
+            phase_seconds["reconciliation"] = time.monotonic() - phase_started
+            phase_started = time.monotonic()
+
             # Regime detection — runs once per cycle, before any slot.
             # Exits are never blocked by regime; only new entries are gated.
             current_regime = None
@@ -2203,6 +2241,9 @@ class TradingEngine:
             # already dispatched the close.
             if current_regime is MarketRegime.BEAR:
                 self._sweep_bear_spread_exits()
+
+            phase_seconds["regime"] = time.monotonic() - phase_started
+            phase_started = time.monotonic()
 
             # Order attribution — computed once per cycle for sleeve accounting.
             # Maps order_id → strategy_name for pending buy entries using
@@ -2276,6 +2317,7 @@ class TradingEngine:
                     strategy_reasons[symbol] = []
                     try:
                         processed_symbols += 1
+                        symbol_started = time.monotonic()
                         filled = self._process_symbol(
                             symbol,
                             snapshot,
@@ -2296,6 +2338,13 @@ class TradingEngine:
                             watchlist_ordinal=watchlist_ordinal,
                             evaluation_ordinal=current_evaluation_ordinal,
                         )
+                        if (
+                            symbol in snapshot.account.open_positions
+                            and self._get_owner(symbol) == slot.strategy.name
+                        ):
+                            owned_eval_seconds.append(
+                                (symbol, time.monotonic() - symbol_started)
+                            )
                         if filled is not None:
                             new_positions += 1
                             # Merge the new position into the running account so
@@ -2315,6 +2364,7 @@ class TradingEngine:
                         # Never let one symbol kill the cycle.
                         self._cycle_symbol_error_count += 1
                         logger.exception(f"{symbol}: cycle step failed: {e}")
+            phase_seconds["strategy_evaluation"] = time.monotonic() - phase_started
         except Exception as exc:
             # A cycle-level phase (drains, reconciles) is outside the
             # per-symbol isolation above. Record the traceback in the log
@@ -2360,6 +2410,42 @@ class TradingEngine:
             close_connections()
             self.broker.close_connections()
             self._last_cycle_end = self._clock()
+            active_seconds = time.monotonic() - cycle_started_mono
+            wall_seconds = max(
+                0.0, (self._last_cycle_end - cycle_started_wall).total_seconds()
+            )
+            suspended_seconds = max(0.0, wall_seconds - active_seconds)
+            attempts = http_attempts_since(request_marker)
+            failed_attempts = sum(
+                attempt.error_type is not None
+                or (attempt.status_code is not None and attempt.status_code >= 400)
+                for attempt in attempts
+            )
+            slow_attempts = sorted(
+                attempts, key=lambda attempt: attempt.elapsed_ms, reverse=True
+            )[:3]
+            slow_text = ",".join(
+                f"{attempt.method}:{attempt.endpoint}:{attempt.elapsed_ms:.0f}ms"
+                for attempt in slow_attempts
+            ) or "none"
+            phase_text = ",".join(
+                f"{name}:{elapsed:.3f}s"
+                for name, elapsed in phase_seconds.items()
+            ) or "none"
+            owned_text = ",".join(
+                f"{symbol}:{elapsed:.3f}s"
+                for symbol, elapsed in sorted(
+                    owned_eval_seconds, key=lambda item: item[1], reverse=True
+                )[:5]
+            ) or "none"
+            logger.info(
+                f"runtime cycle {cycle_id}: active={active_seconds:.3f}s, "
+                f"wall={wall_seconds:.3f}s, suspended={suspended_seconds:.3f}s, "
+                f"start_lag={start_lag_seconds:.3f}s, phases={phase_text}, "
+                f"http_attempts={len(attempts)}, http_failures={failed_attempts}, "
+                f"http_attempts_60s={rolling_http_attempt_count()}, "
+                f"slow_http={slow_text}, owned_evaluations={owned_text}"
+            )
 
     def _record_cycle_symbol_error(self, message: str) -> None:
         """Log a handled symbol error and include it in the cycle summary."""
@@ -10022,6 +10108,24 @@ class TradingEngine:
                 self._external_close_suspects.pop(position_id, None)
                 continue
 
+            # A pre-registered entry that never filled cannot have been
+            # closed externally. While its durable lifecycle is still
+            # pending, the order may be walking at a worker, awaiting
+            # client-order-id recovery after an ambiguous submit, or resting
+            # at Alpaca. Once every entry order is terminal without a fill,
+            # no worker will report it again: release the ownership the same
+            # way the fill drains roll back a rejected entry.
+            unfilled_status = self._unfilled_entry_status(
+                position_id, tracked_position,
+            )
+            if unfilled_status is not None:
+                self._external_close_suspects.pop(position_id, None)
+                if unfilled_status == "canceled":
+                    self._release_unfilled_pre_registration(
+                        position_id, tracked_position,
+                    )
+                continue
+
             count = self._external_close_suspects.get(position_id, 0) + 1
             self._external_close_suspects[position_id] = count
 
@@ -10160,6 +10264,65 @@ class TradingEngine:
                     self._entry_prices.pop(broker_symbol, None)
             except Exception as e:
                 logger.error(f"{broker_symbol}: failed to log external close: {e}")
+
+    def _unfilled_entry_status(
+        self,
+        position_id: str,
+        tracked_position: EnginePosition,
+    ) -> str | None:
+        """Identify a durable entry that has never produced a position.
+
+        ``pending`` means an entry is still unresolved; ``canceled`` means
+        reconciliation proved every entry attempt terminal without a fill.
+        Any fill evidence, other lifecycle state, absent row, or read failure
+        falls back to ordinary external-close handling.
+        """
+        if self.lifecycle_store is None:
+            return None
+        position_uid = (
+            spread_substrate_uid(position_id)
+            if tracked_position.is_spread
+            else position_id
+        )
+        try:
+            row = self.lifecycle_store.get_by_position_uid(position_uid)
+        except Exception as exc:
+            logger.warning(
+                f"{position_id}: lifecycle lookup for external-close check "
+                f"failed: {type(exc).__name__}: {exc}"
+            )
+            return None
+        if row is None or row.status not in {"pending", "canceled"}:
+            return None
+        if row.first_fill_at is not None or float(row.current_qty or 0.0) != 0.0:
+            return None
+        return row.status
+
+    def _release_unfilled_pre_registration(
+        self,
+        position_id: str,
+        tracked_position: EnginePosition,
+    ) -> None:
+        """Release ownership of an entry reconciled terminal with no fill.
+
+        This mirrors the option/spread drain rollback when broker truth arrives
+        through client-ID reconciliation instead of a live worker callback.
+        No trade row is written because nothing traded.
+        """
+        self._pop_position(position_id)
+        if tracked_position.is_spread:
+            self._pending_spread_plans.pop(position_id, None)
+            strategy = self._spread_owner_strategy.pop(position_id, None)
+            if strategy is not None and hasattr(strategy, "release_spread"):
+                strategy.release_spread(position_id)
+        else:
+            leg = tracked_position.primary_leg
+            if leg is not None:
+                self._entry_prices.pop(leg.symbol, None)
+        logger.info(
+            f"{position_id}: entry owned by '{tracked_position.strategy_name}' "
+            "resolved without a fill — pre-registered ownership released"
+        )
 
     def _drain_lifecycle_attaches(self) -> None:
         """Apply per-order substrate attaches enqueued by background
@@ -10418,12 +10581,13 @@ class TradingEngine:
               unknown_to_broker`` so the position-status CTE
               advances the parent out of pending.
 
-        Scope (excluded by ``get_orphaned_pending_single_leg_orders``):
-          - Spreads (PR #72 §10.7 has its own crash-durable path) —
-            the ``position_type='single_leg'`` JOIN filters BOTH
-            the spread ``exit`` row AND the intentional
-            ``partial_close`` residual placeholder, which is the
-            only load-bearing exclusion.
+        Scope:
+          - Single-leg rows and spread entry rows are read from
+            ``get_orphaned_pending_single_leg_orders`` (the historical method
+            name predates spread-entry substrate support).
+          - Spread close rows participate only at ``status='unknown'`` after
+            an ambiguous submit. The intentional ``pending`` partial-close
+            residual placeholder is never queried at Alpaca.
           - Rows newer than ``_SUBSTRATE_NULL_ATTACH_SWEEP_MIN_AGE_
             SECONDS`` (let the normal attach queue drain naturally).
 
@@ -10471,7 +10635,7 @@ class TradingEngine:
             # _reconcile_substrate_via_rest's pattern. With LIMIT
             # at SQL, a persistently-failing oldest row would
             # repeatedly fill the budget and starve newer orphans.
-            orphans = (
+            orphans = list(
                 self.lifecycle_orders_store
                 .get_orphaned_pending_single_leg_orders(
                     min_age_seconds=(
@@ -10480,6 +10644,23 @@ class TradingEngine:
                     limit=None,
                 )
             )
+            spread_close_orphans = (
+                self.lifecycle_orders_store
+                .get_orphaned_unknown_spread_close_orders(
+                    min_age_seconds=(
+                        _SUBSTRATE_NULL_ATTACH_SWEEP_MIN_AGE_SECONDS
+                    ),
+                )
+            )
+            orphans.extend(spread_close_orphans)
+            spread_close_cloids = {
+                row.client_order_id for row in spread_close_orphans
+            }
+            flexible_attach_cloids = spread_close_cloids | {
+                row.client_order_id
+                for row in orphans
+                if row.role == "entry_primary" and row.status == "unknown"
+            }
         except Exception as exc:
             logger.critical(
                 f"substrate {reason} null-attach sweep: orphan query "
@@ -10617,11 +10798,24 @@ class TradingEngine:
             # as benign by re-checking the row.
             attached = False
             try:
-                self.lifecycle_orders_store.attach_broker_order_id(
-                    client_order_id=cli,
-                    order_id=broker_order_id,
-                )
-                attached = True
+                if cli in flexible_attach_cloids:
+                    attached = (
+                        self.lifecycle_orders_store
+                        .attach_or_update_order_id_for_walk_step(
+                            client_order_id=cli,
+                            order_id=broker_order_id,
+                        )
+                    )
+                    if not attached:
+                        raise ValueError(
+                            "spread close row was resolved before attach"
+                        )
+                else:
+                    self.lifecycle_orders_store.attach_broker_order_id(
+                        client_order_id=cli,
+                        order_id=broker_order_id,
+                    )
+                    attached = True
             except ValueError as exc:
                 refreshed = (
                     self.lifecycle_orders_store
@@ -10673,6 +10867,13 @@ class TradingEngine:
                     f"{broker_order_id} role={row.role}"
                 )
 
+            # Spread closes have a dedicated accounting reconciler.  Once
+            # the exact broker ID is attached, leave both live and terminal
+            # outcomes to that path later in this same cycle; the generic
+            # dispatch helpers are deliberately single-leg only.
+            if cli in spread_close_cloids:
+                continue
+
             # Build the broker-state event and apply it. Alpaca
             # status 'new' / 'accepted' maps to substrate 'working'
             # (see _ALPACA_STATUS_TO_SUBSTRATE_STATUS above), so an
@@ -10722,6 +10923,12 @@ class TradingEngine:
                 self._maybe_dispatch_substrate_stop_fill(
                     event=event, snapshot=snapshot,
                 )
+                if row.status == "unknown":
+                    self._queue_recovered_spread_outcome(
+                        row=row,
+                        event=event,
+                        closing=False,
+                    )
 
     def _release_resolved_order_watch(
         self,
@@ -10904,11 +11111,59 @@ class TradingEngine:
                 self._maybe_dispatch_substrate_stop_fill(
                     event=event, snapshot=snapshot,
                 )
+                if row.status == "unknown":
+                    self._queue_recovered_spread_outcome(
+                        row=row,
+                        event=event,
+                        closing=False,
+                    )
             else:
                 logger.debug(
                     f"substrate {reason} reconcile: order_id={oid} "
                     f"no-op ({outcome.reason})"
                 )
+
+    def _queue_recovered_spread_outcome(
+        self,
+        *,
+        row: "Any",
+        event: "Any",
+        closing: bool,
+    ) -> None:
+        """Route a recovered ambiguous spread write through its normal drain.
+
+        Normal MLEG submissions are reported by their worker and must not be
+        duplicated here.  Callers therefore invoke this only when the row was
+        already ``unknown`` before broker reconciliation.  Terminal broker
+        truth is queued into the same engine path the worker would have used.
+        """
+        if event.status not in {"filled", "canceled", "rejected"}:
+            return
+        expected_roles = (
+            {"exit", "partial_close"} if closing else {"entry_primary"}
+        )
+        if row.role not in expected_roles or self.lifecycle_store is None:
+            return
+        try:
+            parent = self.lifecycle_store.get_by_position_uid(row.position_uid)
+            if parent is None or parent.position_type != "spread":
+                return
+            self.broker.queue_recovered_spread_outcome(
+                position_id=parent.owner_key,
+                strategy_name=parent.strategy,
+                closing=closing,
+                status=event.status,
+                filled_qty=float(event.filled_qty or 0.0),
+                avg_fill_price=event.avg_fill_price,
+                order_id=event.order_id,
+                submitted_limit_price=row.intended_limit_price,
+            )
+        except Exception as exc:
+            logger.critical(
+                f"recovered spread outcome could not be queued for "
+                f"client_order_id={row.client_order_id}: "
+                f"{type(exc).__name__}: {exc}"
+            )
 
     @staticmethod
     def _build_substrate_event_from_broker_order(
@@ -11045,6 +11300,12 @@ class TradingEngine:
                     f"role={row.role} advanced to status={event.status} "
                     f"qty={event.filled_qty}"
                 )
+                if row.status == "unknown":
+                    self._queue_recovered_spread_outcome(
+                        row=row,
+                        event=event,
+                        closing=True,
+                    )
             except Exception as exc:
                 logger.critical(
                     f"spread close {reason} reconcile: "
@@ -11065,9 +11326,11 @@ class TradingEngine:
         """
         fills = self.broker.drain_option_fills()
         for decision, status_str, filled_qty, avg_fill_price, order_id, position_uid in fills:
-            mapped = {"filled": OrderStatus.FILLED, "partially_filled": OrderStatus.PARTIAL}.get(
-                status_str, OrderStatus.CANCELED
-            )
+            mapped = {
+                "filled": OrderStatus.FILLED,
+                "partially_filled": OrderStatus.PARTIAL,
+                "unknown": OrderStatus.UNKNOWN,
+            }.get(status_str, OrderStatus.CANCELED)
             result = OrderResult(
                 status=mapped,
                 order_id=order_id,
@@ -11079,6 +11342,16 @@ class TradingEngine:
                 message=f"options async fill: {status_str}",
                 position_uid=position_uid,
             )
+            if result.status is OrderStatus.UNKNOWN:
+                message = (
+                    f"[{decision.strategy_name}] option entry submit outcome "
+                    f"UNKNOWN for {decision.symbol}; ownership and durable "
+                    "order row preserved for client-order-id reconciliation"
+                )
+                logger.critical(message)
+                self.risk.record_broker_error()
+                self.alerts.broker_error(message)
+                continue
             if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
                 self.broker._lifecycle_mark_filled(
                     position_uid=position_uid,
@@ -12439,11 +12712,19 @@ class TradingEngine:
                         filled_qty=float(filled_qty or 0.0),
                         avg_fill_price=avg_fill_price,
                     )
-                    message = (
-                        f"[{strategy_name}] spread entry unresolved after "
-                        f"partial fill — position_id={position_id[:8]} "
-                        f"order={order_id}; manual broker reconciliation required"
-                    )
+                    if float(filled_qty or 0.0) > 0:
+                        message = (
+                            f"[{strategy_name}] spread entry unresolved after "
+                            f"partial fill — position_id={position_id[:8]} "
+                            f"order={order_id}; manual broker reconciliation required"
+                        )
+                    else:
+                        message = (
+                            f"[{strategy_name}] spread entry submit outcome "
+                            f"UNKNOWN — position_id={position_id[:8]}; "
+                            "pre-registration preserved for client-order-id "
+                            "reconciliation"
+                        )
                     logger.critical(message)
                     self.risk.record_broker_error()
                     self.alerts.broker_error(message)
@@ -12653,6 +12934,24 @@ class TradingEngine:
                         f"spread close substrate lookup failed for "
                         f"position_id={position_id[:8]}: {exc}"
                     )
+            if status == "unknown":
+                if substrate_close_row is not None:
+                    self._lifecycle_orders_finalize_spread_close(
+                        client_order_id=substrate_close_row.client_order_id,
+                        broker_order_id=order_id,
+                        status="unknown",
+                        filled_qty=float(filled_qty or 0.0),
+                        avg_fill_price=avg_fill_price,
+                    )
+                message = (
+                    f"[{strategy_name}] spread close submit outcome UNKNOWN — "
+                    f"position_id={position_id[:8]}; position and close lock "
+                    "preserved for client-order-id reconciliation"
+                )
+                logger.critical(message)
+                self.risk.record_broker_error()
+                self.alerts.broker_error(message)
+                continue
             if filled:
                 # PR #56 R5: peek at the open spread BEFORE releasing so
                 # we can detect a partial close (close_qty < released.qty)

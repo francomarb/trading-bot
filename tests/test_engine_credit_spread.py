@@ -824,6 +824,30 @@ class TestDrainSpreadFills:
         assert not _has_pending_close_substrate(engine, "p1")
         assert len(strategy.open_spreads) == 1
 
+    def test_close_unknown_preserves_position_and_close_lock(self, tmp_path):
+        from engine.positions import spread_substrate_uid
+
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        engine.alerts = MagicMock()
+        self._pre_register(engine, strategy, "p1")
+        _mark_close_pending_in_substrate(engine, "p1")
+        broker.drain_spread_fills.return_value = [
+            ("p1", "credit_spread", True, "unknown", 0.0, None, None, 0.60),
+        ]
+
+        engine._drain_spread_fills()
+
+        assert "p1" in engine._positions
+        assert _has_pending_close_substrate(engine, "p1")
+        rows = engine.lifecycle_orders_store.get_non_terminal_by_role(
+            spread_substrate_uid("p1"),
+            ("exit", "partial_close"),
+        )
+        assert len(rows) == 1
+        assert rows[0].status == "unknown"
+        engine.alerts.broker_error.assert_called_once()
+
 
 # ── Exit path ───────────────────────────────────────────────────────────────
 
@@ -1421,7 +1445,9 @@ class TestSpreadExternalCloseDetection:
         engine.trade_logger.log_external_close.assert_not_called()
         engine.trade_logger.log_spread_fill.assert_not_called()
 
-    def test_spread_with_all_legs_absent_logs_spread_close_not_single_leg_close(self, tmp_path):
+    def test_spread_with_all_legs_absent_logs_spread_close_not_single_leg_close(
+        self, tmp_path,
+    ):
         strategy = _strategy()
         engine, _ = _engine(tmp_path, strategy)
         object.__setattr__(engine.config, "external_close_confirm_cycles", 1)
@@ -1435,11 +1461,14 @@ class TestSpreadExternalCloseDetection:
         assert strategy.get_open_spread("uuid-1") is None
         engine.trade_logger.log_external_close.assert_not_called()
         engine.trade_logger.log_spread_fill.assert_called_once()
-        assert engine.trade_logger.log_spread_fill.call_args.kwargs["position_id"] == "uuid-1"
-        assert engine.trade_logger.log_spread_fill.call_args.kwargs["opening"] is False
-        assert engine.trade_logger.log_spread_fill.call_args.kwargs["reason"] == "external_close_detected"
+        kwargs = engine.trade_logger.log_spread_fill.call_args.kwargs
+        assert kwargs["position_id"] == "uuid-1"
+        assert kwargs["opening"] is False
+        assert kwargs["reason"] == "external_close_detected"
 
-    def test_spread_with_one_missing_leg_keeps_ownership_for_manual_reconciliation(self, tmp_path):
+    def test_spread_with_one_missing_leg_keeps_ownership_for_manual_reconciliation(
+        self, tmp_path,
+    ):
         strategy = _strategy()
         engine, _ = _engine(tmp_path, strategy)
         object.__setattr__(engine.config, "external_close_confirm_cycles", 1)
@@ -1456,6 +1485,156 @@ class TestSpreadExternalCloseDetection:
         engine.trade_logger.log_external_close.assert_not_called()
         engine.trade_logger.log_spread_fill.assert_not_called()
 
+
+class TestAmbiguousSpreadEntryResolution:
+    """Ambiguous MLEG entries must not become false external closes."""
+
+    @staticmethod
+    def _enter(tmp_path):
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        engine.alerts = MagicMock()
+        broker.dispatch_spread_order.return_value = OrderResult(
+            status=OrderStatus.ACCEPTED,
+            order_id="spread-worker-1",
+            symbol="SPY",
+            requested_qty=1,
+            filled_qty=0.0,
+            avg_fill_price=0.0,
+            raw_status="accepted",
+            message="",
+        )
+        with patch(
+            "strategies.credit_spread.find_best_put_spread",
+            return_value=_pick(),
+        ):
+            engine._enter_multi_leg(
+                strategy=strategy,
+                symbol="SPY",
+                underlying_close=745.0,
+                notional_cap=2_000.0,
+                signal_key=_SIGNAL_KEY,
+                signal_bar=_SIGNAL_BAR,
+                strategy_statuses={},
+                strategy_reasons={},
+            )
+        kwargs = broker.dispatch_spread_order.call_args.kwargs
+        return (
+            engine,
+            broker,
+            strategy,
+            kwargs["position_id"],
+            kwargs["entry_substrate_cloid"],
+        )
+
+    def _dispatch_ambiguous(self, tmp_path):
+        engine, broker, strategy, position_id, client_order_id = (
+            self._enter(tmp_path)
+        )
+        broker.drain_spread_fills.return_value = [
+            (position_id, "credit_spread", False, "unknown", 0.0,
+             None, None, -1.45),
+        ]
+        engine._drain_spread_fills()
+        broker.drain_spread_fills.return_value = []
+        assert position_id in engine._positions
+        aged = (
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        ).isoformat()
+        conn = engine.lifecycle_orders_store._conn
+        conn.execute(
+            "UPDATE position_lifecycle_orders SET created_at = ? "
+            "WHERE client_order_id = ?",
+            (aged, client_order_id),
+        )
+        conn.commit()
+        return engine, broker, strategy, position_id
+
+    @staticmethod
+    def _run_cycles_past_confirmation(engine) -> None:
+        empty = _snapshot_with({})
+        for _ in range(engine.config.external_close_confirm_cycles + 1):
+            engine._detect_external_closes(empty)
+            engine._drain_spread_fills()
+
+    @staticmethod
+    def _external_close_rows(engine) -> list[dict]:
+        return [
+            row for row in engine.trade_logger.read_all()
+            if row["reason"] == "external_close_detected"
+        ]
+
+    def test_order_alpaca_never_accepted_rolls_back_pre_registration(
+        self, tmp_path,
+    ):
+        engine, broker, strategy, position_id = (
+            self._dispatch_ambiguous(tmp_path)
+        )
+        broker.get_order_by_client_id_for_sweep.return_value = None
+        engine._sweep_null_order_id_attaches(
+            _snapshot_with({}), reason="cycle", budget=5,
+        )
+
+        self._run_cycles_past_confirmation(engine)
+
+        assert self._external_close_rows(engine) == []
+        assert position_id not in engine._positions
+        assert position_id not in engine._pending_spread_plans
+        assert position_id not in engine._spread_owner_strategy
+        assert strategy.open_spreads == []
+
+    def test_order_resting_at_alpaca_is_not_externally_closed(
+        self, tmp_path,
+    ):
+        engine, broker, strategy, position_id = (
+            self._dispatch_ambiguous(tmp_path)
+        )
+        broker.get_order_by_client_id_for_sweep.return_value = SimpleNamespace(
+            id="alpaca-entry-1",
+            status=SimpleNamespace(value="new"),
+            filled_qty="0",
+            filled_avg_price=None,
+            updated_at="2026-06-20T14:30:00+00:00",
+            submitted_at="2026-06-20T14:29:30+00:00",
+            filled_at=None,
+        )
+        engine._sweep_null_order_id_attaches(
+            _snapshot_with({}), reason="cycle", budget=5,
+        )
+
+        self._run_cycles_past_confirmation(engine)
+
+        assert position_id in engine._positions
+        assert strategy.get_open_spread(position_id) is not None
+        assert self._external_close_rows(engine) == []
+
+    @pytest.mark.parametrize(
+        ("filled_qty", "avg_fill_price", "expected", "unexpected"),
+        [
+            (0.0, None, "submit outcome UNKNOWN", "partial fill"),
+            (0.5, -1.50, "partial fill", "submit outcome UNKNOWN"),
+        ],
+        ids=["ambiguous_submit", "unsettled_partial"],
+    )
+    def test_unknown_entry_alert_names_what_was_observed(
+        self,
+        tmp_path,
+        filled_qty,
+        avg_fill_price,
+        expected,
+        unexpected,
+    ):
+        engine, broker, _, position_id, _ = self._enter(tmp_path)
+        broker.drain_spread_fills.return_value = [
+            (position_id, "credit_spread", False, "unknown", filled_qty,
+             avg_fill_price, None, -1.45),
+        ]
+
+        engine._drain_spread_fills()
+
+        message = engine.alerts.broker_error.call_args.args[0]
+        assert expected in message
+        assert unexpected not in message
 
 # ── Startup reconciliation — spread reconstruction ──────────────────────────
 
@@ -2316,6 +2495,40 @@ class TestSpreadCloseReconciler:
         assert row.status == "filled"
         assert row.filled_qty == 1.0
         assert row.avg_fill_price == pytest.approx(0.60)
+
+    def test_recovered_unknown_close_is_queued_for_normal_accounting(
+        self, tmp_path,
+    ):
+        engine, broker, _ = self._setup_with_pending_close_row(tmp_path)
+        engine.lifecycle_orders_store.mark_terminal_after_dispatch(
+            client_order_id="close-cloid",
+            broker_order_id="b-1",
+            status="unknown",
+            filled_qty=0.0,
+            avg_fill_price=None,
+        )
+        broker._api = MagicMock()
+        broker._api.get_order_by_id.return_value = SimpleNamespace(
+            status="filled", id="b-1", filled_qty="1",
+            filled_avg_price="0.60",
+            updated_at="2026-06-20T15:00:00Z",
+        )
+        broker._with_retry = lambda fn, op_desc=None: fn()
+
+        engine._reconcile_substrate_spread_closes(
+            SimpleNamespace(open_orders=[]), reason="cycle",
+        )
+
+        broker.queue_recovered_spread_outcome.assert_called_once_with(
+            position_id="p1",
+            strategy_name="credit_spread",
+            closing=True,
+            status="filled",
+            filled_qty=1.0,
+            avg_fill_price=0.60,
+            order_id="b-1",
+            submitted_limit_price=None,
+        )
 
     def test_cycle_reconciler_skips_open_order(self, tmp_path):
         """Row whose order_id is still in broker.open_orders is left

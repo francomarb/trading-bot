@@ -15,8 +15,8 @@ shape of Alpaca's TradingClient. The tests pin the contract:
     if no position exists.
   - sync_with_broker bundles account + positions + open orders.
   - get_positions normalises Alpaca's position shape into Position.
-  - retry wrapper retries 429 / 5xx / network, raises on 4xx, gives up after
-    max_attempts.
+  - Alpaca's SDK owns native 429/504 handling; the bot bounds safe-read
+    retries and attempts mutating writes only once.
 
 Tests use `time.sleep` patches so the suite stays fast even when polling
 loops are exercised.
@@ -1858,24 +1858,80 @@ class TestReadSide:
 
 
 class TestRetry:
-    def test_retries_on_429_then_succeeds(self):
+    def test_mutating_submit_is_not_blindly_retried(self):
         api = MagicMock()
         api.submit_order.side_effect = [_api_error(429), _alpaca_order(status="filled")]
         api.get_order_by_id.return_value = _alpaca_order(status="filled")
         result = _broker_with_mock(api).place_order(_decision(), poll_timeout=0.0)
-        assert result.status is OrderStatus.FILLED
-        assert api.submit_order.call_count == 2
+        assert result.status is OrderStatus.UNKNOWN
+        assert result.raw_status == "submit_unknown"
+        assert api.submit_order.call_count == 1
+
+    def test_transport_error_on_submit_is_attempted_once(self):
+        api = MagicMock()
+        api.submit_order.side_effect = TimeoutError("response timed out")
+
+        result = _broker_with_mock(api).place_order(
+            _decision(), poll_timeout=0.0,
+        )
+
+        assert result.status is OrderStatus.UNKNOWN
+        assert result.raw_status == "submit_unknown"
+        assert api.submit_order.call_count == 1
+
+    def test_5xx_on_submit_is_attempted_once(self):
+        api = MagicMock()
+        api.submit_order.side_effect = _api_error(503, "unavailable")
+
+        result = _broker_with_mock(api).place_order(
+            _decision(), poll_timeout=0.0,
+        )
+
+        assert result.status is OrderStatus.UNKNOWN
+        assert result.raw_status == "submit_unknown"
+        assert api.submit_order.call_count == 1
+
+    def test_ambiguous_submit_keeps_lifecycle_pending_for_client_id_recovery(
+        self, tmp_path,
+    ):
+        from engine.lifecycle_orders import PositionLifecycleOrdersStore
+
+        api = MagicMock()
+        api.submit_order.side_effect = TimeoutError("response timed out")
+        trade_logger = TradeLogger(path=str(tmp_path / "trades.db"))
+        conn = trade_logger._ensure_db()
+        lifecycle_store = PositionLifecycleStore(conn)
+        orders_store = PositionLifecycleOrdersStore(conn)
+        broker = AlpacaBroker(
+            client=api,
+            max_attempts=3,
+            base_delay=0.0,
+            lifecycle_store=lifecycle_store,
+            lifecycle_orders_store=orders_store,
+        )
+        try:
+            result = broker.place_order(_decision(), poll_timeout=0.0)
+
+            assert result.status is OrderStatus.UNKNOWN
+            assert result.position_uid is not None
+            rows = orders_store.get_all_for_position(result.position_uid)
+            assert len(rows) == 1
+            assert rows[0].status == "pending"
+            assert rows[0].order_id is None
+            assert rows[0].client_order_id in result.message
+            assert api.submit_order.call_count == 1
+        finally:
+            trade_logger.close()
 
     def test_retries_on_503(self):
         api = MagicMock()
         api.get_all_positions.side_effect = [
             _api_error(503),
-            _api_error(502),
             [],
         ]
         positions = _broker_with_mock(api).get_positions()
         assert positions == {}
-        assert api.get_all_positions.call_count == 3
+        assert api.get_all_positions.call_count == 2
 
     def test_4xx_other_than_429_raises_immediately(self):
         api = MagicMock()
@@ -1890,7 +1946,7 @@ class TestRetry:
         broker = AlpacaBroker(client=api, max_attempts=2, base_delay=0.0)
         with pytest.raises(APIError):
             broker.get_positions()
-        assert api.get_all_positions.call_count == 2
+        assert api.get_all_positions.call_count == 1
 
     def test_network_error_retried(self):
         api = MagicMock()

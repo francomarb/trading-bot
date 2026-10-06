@@ -24,7 +24,10 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -37,14 +40,21 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from loguru import logger
-from requests.adapters import HTTPAdapter
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import Timeout as RequestsTimeout
 
+from config import settings
 from config.settings import (
     ALPACA_API_KEY,
     ALPACA_SECRET_KEY,
     ALPACA_DATA_FEED,
     ARRIVAL_QUOTE_MAX_AGE_SECONDS,
     ARRIVAL_QUOTE_MAX_SPREAD_BPS,
+)
+from utils.alpaca_transport import (
+    AlpacaTimeoutAdapter as _TimeoutAdapter,
+    configure_alpaca_client,
+    install_alpaca_transport as _install_timeout,
 )
 
 
@@ -121,23 +131,10 @@ class StaleDataError(Exception):
 
 # ── HTTP timeout adapter ─────────────────────────────────────────────────────
 
-HTTP_TIMEOUT_SECONDS = 30
-
-
-class _TimeoutAdapter(HTTPAdapter):
-    """HTTPAdapter that enforces a default timeout on every request."""
-
-    def send(self, request, **kwargs):
-        if kwargs.get("timeout") is None:
-            kwargs["timeout"] = HTTP_TIMEOUT_SECONDS
-        return super().send(request, **kwargs)
-
-
-def _install_timeout(session) -> None:
-    """Mount the timeout adapter on a requests.Session."""
-    adapter = _TimeoutAdapter()
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
+HTTP_TIMEOUT_SECONDS = (
+    settings.ALPACA_HTTP_CONNECT_TIMEOUT_SECONDS,
+    settings.ALPACA_HTTP_READ_TIMEOUT_SECONDS,
+)
 
 
 # ── Client (lazy singleton) ──────────────────────────────────────────────────
@@ -154,11 +151,10 @@ def close_connections() -> None:
 def _get_client() -> StockHistoricalDataClient:
     global _client
     if _client is None:
-        _client = StockHistoricalDataClient(
+        _client = configure_alpaca_client(StockHistoricalDataClient(
             api_key=ALPACA_API_KEY,
             secret_key=ALPACA_SECRET_KEY,
-        )
-        _install_timeout(_client._session)
+        ))
     return _client
 
 
@@ -625,11 +621,39 @@ def _read_cache(symbol: str, timeframe: str, adjustment: str, feed: str) -> pd.D
                 return pd.DataFrame()
         else:
             return pd.DataFrame()
-    df = pd.read_parquet(path)
-    # Parquet round-trip should preserve tz, but belt-and-suspenders.
-    if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is None:
-        df.index = df.index.tz_localize("UTC")
-    return df
+    meta_path = path.with_suffix(".meta.json")
+    try:
+        df = pd.read_parquet(path)
+        # Parquet round-trip should preserve tz, but belt-and-suspenders.
+        if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        return _validate(df, symbol)
+    except Exception as exc:
+        quarantined = _quarantine_cache_files(path, meta_path)
+        logger.error(
+            f"{symbol}: unreadable/invalid {feed} cache quarantined "
+            f"({type(exc).__name__}: {exc}); files={quarantined or 'none'}"
+        )
+        return pd.DataFrame()
+
+
+def _quarantine_cache_files(*paths: Path) -> list[str]:
+    """Move damaged cache artifacts aside without deleting evidence."""
+
+    existing = [path for path in paths if path.exists()]
+    if not existing:
+        return []
+    quarantine_dir = (
+        CACHE_DIR / "quarantine" /
+        f"{datetime.now(timezone.utc):%Y%m%dT%H%M%S%fZ}-{uuid.uuid4().hex[:8]}"
+    )
+    quarantine_dir.mkdir(parents=True, exist_ok=False)
+    moved: list[str] = []
+    for path in existing:
+        destination = quarantine_dir / path.name
+        os.replace(path, destination)
+        moved.append(str(destination))
+    return moved
 
 
 def _read_meta(
@@ -698,7 +722,13 @@ def _write_cache(
         return
     cache_path = _cache_path(symbol, timeframe, adjustment, feed)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(cache_path)
+    data_fd, data_tmp_name = tempfile.mkstemp(
+        dir=cache_path.parent,
+        prefix=f".{cache_path.name}.",
+        suffix=".tmp",
+    )
+    os.close(data_fd)
+    data_tmp = Path(data_tmp_name)
     meta: dict = {
         "covered_start": covered_start.isoformat(),
         "covered_end": covered_end.isoformat(),
@@ -707,19 +737,52 @@ def _write_cache(
         meta["absent_sessions"] = sorted(d.isoformat() for d in absent_sessions)
     if gap_seen_once:
         meta["gap_seen_once"] = sorted(d.isoformat() for d in gap_seen_once)
-    _meta_path(symbol, timeframe, adjustment, feed).write_text(json.dumps(meta))
+    meta_path = _meta_path(symbol, timeframe, adjustment, feed)
+    meta_fd, meta_tmp_name = tempfile.mkstemp(
+        dir=meta_path.parent,
+        prefix=f".{meta_path.name}.",
+        suffix=".tmp",
+    )
+    os.close(meta_fd)
+    meta_tmp = Path(meta_tmp_name)
+    try:
+        df.to_parquet(data_tmp)
+        meta_tmp.write_text(json.dumps(meta))
+        # Remove the old descriptor before publishing new data. A crash at
+        # any point before the final replace therefore leaves either the old
+        # valid pair or data with no coverage claim (which safely refetches).
+        meta_path.unlink(missing_ok=True)
+        os.replace(data_tmp, cache_path)
+        os.replace(meta_tmp, meta_path)
+    finally:
+        data_tmp.unlink(missing_ok=True)
+        meta_tmp.unlink(missing_ok=True)
 
 
 # ── Retry wrapper ────────────────────────────────────────────────────────────
 
 
 def _with_retry(
-    fn, *, max_attempts: int = 5, base_delay: float = 1.0, op_desc: str = "API call"
+    fn,
+    *,
+    max_attempts: int | None = None,
+    base_delay: float | None = None,
+    op_desc: str = "API call",
 ):
+    """Retry a safe read only where alpaca-py lacks native coverage.
+
+    alpaca-py already retries 429 and 504 internally.  Repeating those here
+    multiplied one logical request into as many as twenty physical attempts.
+    This outer boundary therefore retries only transport failures and other
+    transient 5xx responses, never 429/504, and never sleeps after the final
+    attempt.
     """
-    Call `fn()` with exponential backoff on rate-limit (HTTP 429) or transient
-    network errors. Raises the final exception if all attempts fail.
-    """
+    if max_attempts is None:
+        max_attempts = settings.ALPACA_SAFE_READ_MAX_ATTEMPTS
+    if base_delay is None:
+        base_delay = settings.ALPACA_SAFE_READ_RETRY_DELAY_SECONDS
+    if max_attempts <= 0:
+        raise ValueError("max_attempts must be positive")
     delay = base_delay
     last_exc: Exception | None = None
     for attempt in range(1, max_attempts + 1):
@@ -728,8 +791,13 @@ def _with_retry(
         except APIError as e:
             status = e.status_code
             last_exc = e
-            # 429 = rate limit. 5xx = transient server. Retry both.
-            if status == 429 or (status is not None and 500 <= status < 600):
+            # alpaca-py already exhausted its native policy for 429/504.
+            retryable = (
+                status not in {429, 504}
+                and status is not None
+                and 500 <= status < 600
+            )
+            if retryable and attempt < max_attempts:
                 logger.warning(
                     f"{op_desc} attempt {attempt}/{max_attempts} failed "
                     f"(status={status}): {e}. Sleeping {delay:.1f}s."
@@ -738,8 +806,15 @@ def _with_retry(
                 delay *= 2
                 continue
             raise
-        except (ConnectionError, TimeoutError) as e:
+        except (
+            RequestsConnectionError,
+            RequestsTimeout,
+            ConnectionError,
+            TimeoutError,
+        ) as e:
             last_exc = e
+            if attempt >= max_attempts:
+                raise
             logger.warning(
                 f"{op_desc} attempt {attempt}/{max_attempts} network error: {e}. "
                 f"Sleeping {delay:.1f}s."

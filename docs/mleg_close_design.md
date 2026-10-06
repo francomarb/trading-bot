@@ -276,11 +276,12 @@ so the older order is by construction less likely to clear at the
 moment we walk past it. The race window is typically also short —
 Alpaca cancels usually ack within tens to hundreds of milliseconds.
 
-**Mitigation in this PR:** None code-side. Each walk step uses a
-unique `client_order_id` (`spr-{strategy}-walk{NN}-{8-char-uuid}`) so
-any late fill is unambiguously attributable in the trade log, and the
-reconciliation path on the next engine cycle detects the mismatched
-state.
+**Current mitigation:** Each walk step uses a unique `client_order_id`
+(`spr-{strategy}-walk{NN}-{uuid}`), and publishes that ID to the durable
+per-order row before submitting. A transport/429/5xx submit ambiguity stops the
+walk, preserves the close lock, and reconciles that exact ID before any later
+attempt. This prevents uncertainty from being mislabeled as rejection; it does
+not make cancel-and-resubmit atomic.
 
 **Mitigation to consider if the race is observed in paper:**
 

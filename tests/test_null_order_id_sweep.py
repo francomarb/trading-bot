@@ -487,7 +487,7 @@ class TestSweepRecoversSingleLegPartialClose:
         assert row.status == "working"
 
 
-# ── (7) Spread close rows excluded ─────────────────────────────────────────
+# ── (7) Spread close placeholders excluded; ambiguous submits recovered ───
 
 
 class TestSweepExcludesSpreadClose:
@@ -522,6 +522,70 @@ class TestSweepExcludesSpreadClose:
             f"cli-spread-{role}"
         )
         assert row.status == "pending"
+        assert row.order_id is None
+
+    def test_unknown_spread_close_is_attached_by_client_order_id(
+        self,
+        engine: TradingEngine,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        _seed_orphan(
+            pos_store=pos_store, orders_store=orders_store,
+            owner_key="SPY", cli="cli-spread-unknown",
+            role="exit", side="buy", position_type="spread",
+        )
+        orders_store.mark_terminal_after_dispatch(
+            client_order_id="cli-spread-unknown",
+            broker_order_id=None,
+            status="unknown",
+            filled_qty=0.0,
+            avg_fill_price=None,
+        )
+        engine.broker.get_order_by_client_id_for_sweep = MagicMock(
+            return_value=_make_broker_order(
+                order_id="alpaca-spread-close", status="new",
+            )
+        )
+
+        engine._sweep_null_order_id_attaches(
+            _make_snapshot(), reason="cycle", budget=5,
+        )
+
+        row = orders_store.get_by_client_order_id("cli-spread-unknown")
+        assert row.order_id == "alpaca-spread-close"
+        assert row.status == "unknown"
+
+    def test_unknown_spread_close_missing_at_broker_releases_lock(
+        self,
+        engine: TradingEngine,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        _seed_orphan(
+            pos_store=pos_store, orders_store=orders_store,
+            owner_key="SPY", cli="cli-spread-not-accepted",
+            role="exit", side="buy", position_type="spread",
+        )
+        orders_store.mark_terminal_after_dispatch(
+            client_order_id="cli-spread-not-accepted",
+            broker_order_id=None,
+            status="unknown",
+            filled_qty=0.0,
+            avg_fill_price=None,
+        )
+        engine.broker.get_order_by_client_id_for_sweep = MagicMock(
+            return_value=None,
+        )
+
+        engine._sweep_null_order_id_attaches(
+            _make_snapshot(), reason="cycle", budget=5,
+        )
+
+        row = orders_store.get_by_client_order_id(
+            "cli-spread-not-accepted"
+        )
+        assert row.status == "rejected"
         assert row.order_id is None
 
 

@@ -1085,7 +1085,7 @@ The `role` column in `position_lifecycle_orders` is an open enum (§6.2). The fo
 | Item | Schema artifact | Behavior in this PR |
 |---|---|---|
 | Operator-issued order origin | `origin_kind` (default `'bot'`), `operator_command_uid` (NULL) on `position_lifecycle_orders` | No destructive operator commands implemented. Phase C populates these columns when it ships. |
-| ~~Spread (MLEG) order lifecycle~~ | Per-order schema carries the combo-order intent; `trades` carries both legs | ✅ Parents, closes, and pre-submit `entry_primary` rows are wired. Entry rows use ordinary reconciliation; close rows retain their dedicated reconciler. |
+| ~~Spread (MLEG) order lifecycle~~ | Per-order schema carries the combo-order intent; `trades` carries both legs | ✅ Parents, closes, and pre-submit `entry_primary` rows are wired. Each walk rung durably rekeys the logical row before submit. Ambiguous entry/close writes stay non-terminal and reconcile by exact client ID; entry rows use ordinary reconciliation and close rows retain their dedicated reconciler. |
 | Future order roles beyond §6.1's six | `role TEXT` is open enum | This PR ships only the six roles enumerated in §6.1. |
 | Bracket take-profit | `intended_take_profit_price` column exists | No strategy uses bracket TP today; column is reserved for future strategies. |
 

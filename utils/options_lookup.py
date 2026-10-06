@@ -37,6 +37,7 @@ from utils.options_ranker import (
     rank_call_candidates,
     rank_put_spread_candidates,
 )
+from utils.alpaca_transport import configure_alpaca_client
 
 _client: TradingClient | None = None
 
@@ -78,10 +79,12 @@ class ContractPick:
 def _get_client() -> TradingClient:
     global _client
     if _client is None:
-        _client = TradingClient(
-            api_key=ALPACA_API_KEY,
-            secret_key=ALPACA_SECRET_KEY,
-            paper=ALPACA_PAPER,
+        _client = configure_alpaca_client(
+            TradingClient(
+                api_key=ALPACA_API_KEY,
+                secret_key=ALPACA_SECRET_KEY,
+                paper=ALPACA_PAPER,
+            )
         )
     return _client
 
@@ -333,7 +336,9 @@ def build_opra_quote_lookup() -> QuoteLookup:
     from alpaca.data.historical.option import OptionHistoricalDataClient
     from alpaca.data.requests import OptionSnapshotRequest
 
-    data_client = OptionHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+    data_client = configure_alpaca_client(
+        OptionHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+    )
 
     def _lookup(occ_symbols: list[str]) -> dict[str, "Quote | None"]:
         if not occ_symbols:
