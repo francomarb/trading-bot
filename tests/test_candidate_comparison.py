@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
+from dataclasses import replace
 from datetime import datetime, timezone
 
+import reporting.candidate_shadows as candidate_shadows
 from engine.candidate_observation import CandidateObservationStore, CandidateStart
 from reporting.candidate_comparison import build_candidate_comparison_report
 
@@ -129,7 +132,7 @@ class TestCandidateComparisonReport:
 
         report = build_candidate_comparison_report(conn)
 
-        assert "sma_crossover | TRENDING | 1 | 1/1 | 1/1 | 0" in report
+        assert "sma_crossover | TRENDING | 1 | 1/1 | 1/1 | 0 | 0" in report
         assert "AAA | selected" in report
         assert "-0.50R" in report
         assert "actual_lifecycle" in report
@@ -160,7 +163,7 @@ class TestCandidateComparisonReport:
 
         report = build_candidate_comparison_report(conn)
 
-        assert "sma_crossover | TRENDING | 1 | 0/1 | 0/1 | 0" in report
+        assert "sma_crossover | TRENDING | 1 | 0/1 | 0/1 | 0 | 0" in report
         assert "AAA | selected | accepted | open" in report
         assert "BBB | refused | sleeve_full | pending" in report
 
@@ -212,5 +215,45 @@ class TestCandidateComparisonReport:
 
         report = build_candidate_comparison_report(conn, repo_root=tmp_path)
 
-        assert "sma_crossover | TRENDING | 1 | 0/1 | 0/2 | 0" in report
+        assert "sma_crossover | TRENDING | 1 | 0/1 | 0/2 | 0 | 0" in report
         assert "CCC | refused | position_too_small | pending" in report
+
+    def test_missing_legacy_commit_renders_unclassified_instead_of_aborting(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        conn, store = _connection()
+
+        def donchian(symbol: str, ordinal: int) -> CandidateStart:
+            return replace(
+                _candidate(symbol, ordinal),
+                strategy="donchian_breakout",
+                strategy_features={
+                    "entry_window": 20,
+                    "exit_window": 10,
+                    "entry_trigger": 102.0,
+                },
+                common_context={"sleeve": {"max_position_notional": 101.0}},
+            )
+
+        selected = store.start(donchian("AAA", 0), observed_at=NOW)
+        capacity = store.start(donchian("BBB", 1), observed_at=NOW)
+        unknown = store.start(donchian("CCC", 2), observed_at=NOW)
+        store.update(selected, selected=True, disposition="filled")
+        store.update(capacity, disposition="sleeve_full")
+        store.update(unknown, disposition="position_too_small")
+        store.finalize_cycle("cycle-sma")
+
+        def missing_commit(*_args, **_kwargs) -> None:
+            raise subprocess.CalledProcessError(128, ["git", "show"])
+
+        monkeypatch.setattr(
+            candidate_shadows.subprocess,
+            "run",
+            missing_commit,
+        )
+
+        report = build_candidate_comparison_report(conn, repo_root=tmp_path)
+
+        assert "donchian_breakout | TRENDING | 1 | 0/1 | 0/1 | 0 | 1" in report
+        assert "CCC | refused | position_too_small | unclassified" in report
+        assert "historical_contract_unavailable" in report

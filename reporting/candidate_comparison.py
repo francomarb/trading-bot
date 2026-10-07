@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -134,9 +135,24 @@ def _selected_outcome(conn: sqlite3.Connection, position_uid: str | None) -> dic
 def _refused_outcome(
     row: sqlite3.Row, *, repo_root: str | Path
 ) -> dict[str, Any]:
-    capacity_refusal = candidate_is_capacity_refusal(
-        dict(row), repo_root=repo_root
-    )
+    try:
+        capacity_refusal = candidate_is_capacity_refusal(
+            dict(row), repo_root=repo_root
+        )
+    except subprocess.CalledProcessError:
+        return {
+            "status": "unclassified",
+            "basis": "historical_contract_unavailable",
+            "return_pct": None,
+            "r_multiple": None,
+            "mfe": None,
+            "mae": None,
+            "exit_at": None,
+            "duration": None,
+            "exit_reason": None,
+            "operator_modified": False,
+            "capacity_refusal": None,
+        }
     if not capacity_refusal:
         return {
             "status": "not_eligible",
@@ -278,6 +294,7 @@ def build_candidate_comparison_report(
             "selected": 0,
             "refused": 0,
             "other_rejected": 0,
+            "unclassified": 0,
             "resolved_selected": 0,
             "resolved_refused": 0,
         }
@@ -290,6 +307,9 @@ def build_candidate_comparison_report(
                 kind = "selected"
             elif bool(outcome.get("capacity_refusal")):
                 kind = "refused"
+            elif outcome.get("capacity_refusal") is None:
+                bucket["unclassified"] += 1
+                continue
             else:
                 bucket["other_rejected"] += 1
                 continue
@@ -309,18 +329,18 @@ def build_candidate_comparison_report(
         "## Coverage",
         "",
         "| Strategy | Regime | Groups | Selected resolved | Capacity-refused "
-        "resolved | Other rejected |",
-        "|---|---|---:|---:|---:|---:|",
+        "resolved | Other rejected | Unclassified |",
+        "|---|---|---:|---:|---:|---:|---:|",
     ]
     for (strategy, regime), values in sorted(summary.items()):
         lines.append(
             f"| {strategy} | {regime} | {values['groups']} | "
             f"{values['resolved_selected']}/{values['selected']} | "
             f"{values['resolved_refused']}/{values['refused']} | "
-            f"{values['other_rejected']} |"
+            f"{values['other_rejected']} | {values['unclassified']} |"
         )
     if not groups:
-        lines.append("| — | — | 0 | 0/0 | 0/0 | 0 |")
+        lines.append("| — | — | 0 | 0/0 | 0/0 | 0 | 0 |")
 
     lines.extend(["", "## Contention groups", ""])
     for (strategy, regime, cycle_uid, signal_at), items in groups.items():

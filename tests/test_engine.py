@@ -1241,6 +1241,36 @@ class TestProcessSymbol:
         engine.risk.evaluate.assert_called_once()
         broker.place_order.assert_not_called()
 
+    def test_zero_quantity_rejection_records_binding_cap_on_candidate(
+        self, engine_factory
+    ):
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        engine._candidate_cycle_uid = "candidate-cycle"
+        engine.risk.evaluate = MagicMock(
+            return_value=RiskRejection(
+                code=RejectionCode.POSITION_TOO_SMALL,
+                message="sized position rounds to 0 shares",
+                symbol="AAPL",
+                strategy_name=engine.strategy.name,
+                risk_clip_kind="sleeve_notional",
+            )
+        )
+        snapshot = _snapshot()
+
+        engine._process_symbol(
+            "AAPL",
+            snapshot,
+            snapshot.account,
+            engine.strategy,
+            "1Day",
+            data_feed="iex",
+        )
+
+        [row] = engine.candidate_observation_store.read_cycle("candidate-cycle")
+        assert row["disposition"] == "position_too_small"
+        assert row["risk_clip_kind"] == "sleeve_notional"
+        broker.place_order.assert_not_called()
+
     def test_flat_position_target_respects_position_owner(self, engine_factory):
         engine, broker = engine_factory()
         strategy = TargetStateStrategy(target=PositionTarget.FLAT)

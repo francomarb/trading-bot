@@ -154,8 +154,11 @@ lifecycles and counterfactual refused outcomes from the shadow table, labels
 each basis, and segments coverage by strategy and entry regime. Actual
 lifecycle MFE/MAE remains unavailable unless complete post-fill bars can prove
 it; the report prints an em dash instead of manufacturing a value. Once a
-ranking policy is accepted, the temporary shadow table can be dropped without
-affecting trading or the permanent audit trail.
+legacy row needs a Git commit that is not available locally, the report keeps
+rendering and labels that row `unclassified / historical_contract_unavailable`
+instead of guessing or aborting. Once a ranking policy is accepted, the
+temporary shadow table can be dropped without affecting trading or the
+permanent audit trail.
 
 ## When ranking may begin
 

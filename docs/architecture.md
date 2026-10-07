@@ -449,7 +449,8 @@ fill/exit model: RSI limit, SMA market, and Donchian stop-limit mechanics
 remain separate. A read-only comparison report joins selected candidates to
 their actual durable lifecycles and refused candidates to labeled
 counterfactual outcomes, segmented by strategy and regime. Ranking remains
-disabled; see
+disabled. Unavailable historical commits leave an explicitly unclassified row
+instead of aborting the whole report; see
 [`entry_candidate_observation.md`](entry_candidate_observation.md).
 
 **Current strategies:**

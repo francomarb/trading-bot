@@ -547,6 +547,42 @@ class TestEquityShadowReplay:
         assert result.status == "needs_review"
         assert "same minute" in result.metadata["unresolved_reason"]
 
+    def test_sma_signal_exit_is_timestamped_at_next_session_open(self) -> None:
+        candidate = _candidate(
+            strategy="sma_crossover",
+            atr=20.0,
+            strategy_features_json=json.dumps({"fast_window": 2, "slow_window": 3}),
+        )
+        closes = [90, 91, 92, 93, 94, 95, 100, 105, 110, 100, 90, 80]
+        index = pd.date_range(
+            "2026-09-01", periods=len(closes), freq="D", tz="America/New_York"
+        ).tz_convert("UTC")
+        daily = pd.DataFrame(
+            {
+                "open": closes,
+                "high": [value + 1 for value in closes],
+                "low": [value - 1 for value in closes],
+                "close": closes,
+            },
+            index=index,
+        )
+
+        result = resolve_sma_shadow(
+            candidate,
+            _sma_contract(),
+            daily_bars=daily,
+            entry_minutes=_minutes(
+                ("2026-09-09T13:44:00", 101.0, 102.0, 100.0, 101.0)
+            ),
+            as_of=datetime(2026, 9, 13, 12, tzinfo=timezone.utc),
+            entry_window_complete=True,
+            contract_source="test",
+        )
+
+        assert result.status == "resolved"
+        assert result.metadata["exit_reason"] == "strategy_signal"
+        assert result.exit_at == datetime(2026, 9, 12, 13, 30, tzinfo=timezone.utc)
+
     def test_donchian_day_stop_limit_fill_then_stop(self) -> None:
         candidate = _candidate(
             strategy="donchian_breakout",
