@@ -11,10 +11,14 @@ import pytest
 
 import reporting.candidate_shadows as candidate_shadows
 from reporting.candidate_shadows import (
+    DonchianReplayContract,
     RSIReplayContract,
+    SMAReplayContract,
     historical_contract_from_settings_source,
     replay_contract_for_candidate,
+    resolve_donchian_shadow,
     resolve_rsi_shadow,
+    resolve_sma_shadow,
 )
 
 
@@ -453,3 +457,196 @@ class TestRSIShadowReplay:
         assert monday_close.status == "open"
         assert monday_close.entry_price == 98.0
         assert monday_close.metadata["entry_at"].startswith("2026-09-14")
+
+
+def _sma_contract() -> SMAReplayContract:
+    return SMAReplayContract.from_mapping(
+        {
+            "contract_version": 1,
+            "strategy": "sma_crossover",
+            "timeframe": "1Day",
+            "fast_window": 2,
+            "slow_window": 3,
+            "entry_order_type": "market",
+            "entry_time_in_force": "day",
+            "stop_anchor": "reference",
+            "atr_stop_multiplier": 2.0,
+            "exit_order_type": "market",
+            "modeled_exit_slippage_bps": 5.0,
+        }
+    )
+
+
+def _donchian_contract() -> DonchianReplayContract:
+    return DonchianReplayContract.from_mapping(
+        {
+            "contract_version": 1,
+            "strategy": "donchian_breakout",
+            "timeframe": "1Day",
+            "entry_window": 3,
+            "exit_window": 2,
+            "entry_order_type": "stop_limit",
+            "entry_time_in_force": "day",
+            "max_chase_bps": 100.0,
+            "max_chase_atr_fraction": 2.0,
+            "stop_anchor": "reference",
+            "atr_stop_multiplier": 2.0,
+            "exit_order_type": "market",
+            "modeled_exit_slippage_bps": 5.0,
+        }
+    )
+
+
+class TestEquityShadowReplay:
+    def test_sma_market_entry_uses_first_complete_minute_and_reference_stop(self) -> None:
+        candidate = _candidate(
+            strategy="sma_crossover",
+            strategy_features_json=json.dumps({"fast_window": 2, "slow_window": 3}),
+        )
+        result = resolve_sma_shadow(
+            candidate,
+            _sma_contract(),
+            daily_bars=_daily(),
+            entry_minutes=_minutes(
+                ("2026-09-09T13:44:00", 101.0, 103.0, 100.0, 102.0),
+                ("2026-09-09T13:45:00", 89.0, 91.0, 88.0, 90.0),
+            ),
+            as_of=datetime(2026, 9, 12, 12, tzinfo=timezone.utc),
+            entry_window_complete=True,
+            contract_source="test",
+        )
+
+        assert result.status == "resolved"
+        assert result.entry_price == 101.0
+        assert result.metadata["stop_price"] == 90.0
+        assert result.exit_price == pytest.approx(89.0 * 0.9995)
+        assert result.metadata["exit_reason"] == "protective_stop_entry_session"
+        assert result.outcome_basis == "sma_market_stop_daily_v1"
+
+    def test_sma_same_minute_stop_is_not_guessed(self) -> None:
+        candidate = _candidate(
+            strategy="sma_crossover",
+            strategy_features_json=json.dumps({"fast_window": 2, "slow_window": 3}),
+        )
+        result = resolve_sma_shadow(
+            candidate,
+            _sma_contract(),
+            daily_bars=_daily(),
+            entry_minutes=_minutes(
+                ("2026-09-09T13:44:00", 101.0, 103.0, 89.0, 90.0)
+            ),
+            as_of=datetime(2026, 9, 12, 12, tzinfo=timezone.utc),
+            entry_window_complete=True,
+            contract_source="test",
+        )
+
+        assert result.status == "needs_review"
+        assert "same minute" in result.metadata["unresolved_reason"]
+
+    def test_donchian_day_stop_limit_fill_then_stop(self) -> None:
+        candidate = _candidate(
+            strategy="donchian_breakout",
+            strategy_features_json=json.dumps(
+                {"entry_window": 3, "exit_window": 2, "entry_trigger": 102.0}
+            ),
+        )
+        result = resolve_donchian_shadow(
+            candidate,
+            _donchian_contract(),
+            daily_bars=_daily(),
+            entry_minutes=_minutes(
+                ("2026-09-09T13:44:00", 100.0, 103.0, 99.0, 102.0),
+                ("2026-09-09T13:45:00", 89.0, 91.0, 88.0, 90.0),
+            ),
+            as_of=datetime(2026, 9, 12, 12, tzinfo=timezone.utc),
+            entry_window_complete=True,
+            contract_source="test",
+        )
+
+        assert result.status == "resolved"
+        assert result.entry_price == 102.0
+        assert result.metadata["entry_limit"] == pytest.approx(103.02)
+        assert result.metadata["stop_price"] == 90.0
+        assert result.outcome_basis == "donchian_stop_limit_stop_daily_v1"
+
+    def test_donchian_day_order_expires_when_trigger_never_trades(self) -> None:
+        candidate = _candidate(
+            strategy="donchian_breakout",
+            strategy_features_json=json.dumps(
+                {"entry_window": 3, "exit_window": 2, "entry_trigger": 102.0}
+            ),
+        )
+        result = resolve_donchian_shadow(
+            candidate,
+            _donchian_contract(),
+            daily_bars=_daily(),
+            entry_minutes=_minutes(
+                ("2026-09-09T13:44:00", 100.0, 101.0, 99.0, 100.5)
+            ),
+            as_of=datetime(2026, 9, 12, 12, tzinfo=timezone.utc),
+            entry_window_complete=True,
+            contract_source="test",
+        )
+
+        assert result.status == "not_filled"
+        assert result.entry_price is None
+
+
+class TestEquityHistoricalContracts:
+    SOURCE = """
+SLIPPAGE_MODEL_MARKET_BPS = 5.0
+ATR_STOP_MULTIPLIER = 2.0
+ENTRY_PRICE_CAPS: dict = {
+    "donchian_breakout": EntryPriceCap(
+        max_chase_bps=500,
+        max_chase_atr_fraction=2.0,
+    ),
+}
+"""
+
+    def test_sma_legacy_contract_uses_features_and_immutable_settings(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(
+            candidate_shadows.subprocess,
+            "run",
+            lambda *_args, **_kwargs: SimpleNamespace(stdout=self.SOURCE),
+        )
+        contract, source = replay_contract_for_candidate(
+            _candidate(
+                strategy="sma_crossover",
+                timeframe="1Day",
+                strategy_features_json=json.dumps(
+                    {"fast_window": 20, "slow_window": 50}
+                ),
+                peer_entry_time_in_force="day",
+            ),
+            repo_root=tmp_path,
+        )
+
+        assert isinstance(contract, SMAReplayContract)
+        assert (contract.fast_window, contract.slow_window) == (20, 50)
+        assert source == "historical_commit:aaaaaaaaaa"
+
+    def test_donchian_legacy_contract_recovers_cap_without_executing_source(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(
+            candidate_shadows.subprocess,
+            "run",
+            lambda *_args, **_kwargs: SimpleNamespace(stdout=self.SOURCE),
+        )
+        contract, _ = replay_contract_for_candidate(
+            _candidate(
+                strategy="donchian_breakout",
+                timeframe="1Day",
+                strategy_features_json=json.dumps(
+                    {"entry_window": 30, "exit_window": 15}
+                ),
+            ),
+            repo_root=tmp_path,
+        )
+
+        assert isinstance(contract, DonchianReplayContract)
+        assert contract.max_chase_bps == 500.0
+        assert contract.max_chase_atr_fraction == 2.0

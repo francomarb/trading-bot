@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve disposable PLAN 11.61 RSI shadow candidates offline.
+"""Resolve disposable PLAN 11.61 strategy shadow candidates offline.
 
 The command previews by default. Pass ``--apply`` to update only the
 ``entry_candidate_shadow_outcomes`` table; trading decisions and lifecycle
@@ -23,14 +23,21 @@ if str(ROOT) not in sys.path:
 from config import settings  # noqa: E402
 from data.fetcher import fetch_symbol  # noqa: E402
 from engine.candidate_observation import CandidateObservationStore  # noqa: E402
+from engine.candidate_observation import _CAPACITY_DISPOSITIONS  # noqa: E402
 from reporting.candidate_shadows import (  # noqa: E402
+    DonchianReplayContract,
+    RSIReplayContract,
+    SMAReplayContract,
     replay_contract_for_candidate,
+    resolve_donchian_shadow,
     resolve_rsi_shadow,
+    resolve_sma_shadow,
 )
 
 
 _NY = ZoneInfo("America/New_York")
 _REFRESHABLE = ("pending", "pending_data", "awaiting_fill", "open")
+_STRATEGIES = ("rsi_reversion", "sma_crossover", "donchian_breakout")
 
 
 def _parse_utc(value: str) -> datetime:
@@ -41,7 +48,9 @@ def _parse_utc(value: str) -> datetime:
 
 
 def _load_work(
-    conn: sqlite3.Connection, candidate_uid: str | None
+    conn: sqlite3.Connection,
+    candidate_uid: str | None,
+    strategy: str,
 ) -> list[dict[str, object]]:
     conn.row_factory = sqlite3.Row
     placeholders = ",".join("?" for _ in _REFRESHABLE)
@@ -64,12 +73,15 @@ def _load_work(
                ) AS peer_entry_time_in_force
         FROM entry_candidate_decisions AS d
         JOIN entry_candidate_shadow_outcomes AS s USING(candidate_uid)
-        WHERE d.strategy = 'rsi_reversion'
-          AND d.selected = 0
+        WHERE d.selected = 0
           AND d.capacity_contended = 1
+          AND d.disposition IN ({','.join('?' for _ in _CAPACITY_DISPOSITIONS)})
           AND s.status IN ({placeholders})
     """
-    params: list[object] = list(_REFRESHABLE)
+    params: list[object] = [*sorted(_CAPACITY_DISPOSITIONS), *_REFRESHABLE]
+    if strategy != "all":
+        sql += " AND d.strategy = ?"
+        params.append(strategy)
     if candidate_uid:
         sql += " AND d.candidate_uid = ?"
         params.append(candidate_uid)
@@ -85,10 +97,42 @@ def _entry_window(observed: datetime) -> tuple[datetime, datetime]:
     return observed.replace(second=0, microsecond=0), close + timedelta(minutes=1)
 
 
+def _resolve(
+    candidate: dict[str, object],
+    contract: RSIReplayContract | SMAReplayContract | DonchianReplayContract,
+    *,
+    daily_bars,
+    entry_minutes,
+    as_of: datetime,
+    entry_window_complete: bool,
+    contract_source: str,
+):
+    kwargs = {
+        "daily_bars": daily_bars,
+        "entry_minutes": entry_minutes,
+        "as_of": as_of,
+        "entry_window_complete": entry_window_complete,
+        "contract_source": contract_source,
+    }
+    if isinstance(contract, RSIReplayContract):
+        return resolve_rsi_shadow(candidate, contract, **kwargs)
+    if isinstance(contract, SMAReplayContract):
+        return resolve_sma_shadow(candidate, contract, **kwargs)
+    if isinstance(contract, DonchianReplayContract):
+        return resolve_donchian_shadow(candidate, contract, **kwargs)
+    raise TypeError(f"unsupported replay contract {type(contract).__name__}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", default=settings.TRADE_LOG_DB)
     parser.add_argument("--candidate", help="resolve one full candidate UID")
+    parser.add_argument(
+        "--strategy",
+        choices=("all", *_STRATEGIES),
+        default="all",
+        help="limit work to one strategy (default: all supported strategies)",
+    )
     parser.add_argument(
         "--as-of",
         help="UTC ISO timestamp; defaults to now",
@@ -107,9 +151,9 @@ def main() -> int:
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA foreign_keys = ON")
     store = CandidateObservationStore(conn)
-    work = _load_work(conn, args.candidate)
+    work = _load_work(conn, args.candidate, args.strategy)
     if not work:
-        print("No refreshable RSI shadow candidates.")
+        print("No refreshable supported shadow candidates.")
         return 0
 
     failures = 0
@@ -140,7 +184,7 @@ def main() -> int:
                 feed=str(candidate["data_feed"]),
             )
             entry_complete = as_of >= minute_end
-            resolution = resolve_rsi_shadow(
+            resolution = _resolve(
                 candidate,
                 contract,
                 daily_bars=daily_bars,

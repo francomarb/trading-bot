@@ -4,9 +4,9 @@
 
 Phase `11.61a` records which actionable candidates reached allocation, what
 distinguished them, which one the existing sequential engine selected, and why
-another was refused. The first strategy-specific shadow resolver now supports
-RSI equity candidates offline. Nothing ranks, reorders, resizes, or submits an
-additional order.
+another was refused. Strategy-specific offline resolvers support RSI, SMA, and
+Donchian equity candidates through one shared outcome/reporting framework.
+Nothing ranks, reorders, resizes, or submits an additional order.
 
 ## The decision boundary
 
@@ -81,21 +81,27 @@ return/R, and favorable/adverse excursion through
 a refused candidate because allocation never approved a quantity.
 
 The table is a work queue, not a claim that an untraded position earned or lost
-money. There is deliberately no generic resolver: even equity strategies have
-different entry, protection, and exit semantics, and applying one price horizon
-would create misleading evidence. RSI remains the only supported resolver
-because it was the first observed contention case. SMA and Donchian contention
-groups now exist and require their own reviewed replay contracts before their
-refused candidates can be resolved.
+money. There is deliberately no generic trading model: the framework shares
+storage, contract validation, metrics, commands, and reporting, while each
+strategy retains its own entry, protection, and exit resolver. A contended
+cycle can also contain a candidate production rejected for an unrelated reason
+such as an invalid stop. Such a row remains visible in the permanent audit and
+comparison report as `not_eligible`; it is not queued or replayed as though
+removing capacity would have made it tradable.
 
-The RSI resolver is an explicit offline command:
+The resolvers are explicit offline commands:
 
 ```bash
-# Preview only; does not update the database.
+# Preview all supported strategies; does not update the database.
 ./venv/bin/python scripts/resolve_candidate_shadows.py
 
-# Persist the previewed states to the disposable shadow table.
-./venv/bin/python scripts/resolve_candidate_shadows.py --apply
+# Preview or persist one strategy.
+./venv/bin/python scripts/resolve_candidate_shadows.py --strategy sma_crossover
+./venv/bin/python scripts/resolve_candidate_shadows.py --strategy donchian_breakout --apply
+
+# Render the read-only selected-versus-refused report.
+./venv/bin/python scripts/candidate_comparison_report.py
+./venv/bin/python scripts/candidate_comparison_report.py --strategy rsi_reversion --output /tmp/rsi-candidates.md
 ```
 
 It tests the observation session against complete one-minute bars from the
@@ -124,10 +130,23 @@ missing configuration and stale-age default by parsing settings from their
 immutable stored bot commit; historical Python is never executed and current
 settings are never substituted.
 
-The command only updates `entry_candidate_shadow_outcomes`. It never changes a
-decision, lifecycle, allocator state, or bot behavior. Once ranking is accepted,
-this temporary table can be dropped without affecting trading or the permanent
-audit trail.
+SMA models an immediate market entry from the first complete minute after
+observation, its reference-anchored ATR stop, and the raw crossunder exit.
+Donchian models only the remaining session of its DAY stop-limit order, the
+frozen trigger/chase cap, its reference-anchored ATR stop, and the raw channel
+exit. Same-minute entry/stop ordering stays `needs_review`; unavailable bars
+stay pending rather than being guessed. Pre-contract rows recover literal
+settings from their immutable Git commit without executing historical Python.
+
+The resolver command only updates `entry_candidate_shadow_outcomes` when
+`--apply` is passed. It never changes a decision, lifecycle, allocator state,
+or bot behavior. The report reads actual selected outcomes from durable
+lifecycles and counterfactual refused outcomes from the shadow table, labels
+each basis, and segments coverage by strategy and entry regime. Actual
+lifecycle MFE/MAE remains unavailable unless complete post-fill bars can prove
+it; the report prints an em dash instead of manufacturing a value. Once a
+ranking policy is accepted, the temporary shadow table can be dropped without
+affecting trading or the permanent audit trail.
 
 ## When ranking may begin
 

@@ -174,6 +174,18 @@ def _json(value: Mapping[str, Any] | None) -> str:
     )
 
 
+def replay_contract_with_default_tif(
+    contract: Mapping[str, Any], entry_time_in_force: str
+) -> dict[str, Any]:
+    """Add the broker's ordinary TIF without overriding strategy routing."""
+    tif = str(entry_time_in_force).lower()
+    if tif not in {"day", "gtc"}:
+        raise ValueError(f"unsupported equity entry TIF {entry_time_in_force!r}")
+    enriched = dict(contract)
+    enriched.setdefault("entry_time_in_force", tif)
+    return enriched
+
+
 @dataclass(frozen=True)
 class CandidateStart:
     """Facts available when an actionable signal reaches allocation."""
@@ -328,6 +340,12 @@ class CandidateObservationStore:
                     position_uid,
                     reference_price,
                 ) = row
+                # A contended cycle can also contain candidates rejected for
+                # an independent reason (invalid stop, too-small size, etc.).
+                # They remain in the permanent decision audit but are not a
+                # truthful "capacity removed" counterfactual.
+                if not selected and disposition not in _CAPACITY_DISPOSITIONS:
+                    continue
                 has_lifecycle = bool(selected and position_uid)
                 status = "actual_lifecycle" if has_lifecycle else "pending"
                 basis = (
@@ -398,6 +416,7 @@ class CandidateObservationStore:
 __all__ = [
     "CandidateObservationStore",
     "CandidateStart",
+    "replay_contract_with_default_tif",
     "_CREATE_CANDIDATE_DECISIONS_SQL",
     "_CREATE_CANDIDATE_INDEXES_SQL",
     "_CREATE_CANDIDATE_SHADOW_SQL",
