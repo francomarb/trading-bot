@@ -436,14 +436,21 @@ picker facts already computed by the real execution path through
 output never feeds back into trading. Same-strategy/same-signal-bar groups retain
 explicit slot, watchlist, and global evaluation order. Groups where one
 candidate was selected and another hit a capacity gate enqueue a disposable
-counterfactual outcome row. RSI candidates freeze a replay contract through
-`candidate_replay_contract()`, enriched with the broker's actual entry TIF, and
-can be resolved offline from post-observation minute bars plus completed daily
-bars. The contract freezes the engine's local stale-LIMIT age as well as the
-effective stop anchor, so neither a later configuration change nor Alpaca's
-longer 90-day GTC ceiling can rewrite historical counterfactuals. Other strategies
-require their own
-instrument-correct resolver. Ranking remains disabled; see
+counterfactual outcome row. Cap-driven zero-share sizing rejections preserve
+their binding cap and count as capacity refusals; risk-driven zeroes and invalid
+stops do not. RSI, SMA, and Donchian candidates freeze
+strategy-specific replay contracts through `candidate_replay_contract()` and
+resolve offline from post-observation minute bars plus completed daily bars.
+RSI records the broker's ordinary entry TIF and local stale-LIMIT age;
+SMA records its fractional DAY market route and fill-anchored stop;
+Donchian declares its stricter routing invariant directly because STOP_LIMIT
+entries are always DAY. The shared framework never substitutes a generic
+fill/exit model: RSI limit, SMA market, and Donchian stop-limit mechanics
+remain separate. A read-only comparison report joins selected candidates to
+their actual durable lifecycles and refused candidates to labeled
+counterfactual outcomes, segmented by strategy and regime. Ranking remains
+disabled. Unavailable historical commits leave an explicitly unclassified row
+instead of aborting the whole report; see
 [`entry_candidate_observation.md`](entry_candidate_observation.md).
 
 **Current strategies:**
@@ -675,9 +682,9 @@ Every trade is logged to SQLite for per-strategy graduation evidence. This layer
 In addition to fills and lifecycle state, `entry_candidate_decisions` retains
 the permanent explanation of actionable entry choices. The separate
 `entry_candidate_shadow_outcomes` table is calibration-only and can be removed
-after a reviewed ranking policy replaces fixed-order selection. The offline RSI
-resolver may update only that disposable shadow table; neither table is read by
-the order path.
+after a reviewed ranking policy replaces fixed-order selection. The offline
+strategy resolvers may update only that disposable shadow table; the comparison
+report is read-only, and neither table is read by the order path.
 - `data/trades.db` — paper trading (never mixed with live data)
 - `data/trades_live.db` — live trading (separate file to prevent cross-contamination)
 

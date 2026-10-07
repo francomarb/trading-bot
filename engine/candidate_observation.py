@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from typing import Any, Mapping
 
 from risk.allocator import SleeveRejectionCode
-from risk.manager import RejectionCode
+from risk.manager import RejectionCode, VALID_RISK_CLIP_KINDS
 
 
 _CREATE_CANDIDATE_DECISIONS_SQL = """
@@ -104,6 +104,19 @@ _CAPACITY_DISPOSITIONS = frozenset(
     }
 )
 
+
+def is_capacity_disposition(
+    disposition: str | None,
+    risk_clip_kind: str | None = None,
+) -> bool:
+    """Return whether removing a capacity brake could admit the candidate."""
+    if disposition in _CAPACITY_DISPOSITIONS:
+        return True
+    return (
+        disposition == RejectionCode.POSITION_TOO_SMALL.value
+        and risk_clip_kind in VALID_RISK_CLIP_KINDS
+    )
+
 _UPDATE_COLUMNS = frozenset(
     {
         "disposition",
@@ -172,6 +185,18 @@ def _json(value: Mapping[str, Any] | None) -> str:
         separators=(",", ":"),
         allow_nan=False,
     )
+
+
+def replay_contract_with_default_tif(
+    contract: Mapping[str, Any], entry_time_in_force: str
+) -> dict[str, Any]:
+    """Add the broker's ordinary TIF without overriding strategy routing."""
+    tif = str(entry_time_in_force).lower()
+    if tif not in {"day", "gtc"}:
+        raise ValueError(f"unsupported equity entry TIF {entry_time_in_force!r}")
+    enriched = dict(contract)
+    enriched.setdefault("entry_time_in_force", tif)
+    return enriched
 
 
 @dataclass(frozen=True)
@@ -295,7 +320,8 @@ class CandidateObservationStore:
         """Label same-strategy groups and enqueue only real contention shadows."""
         rows = self._conn.execute(
             "SELECT candidate_uid, strategy, signal_at, disposition, selected, "
-            "position_uid, reference_price FROM entry_candidate_decisions "
+            "position_uid, reference_price, risk_clip_kind "
+            "FROM entry_candidate_decisions "
             "WHERE cycle_uid = ? ORDER BY observed_at, candidate_uid",
             (cycle_uid,),
         ).fetchall()
@@ -309,7 +335,7 @@ class CandidateObservationStore:
             contended = (
                 size > 1
                 and any(row[4] for row in group)
-                and any(row[3] in _CAPACITY_DISPOSITIONS for row in group)
+                and any(is_capacity_disposition(row[3], row[7]) for row in group)
             )
             self._conn.executemany(
                 "UPDATE entry_candidate_decisions SET candidate_group_size = ?, "
@@ -327,7 +353,16 @@ class CandidateObservationStore:
                     selected,
                     position_uid,
                     reference_price,
+                    risk_clip_kind,
                 ) = row
+                # A contended cycle can also contain candidates rejected for
+                # an independent reason (invalid stop, risk-driven zero, etc.).
+                # They remain in the permanent decision audit but are not a
+                # truthful "capacity removed" counterfactual.
+                if not selected and not is_capacity_disposition(
+                    disposition, risk_clip_kind
+                ):
+                    continue
                 has_lifecycle = bool(selected and position_uid)
                 status = "actual_lifecycle" if has_lifecycle else "pending"
                 basis = (
@@ -398,6 +433,8 @@ class CandidateObservationStore:
 __all__ = [
     "CandidateObservationStore",
     "CandidateStart",
+    "is_capacity_disposition",
+    "replay_contract_with_default_tif",
     "_CREATE_CANDIDATE_DECISIONS_SQL",
     "_CREATE_CANDIDATE_INDEXES_SQL",
     "_CREATE_CANDIDATE_SHADOW_SQL",

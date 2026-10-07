@@ -1489,7 +1489,16 @@ class TradingEngine:
                             raise ValueError(
                                 "broker does not expose its equity entry TIF"
                             )
-                        replay_contract["entry_time_in_force"] = entry_tif
+                        # A strategy may have stricter routing than the
+                        # broker's ordinary equity TIF. Donchian STOP_LIMIT,
+                        # for example, is always DAY.
+                        from engine.candidate_observation import (
+                            replay_contract_with_default_tif,
+                        )
+
+                        replay_contract = replay_contract_with_default_tif(
+                            replay_contract, entry_tif
+                        )
                         common_context["shadow_replay_contract"] = replay_contract
                 except Exception as exc:
                     common_context["shadow_replay_contract_error"] = (
@@ -3370,6 +3379,7 @@ class TradingEngine:
                 candidate_uid,
                 disposition=decision.code.value,
                 disposition_reason=decision.message,
+                risk_clip_kind=decision.risk_clip_kind,
             )
             # Already logged by risk; alert the operator.
             self.alerts.order_rejection(

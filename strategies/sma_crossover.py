@@ -111,5 +111,25 @@ class SMACrossover(BaseStrategy):
             ),
         }
 
+    def candidate_replay_contract(self) -> dict[str, object]:
+        """Freeze the production mechanics needed for an offline shadow trade."""
+        from config import settings
+
+        return {
+            "contract_version": 1,
+            "strategy": self.name,
+            "timeframe": "1Day",
+            "fast_window": self.fast,
+            "slow_window": self.slow,
+            "entry_order_type": self.preferred_order_type.value,
+            # Production's fractional MARKET route is a DAY entry followed
+            # by a standalone stop at fill minus k*ATR (PLAN 11.53).
+            "entry_time_in_force": "day",
+            "stop_anchor": "fill",
+            "atr_stop_multiplier": settings.ATR_STOP_MULTIPLIER,
+            "exit_order_type": "market",
+            "modeled_exit_slippage_bps": settings.SLIPPAGE_MODEL_MARKET_BPS,
+        }
+
     def __repr__(self) -> str:
         return f"SMACrossover(fast={self.fast}, slow={self.slow})"

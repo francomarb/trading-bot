@@ -13,6 +13,7 @@ from engine.candidate_observation import (
     CandidateObservationStore,
     CandidateStart,
     _CAPACITY_DISPOSITIONS,
+    replay_contract_with_default_tif,
 )
 from risk.allocator import SleeveRejectionCode
 from risk.manager import RejectionCode
@@ -64,6 +65,14 @@ def store() -> CandidateObservationStore:
 
 
 class TestCandidateObservationStore:
+    def test_strategy_tif_overrides_ordinary_broker_default(self) -> None:
+        assert replay_contract_with_default_tif(
+            {"entry_time_in_force": "day"}, "gtc"
+        )["entry_time_in_force"] == "day"
+        assert replay_contract_with_default_tif({}, "gtc")[
+            "entry_time_in_force"
+        ] == "gtc"
+
     def test_capacity_dispositions_follow_source_enums(self) -> None:
         assert _CAPACITY_DISPOSITIONS == {
             SleeveRejectionCode.SLEEVE_FULL.value,
@@ -215,6 +224,75 @@ class TestCandidateObservationStore:
             for row in store.read_cycle("cycle-1")
         )
 
+    def test_noncapacity_rejection_in_contended_group_is_not_queued_for_replay(
+        self, store: CandidateObservationStore
+    ) -> None:
+        selected = store.start(_start(symbol="AAPL", ordinal=0), observed_at=NOW)
+        capacity = store.start(_start(symbol="MSFT", ordinal=1), observed_at=NOW)
+        invalid = store.start(_start(symbol="AMD", ordinal=2), observed_at=NOW)
+        store.update(
+            selected,
+            selected=True,
+            disposition="filled",
+            position_uid="position-1",
+        )
+        store.update(capacity, disposition="sleeve_full")
+        store.update(invalid, disposition="invalid_stop")
+
+        store.finalize_cycle("cycle-1")
+
+        queued = {
+            row[0]
+            for row in store._conn.execute(
+                "SELECT candidate_uid FROM entry_candidate_shadow_outcomes"
+            )
+        }
+        assert queued == {selected, capacity}
+
+    def test_cap_driven_zero_quantity_is_capacity_contention(
+        self, store: CandidateObservationStore
+    ) -> None:
+        selected = store.start(_start(symbol="AAPL", ordinal=0), observed_at=NOW)
+        blocked = store.start(_start(symbol="MSFT", ordinal=1), observed_at=NOW)
+        store.update(
+            selected,
+            selected=True,
+            disposition="filled",
+            position_uid="position-1",
+        )
+        store.update(
+            blocked,
+            disposition="position_too_small",
+            risk_clip_kind="sleeve_notional",
+        )
+
+        store.finalize_cycle("cycle-1")
+
+        rows = {row["symbol"]: row for row in store.read_cycle("cycle-1")}
+        assert rows["MSFT"]["capacity_contended"] == 1
+        queued = {
+            row[0]
+            for row in store._conn.execute(
+                "SELECT candidate_uid FROM entry_candidate_shadow_outcomes"
+            )
+        }
+        assert queued == {selected, blocked}
+
+    def test_risk_driven_zero_quantity_is_not_capacity_contention(
+        self, store: CandidateObservationStore
+    ) -> None:
+        selected = store.start(_start(symbol="AAPL", ordinal=0), observed_at=NOW)
+        blocked = store.start(_start(symbol="MSFT", ordinal=1), observed_at=NOW)
+        store.update(selected, selected=True, disposition="filled")
+        store.update(blocked, disposition="position_too_small")
+
+        store.finalize_cycle("cycle-1")
+
+        assert all(
+            row["capacity_contended"] == 0
+            for row in store.read_cycle("cycle-1")
+        )
+
     def test_unknown_update_field_is_rejected(self, store: CandidateObservationStore) -> None:
         uid = store.start(_start(), observed_at=NOW)
         with pytest.raises(ValueError, match="unknown candidate update fields"):
@@ -246,6 +324,15 @@ class TestStrategyCandidateFeatures:
         assert features["slow_window"] == 50
         assert features["crossover_gap_pct"] > 0
         assert "fast_slope_pct" in features
+
+    def test_sma_replay_contract_freezes_market_and_stop_policy(self) -> None:
+        contract = SMACrossover(20, 50).candidate_replay_contract()
+
+        assert contract["fast_window"] == 20
+        assert contract["slow_window"] == 50
+        assert contract["entry_order_type"] == "market"
+        assert contract["entry_time_in_force"] == "day"
+        assert contract["stop_anchor"] == "fill"
 
     def test_rsi_features_describe_oversold_depth_and_reversion_distance(self) -> None:
         frame = self._frame()
@@ -289,6 +376,18 @@ class TestStrategyCandidateFeatures:
         assert features["entry_window"] == 30
         assert features["breakout_pct"] > 0
         assert features["channel_width_pct"] > 0
+
+    def test_donchian_replay_contract_freezes_day_stop_limit_cap(self) -> None:
+        contract = DonchianBreakout(
+            entry_window=30, exit_window=15
+        ).candidate_replay_contract()
+
+        assert contract["entry_order_type"] == "stop_limit"
+        assert contract["entry_time_in_force"] == "day"
+        assert contract["entry_window"] == 30
+        assert contract["exit_window"] == 15
+        assert contract["max_chase_bps"] is not None
+        assert contract["stop_anchor"] == "reference"
 
     def test_leveraged_features_use_unleveraged_signal_series(self) -> None:
         frame = self._frame()

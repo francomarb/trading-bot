@@ -175,6 +175,31 @@ class DonchianBreakout(BaseStrategy):
             "volume_vs_20d_average": volume_ratio,
         }
 
+    def candidate_replay_contract(self) -> dict[str, object]:
+        """Freeze DAY stop-limit, protection, and channel-exit mechanics."""
+        from config import settings
+
+        policy = settings.ENTRY_PRICE_CAPS.get(self.name)
+        if policy is None:
+            raise ValueError("Donchian replay requires its entry-price cap policy")
+        return {
+            "contract_version": 1,
+            "strategy": self.name,
+            "timeframe": "1Day",
+            "entry_window": self.entry_window,
+            "exit_window": self.exit_window,
+            "entry_order_type": self.preferred_order_type.value,
+            # STOP_LIMIT is hard-coded DAY in AlpacaBroker, independently of
+            # the ordinary equity-entry TIF setting.
+            "entry_time_in_force": "day",
+            "max_chase_bps": policy.max_chase_bps,
+            "max_chase_atr_fraction": policy.max_chase_atr_fraction,
+            "stop_anchor": self.stop_anchor("").value,
+            "atr_stop_multiplier": settings.ATR_STOP_MULTIPLIER,
+            "exit_order_type": "market",
+            "modeled_exit_slippage_bps": settings.SLIPPAGE_MODEL_MARKET_BPS,
+        }
+
     def __repr__(self) -> str:
         return (
             f"DonchianBreakout(entry={self.entry_window}, exit={self.exit_window})"

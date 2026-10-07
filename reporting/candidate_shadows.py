@@ -20,13 +20,18 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from engine.candidate_observation import _CAPACITY_DISPOSITIONS
+from engine.candidate_observation import is_capacity_disposition
+from execution.entry_guard import EntryPriceCap, compute_cap_price
+from strategies.donchian_breakout import DonchianBreakout
 from strategies.rsi_reversion import RSIReversion
+from strategies.sma_crossover import SMACrossover
 
 
 _NY = ZoneInfo("America/New_York")
 _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 _REPLAY_BASIS = "rsi_limit_stop_daily_v1"
+_SMA_REPLAY_BASIS = "sma_market_stop_daily_v1"
+_DONCHIAN_REPLAY_BASIS = "donchian_stop_limit_stop_daily_v1"
 
 
 @dataclass(frozen=True)
@@ -126,6 +131,149 @@ class RSIReplayContract:
 
 
 @dataclass(frozen=True)
+class SMAReplayContract:
+    """Frozen production behavior for one SMA crossover candidate."""
+
+    contract_version: int
+    strategy: str
+    timeframe: str
+    fast_window: int
+    slow_window: int
+    entry_order_type: str
+    entry_time_in_force: str
+    stop_anchor: str
+    atr_stop_multiplier: float
+    exit_order_type: str
+    modeled_exit_slippage_bps: float
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "SMAReplayContract":
+        contract = cls(
+            contract_version=int(value["contract_version"]),
+            strategy=str(value["strategy"]),
+            timeframe=str(value["timeframe"]),
+            fast_window=int(value["fast_window"]),
+            slow_window=int(value["slow_window"]),
+            entry_order_type=str(value["entry_order_type"]),
+            entry_time_in_force=str(value["entry_time_in_force"]),
+            stop_anchor=str(value["stop_anchor"]),
+            atr_stop_multiplier=float(value["atr_stop_multiplier"]),
+            exit_order_type=str(value["exit_order_type"]),
+            modeled_exit_slippage_bps=float(value["modeled_exit_slippage_bps"]),
+        )
+        contract.validate()
+        return contract
+
+    def validate(self) -> None:
+        if self.contract_version != 1:
+            raise ValueError(f"unsupported SMA replay contract {self.contract_version}")
+        if self.strategy != "sma_crossover" or self.timeframe != "1Day":
+            raise ValueError("SMA shadow replay supports sma_crossover/1Day only")
+        if self.entry_order_type != "market" or self.exit_order_type != "market":
+            raise ValueError("SMA shadow replay requires MARKET entry and exit")
+        if self.entry_time_in_force not in {"day", "gtc"}:
+            raise ValueError("SMA shadow replay requires a known entry TIF")
+        if self.stop_anchor not in {"reference", "fill"}:
+            raise ValueError("SMA shadow replay requires a known stop anchor")
+        if self.stop_anchor == "fill" and self.entry_time_in_force != "day":
+            raise ValueError("fill-anchored SMA replay requires its DAY entry route")
+        if (
+            not math.isfinite(self.atr_stop_multiplier)
+            or not math.isfinite(self.modeled_exit_slippage_bps)
+            or self.atr_stop_multiplier <= 0
+            or self.modeled_exit_slippage_bps < 0
+        ):
+            raise ValueError("SMA replay risk/slippage settings are invalid")
+        SMACrossover(fast=self.fast_window, slow=self.slow_window)
+
+    @property
+    def warmup_calendar_days(self) -> int:
+        return max(120, self.slow_window * 2 + 20)
+
+
+@dataclass(frozen=True)
+class DonchianReplayContract:
+    """Frozen production behavior for one Donchian candidate."""
+
+    contract_version: int
+    strategy: str
+    timeframe: str
+    entry_window: int
+    exit_window: int
+    entry_order_type: str
+    entry_time_in_force: str
+    max_chase_bps: float | None
+    max_chase_atr_fraction: float | None
+    stop_anchor: str
+    atr_stop_multiplier: float
+    exit_order_type: str
+    modeled_exit_slippage_bps: float
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "DonchianReplayContract":
+        contract = cls(
+            contract_version=int(value["contract_version"]),
+            strategy=str(value["strategy"]),
+            timeframe=str(value["timeframe"]),
+            entry_window=int(value["entry_window"]),
+            exit_window=int(value["exit_window"]),
+            entry_order_type=str(value["entry_order_type"]),
+            entry_time_in_force=str(value["entry_time_in_force"]),
+            max_chase_bps=(
+                float(value["max_chase_bps"])
+                if value.get("max_chase_bps") is not None
+                else None
+            ),
+            max_chase_atr_fraction=(
+                float(value["max_chase_atr_fraction"])
+                if value.get("max_chase_atr_fraction") is not None
+                else None
+            ),
+            stop_anchor=str(value["stop_anchor"]),
+            atr_stop_multiplier=float(value["atr_stop_multiplier"]),
+            exit_order_type=str(value["exit_order_type"]),
+            modeled_exit_slippage_bps=float(value["modeled_exit_slippage_bps"]),
+        )
+        contract.validate()
+        return contract
+
+    def validate(self) -> None:
+        if self.contract_version != 1:
+            raise ValueError(
+                f"unsupported Donchian replay contract {self.contract_version}"
+            )
+        if self.strategy != "donchian_breakout" or self.timeframe != "1Day":
+            raise ValueError(
+                "Donchian shadow replay supports donchian_breakout/1Day only"
+            )
+        if self.entry_order_type != "stop_limit" or self.entry_time_in_force != "day":
+            raise ValueError("Donchian shadow replay requires a DAY STOP_LIMIT entry")
+        if self.exit_order_type != "market" or self.stop_anchor != "reference":
+            raise ValueError(
+                "Donchian shadow replay requires MARKET exits and reference stops"
+            )
+        if (
+            not math.isfinite(self.atr_stop_multiplier)
+            or not math.isfinite(self.modeled_exit_slippage_bps)
+            or self.atr_stop_multiplier <= 0
+            or self.modeled_exit_slippage_bps < 0
+        ):
+            raise ValueError("Donchian replay risk/slippage settings are invalid")
+        EntryPriceCap(
+            max_chase_bps=self.max_chase_bps,
+            max_chase_atr_fraction=self.max_chase_atr_fraction,
+        )
+        DonchianBreakout(
+            entry_window=self.entry_window,
+            exit_window=self.exit_window,
+        )
+
+    @property
+    def warmup_calendar_days(self) -> int:
+        return max(90, self.entry_window * 2 + 20)
+
+
+@dataclass(frozen=True)
 class ShadowReplayResult:
     """One truthful terminal, open, or unresolved shadow state."""
 
@@ -138,11 +286,12 @@ class ShadowReplayResult:
     max_favorable_pct: float | None
     max_adverse_pct: float | None
     metadata: dict[str, Any]
+    outcome_basis: str = _REPLAY_BASIS
 
     def store_values(self) -> dict[str, Any]:
         return {
             "status": self.status,
-            "outcome_basis": _REPLAY_BASIS,
+            "outcome_basis": self.outcome_basis,
             "entry_price": self.entry_price,
             "exit_price": self.exit_price,
             "exit_at": self.exit_at,
@@ -244,7 +393,7 @@ def historical_contract_from_settings_source(
     )
 
 
-def replay_contract_for_candidate(
+def _rsi_replay_contract_for_candidate(
     candidate: Mapping[str, Any], *, repo_root: str | Path
 ) -> tuple[RSIReplayContract, str]:
     """Load the stored contract, or recover old 11.61a rows from Git.
@@ -323,6 +472,192 @@ def replay_contract_for_candidate(
     return contract, f"historical_commit:{commit[:10]}"
 
 
+def _historical_source(candidate: Mapping[str, Any], repo_root: str | Path) -> tuple[str, str]:
+    """Read settings from a candidate's immutable commit without executing it."""
+    commit = str(candidate.get("bot_git_commit") or "")
+    if commit.startswith("uncommitted:") or not _COMMIT_RE.fullmatch(commit):
+        raise ValueError("candidate has no stored contract or immutable bot commit")
+    result = subprocess.run(
+        ["git", "show", f"{commit}:config/settings.py"],
+        cwd=Path(repo_root),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout, commit
+
+
+def _literal_setting(source: str, name: str) -> Any:
+    """Return one literal assignment from historical source, never executing it."""
+    for node in ast.parse(source).body:
+        target = None
+        value_node = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value_node = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign):
+            target, value_node = node.target, node.value
+        if isinstance(target, ast.Name) and target.id == name and value_node is not None:
+            try:
+                return ast.literal_eval(value_node)
+            except (ValueError, TypeError) as exc:
+                raise ValueError(f"historical setting {name} is not literal") from exc
+    raise ValueError(f"historical settings missing {name}")
+
+
+def _historical_donchian_cap(source: str) -> tuple[float | None, float | None]:
+    """Safely parse the Donchian EntryPriceCap constructor from settings.py."""
+    for node in ast.parse(source).body:
+        target = None
+        value_node = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value_node = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign):
+            target, value_node = node.target, node.value
+        if not (
+            isinstance(target, ast.Name)
+            and target.id == "ENTRY_PRICE_CAPS"
+            and isinstance(value_node, ast.Dict)
+        ):
+            continue
+        for key_node, item in zip(value_node.keys, value_node.values, strict=True):
+            try:
+                key = ast.literal_eval(key_node)
+            except (ValueError, TypeError):
+                continue
+            if key != "donchian_breakout" or not isinstance(item, ast.Call):
+                continue
+            keywords = {keyword.arg: keyword.value for keyword in item.keywords if keyword.arg}
+            bps_node = keywords.get("max_chase_bps")
+            atr_node = keywords.get("max_chase_atr_fraction")
+            bps = ast.literal_eval(bps_node) if bps_node is not None else None
+            atr = ast.literal_eval(atr_node) if atr_node is not None else None
+            return (
+                float(bps) if bps is not None else None,
+                float(atr) if atr is not None else None,
+            )
+    raise ValueError("historical settings missing Donchian entry-price cap")
+
+
+def replay_contract_for_candidate(
+    candidate: Mapping[str, Any], *, repo_root: str | Path
+) -> tuple[RSIReplayContract | SMAReplayContract | DonchianReplayContract, str]:
+    """Return the exact strategy-specific contract for one refused candidate."""
+    strategy = str(candidate.get("strategy") or "")
+    if strategy == "rsi_reversion":
+        return _rsi_replay_contract_for_candidate(candidate, repo_root=repo_root)
+
+    common = _decoded(candidate.get("common_context_json"))
+    stored = common.get("shadow_replay_contract")
+    if isinstance(stored, Mapping):
+        if strategy == "sma_crossover":
+            return SMAReplayContract.from_mapping(stored), "stored_candidate_contract"
+        if strategy == "donchian_breakout":
+            return DonchianReplayContract.from_mapping(stored), "stored_candidate_contract"
+        raise ValueError(f"unsupported candidate strategy {strategy!r}")
+
+    source, commit = _historical_source(candidate, repo_root)
+    features = _decoded(candidate.get("strategy_features_json"))
+    common_values = {
+        "contract_version": 1,
+        "strategy": strategy,
+        "timeframe": str(candidate.get("timeframe") or ""),
+        "stop_anchor": "reference",
+        "atr_stop_multiplier": float(_literal_setting(source, "ATR_STOP_MULTIPLIER")),
+        "exit_order_type": "market",
+        "modeled_exit_slippage_bps": float(
+            _literal_setting(source, "SLIPPAGE_MODEL_MARKET_BPS")
+        ),
+    }
+    if strategy == "sma_crossover":
+        peer_tif = str(candidate.get("peer_entry_time_in_force") or "").lower()
+        if peer_tif not in {"day", "gtc"}:
+            raise ValueError("legacy SMA candidate has no selected-peer entry TIF")
+        fractional_enabled = bool(_literal_setting(source, "FRACTIONAL_ENABLED"))
+        contract = SMAReplayContract.from_mapping(
+            {
+                **common_values,
+                "fast_window": features["fast_window"],
+                "slow_window": features["slow_window"],
+                "entry_order_type": "market",
+                "entry_time_in_force": "day" if fractional_enabled else peer_tif,
+                "stop_anchor": "fill" if fractional_enabled else "reference",
+            }
+        )
+    elif strategy == "donchian_breakout":
+        chase_bps, chase_atr = _historical_donchian_cap(source)
+        contract = DonchianReplayContract.from_mapping(
+            {
+                **common_values,
+                "entry_window": features["entry_window"],
+                "exit_window": features["exit_window"],
+                "entry_order_type": "stop_limit",
+                "entry_time_in_force": "day",
+                "max_chase_bps": chase_bps,
+                "max_chase_atr_fraction": chase_atr,
+            }
+        )
+    else:
+        raise ValueError(f"unsupported candidate strategy {strategy!r}")
+    return contract, f"historical_commit:{commit[:10]}"
+
+
+def candidate_is_capacity_refusal(
+    candidate: Mapping[str, Any],
+    *,
+    repo_root: str | Path,
+    contract: (
+        RSIReplayContract | SMAReplayContract | DonchianReplayContract | None
+    ) = None,
+) -> bool:
+    """Classify explicit and legacy cap-driven candidate refusals.
+
+    New rows preserve the binding cap directly. Older ``position_too_small``
+    rows predate that field, so the remaining sleeve allowance is compared
+    with the exact worst permitted one-share entry price.
+    """
+    disposition = str(candidate.get("disposition") or "")
+    clip_kind = candidate.get("risk_clip_kind")
+    if is_capacity_disposition(
+        disposition,
+        str(clip_kind) if clip_kind else None,
+    ):
+        return True
+    if disposition != "position_too_small":
+        return False
+    common = _decoded(candidate.get("common_context_json"))
+    sleeve = common.get("sleeve")
+    if not isinstance(sleeve, Mapping):
+        return False
+    try:
+        remaining = float(sleeve["max_position_notional"])
+        sizing_price = float(candidate["reference_price"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if str(candidate.get("strategy") or "") == "donchian_breakout":
+        try:
+            if contract is None:
+                contract, _source = replay_contract_for_candidate(
+                    candidate, repo_root=repo_root
+                )
+            if not isinstance(contract, DonchianReplayContract):
+                return False
+            features = _decoded(candidate.get("strategy_features_json"))
+            trigger = float(features["entry_trigger"])
+            atr = float(candidate["atr"])
+            sizing_price = compute_cap_price(
+                reference_price=trigger,
+                atr=atr,
+                side="buy",
+                policy=EntryPriceCap(
+                    max_chase_bps=contract.max_chase_bps,
+                    max_chase_atr_fraction=contract.max_chase_atr_fraction,
+                ),
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
+    return math.isfinite(remaining) and 0 <= remaining < sizing_price
+
+
 def _bars(value: pd.DataFrame, *, name: str) -> pd.DataFrame:
     required = {"open", "high", "low", "close"}
     missing = sorted(required - set(value.columns))
@@ -346,6 +681,7 @@ def _metric_result(
     high: float,
     low: float,
     metadata: dict[str, Any],
+    outcome_basis: str = _REPLAY_BASIS,
 ) -> ShadowReplayResult:
     realized = exit_price is not None
     return_pct = exit_price / entry - 1.0 if realized else None
@@ -361,6 +697,7 @@ def _metric_result(
         max_favorable_pct=high / entry - 1.0,
         max_adverse_pct=low / entry - 1.0,
         metadata=metadata,
+        outcome_basis=outcome_basis,
     )
 
 
@@ -385,7 +722,10 @@ def resolve_rsi_shadow(
     """
     if candidate.get("strategy") != "rsi_reversion":
         raise ValueError("resolve_rsi_shadow received a non-RSI candidate")
-    if candidate.get("disposition") not in _CAPACITY_DISPOSITIONS:
+    if not is_capacity_disposition(
+        str(candidate.get("disposition") or ""),
+        str(candidate.get("risk_clip_kind") or "") or None,
+    ):
         raise ValueError("RSI shadow resolver accepts capacity refusals only")
     observed = datetime.fromisoformat(str(candidate["observed_at"]))
     if observed.tzinfo is None:
@@ -689,7 +1029,9 @@ def resolve_rsi_shadow(
                 entry=entry,
                 stop=stop,
                 exit_price=exit_price,
-                exit_at=pd.Timestamp(timestamp).to_pydatetime(),
+                exit_at=datetime.combine(
+                    row["_session_date"], time(9, 30), _NY
+                ).astimezone(timezone.utc),
                 high=high,
                 low=low,
                 metadata={**base_meta, "exit_reason": reason},
@@ -735,10 +1077,389 @@ def resolve_rsi_shadow(
     )
 
 
+def _empty_result(
+    *, status: str, basis: str, metadata: dict[str, Any]
+) -> ShadowReplayResult:
+    return ShadowReplayResult(
+        status=status,
+        entry_price=None,
+        exit_price=None,
+        exit_at=None,
+        return_pct=None,
+        r_multiple=None,
+        max_favorable_pct=None,
+        max_adverse_pct=None,
+        metadata=metadata,
+        outcome_basis=basis,
+    )
+
+
+def _as_of_utc(value: datetime | None) -> datetime:
+    resolved = value or datetime.now(timezone.utc)
+    if resolved.tzinfo is None:
+        raise ValueError("as_of must be timezone-aware")
+    return resolved.astimezone(timezone.utc)
+
+
+def _resolve_equity_after_entry(
+    *,
+    strategy: SMACrossover | DonchianBreakout,
+    daily_bars: pd.DataFrame,
+    entry_minutes: pd.DataFrame,
+    entry_at: pd.Timestamp,
+    entry: float,
+    stop: float,
+    as_of: datetime,
+    slippage_bps: float,
+    basis: str,
+    metadata: dict[str, Any],
+) -> ShadowReplayResult:
+    """Apply the production protective stop and raw daily signal exit."""
+    minutes = _bars(entry_minutes, name="entry minute")
+    post_fill = minutes[minutes.index >= entry_at]
+    fill_bar = post_fill.iloc[0]
+    high = max(entry, float(fill_bar["high"]))
+    low = min(entry, float(fill_bar["low"]))
+    if float(fill_bar["low"]) <= stop:
+        return _metric_result(
+            status="needs_review",
+            entry=entry,
+            stop=stop,
+            exit_price=None,
+            exit_at=None,
+            high=high,
+            low=low,
+            metadata={
+                **metadata,
+                "unresolved_reason": "entry and stop touched in the same minute",
+            },
+            outcome_basis=basis,
+        )
+    for timestamp, row in post_fill.iloc[1:].iterrows():
+        open_price = float(row["open"])
+        if open_price <= stop or float(row["low"]) <= stop:
+            raw_exit = min(open_price, stop)
+            high = max(high, raw_exit)
+            low = min(low, raw_exit)
+            return _metric_result(
+                status="resolved",
+                entry=entry,
+                stop=stop,
+                exit_price=raw_exit * (1.0 - slippage_bps / 10_000.0),
+                exit_at=pd.Timestamp(timestamp).to_pydatetime(),
+                high=high,
+                low=low,
+                metadata={
+                    **metadata,
+                    "exit_reason": "protective_stop_entry_session",
+                    "stop_bar_excursion_excluded": True,
+                },
+                outcome_basis=basis,
+            )
+        high = max(high, float(row["high"]))
+        low = min(low, float(row["low"]))
+
+    daily = _bars(daily_bars, name="daily")
+    local_dates = pd.Index(daily.index.tz_convert(_NY).date)
+    daily = daily.assign(_session_date=local_dates)
+    today_ny = as_of.astimezone(_NY)
+    if today_ny.time() < time(16, 0):
+        daily = daily[daily["_session_date"] < today_ny.date()]
+    else:
+        daily = daily[daily["_session_date"] <= today_ny.date()]
+    entry_date = entry_at.tz_convert(_NY).date()
+    entry_matches = list(daily.index[daily["_session_date"] == entry_date])
+    if not entry_matches:
+        return _metric_result(
+            status="open",
+            entry=entry,
+            stop=stop,
+            exit_price=None,
+            exit_at=None,
+            high=high,
+            low=low,
+            metadata={**metadata, "pending_exit_signal": False},
+            outcome_basis=basis,
+        )
+
+    signal_frame = daily.drop(columns="_session_date")
+    exits = strategy._raw_signals(signal_frame).exits
+    sessions = list(daily.iterrows())
+    entry_idx = next(
+        idx for idx, (_timestamp, row) in enumerate(sessions)
+        if row["_session_date"] == entry_date
+    )
+    pending_exit = bool(exits.iloc[entry_idx])
+    for idx in range(entry_idx + 1, len(sessions)):
+        timestamp, row = sessions[idx]
+        open_price = float(row["open"])
+        if open_price <= stop:
+            raw_exit = open_price
+            reason = "protective_stop_gap"
+        elif pending_exit:
+            raw_exit = open_price
+            reason = "strategy_signal"
+        elif float(row["low"]) <= stop:
+            raw_exit = stop
+            reason = "protective_stop"
+        else:
+            high = max(high, float(row["high"]))
+            low = min(low, float(row["low"]))
+            pending_exit = bool(exits.iloc[idx])
+            continue
+        high = max(high, raw_exit)
+        low = min(low, raw_exit)
+        modeled_exit_at = pd.Timestamp(timestamp).to_pydatetime()
+        if reason in {"strategy_signal", "protective_stop_gap"}:
+            modeled_exit_at = datetime.combine(
+                row["_session_date"], time(9, 30), _NY
+            ).astimezone(timezone.utc)
+        return _metric_result(
+            status="resolved",
+            entry=entry,
+            stop=stop,
+            exit_price=raw_exit * (1.0 - slippage_bps / 10_000.0),
+            exit_at=modeled_exit_at,
+            high=high,
+            low=low,
+            metadata={
+                **metadata,
+                "exit_reason": reason,
+                "stop_bar_excursion_excluded": reason.startswith("protective_stop"),
+            },
+            outcome_basis=basis,
+        )
+
+    return _metric_result(
+        status="open",
+        entry=entry,
+        stop=stop,
+        exit_price=None,
+        exit_at=None,
+        high=high,
+        low=low,
+        metadata={
+            **metadata,
+            "pending_exit_signal": pending_exit,
+            "last_mark": float(sessions[-1][1]["close"]),
+        },
+        outcome_basis=basis,
+    )
+
+
+def resolve_sma_shadow(
+    candidate: Mapping[str, Any],
+    contract: SMAReplayContract,
+    *,
+    daily_bars: pd.DataFrame,
+    entry_minutes: pd.DataFrame,
+    as_of: datetime | None = None,
+    entry_window_complete: bool,
+    contract_source: str,
+) -> ShadowReplayResult:
+    """Replay one refused SMA market entry and its production exits."""
+    if candidate.get("strategy") != "sma_crossover":
+        raise ValueError("resolve_sma_shadow received a non-SMA candidate")
+    if not is_capacity_disposition(
+        str(candidate.get("disposition") or ""),
+        str(candidate.get("risk_clip_kind") or "") or None,
+    ):
+        raise ValueError("SMA shadow resolver accepts capacity refusals only")
+    observed = datetime.fromisoformat(str(candidate["observed_at"]))
+    if observed.tzinfo is None:
+        raise ValueError("candidate observed_at must be timezone-aware")
+    observed = observed.astimezone(timezone.utc)
+    as_of = _as_of_utc(as_of)
+    reference = float(candidate["reference_price"])
+    atr = float(candidate["atr"])
+    if not all(math.isfinite(value) and value > 0 for value in (reference, atr)):
+        raise ValueError("candidate reference/ATR must be finite and positive")
+    reference_stop = round(reference - contract.atr_stop_multiplier * atr, 2)
+    base = {
+        "replay_version": 1,
+        "contract_source": contract_source,
+        "contract": asdict(contract),
+        "as_of": as_of.isoformat(),
+        "entry_timing_basis": "first complete 1-minute bar after observation",
+        "exit_timing_basis": "next-session open after completed daily signal",
+        "reference_stop_price": reference_stop,
+    }
+    if reference_stop <= 0:
+        return _empty_result(status="not_eligible", basis=_SMA_REPLAY_BASIS, metadata={
+            **base, "unresolved_reason": "production stop would be non-positive"
+        })
+    minutes = _bars(entry_minutes, name="entry minute")
+    session_close = datetime.combine(
+        observed.astimezone(_NY).date(), time(16, 0), _NY
+    ).astimezone(timezone.utc)
+    usable = minutes[
+        (minutes.index >= pd.Timestamp(observed).ceil("min"))
+        & (minutes.index < session_close)
+    ]
+    if usable.empty:
+        return _empty_result(
+            status="pending_data",
+            basis=_SMA_REPLAY_BASIS,
+            metadata={
+                **base,
+                "unresolved_reason": (
+                    "market-entry minute unavailable"
+                    if entry_window_complete
+                    else "entry session still in progress"
+                ),
+            },
+        )
+    entry_at = usable.index[0]
+    entry = float(usable.iloc[0]["open"])
+    stop_anchor = entry if contract.stop_anchor == "fill" else reference
+    stop = round(stop_anchor - contract.atr_stop_multiplier * atr, 2)
+    stop_anchor_fallback = False
+    if stop <= 0 or stop >= entry:
+        # Match RiskDecision.stop_for_fill(): an unusable fill-anchored stop
+        # falls back to the valid pre-fill reference stop.
+        stop = reference_stop
+        stop_anchor_fallback = True
+    return _resolve_equity_after_entry(
+        strategy=SMACrossover(
+            fast=contract.fast_window,
+            slow=contract.slow_window,
+        ),
+        daily_bars=daily_bars,
+        entry_minutes=usable,
+        entry_at=entry_at,
+        entry=entry,
+        stop=stop,
+        as_of=as_of,
+        slippage_bps=contract.modeled_exit_slippage_bps,
+        basis=_SMA_REPLAY_BASIS,
+        metadata={
+            **base,
+            "fill_status": "filled",
+            "entry_at": entry_at.isoformat(),
+            "entry_price_basis": "minute_open_proxy",
+            "stop_price": stop,
+            "stop_anchor_fallback": stop_anchor_fallback,
+            "excursion_precision": "one_minute_bounds",
+        },
+    )
+
+
+def resolve_donchian_shadow(
+    candidate: Mapping[str, Any],
+    contract: DonchianReplayContract,
+    *,
+    daily_bars: pd.DataFrame,
+    entry_minutes: pd.DataFrame,
+    as_of: datetime | None = None,
+    entry_window_complete: bool,
+    contract_source: str,
+) -> ShadowReplayResult:
+    """Replay one refused Donchian DAY stop-limit and its production exits."""
+    if candidate.get("strategy") != "donchian_breakout":
+        raise ValueError("resolve_donchian_shadow received a non-Donchian candidate")
+    if not is_capacity_disposition(
+        str(candidate.get("disposition") or ""),
+        str(candidate.get("risk_clip_kind") or "") or None,
+    ):
+        raise ValueError("Donchian shadow resolver accepts capacity refusals only")
+    observed = datetime.fromisoformat(str(candidate["observed_at"]))
+    if observed.tzinfo is None:
+        raise ValueError("candidate observed_at must be timezone-aware")
+    observed = observed.astimezone(timezone.utc)
+    as_of = _as_of_utc(as_of)
+    reference = float(candidate["reference_price"])
+    atr = float(candidate["atr"])
+    features = _decoded(candidate.get("strategy_features_json"))
+    trigger = round(float(features["entry_trigger"]), 2)
+    policy = EntryPriceCap(
+        max_chase_bps=contract.max_chase_bps,
+        max_chase_atr_fraction=contract.max_chase_atr_fraction,
+    )
+    limit = round(compute_cap_price(
+        reference_price=trigger,
+        atr=atr,
+        side="buy",
+        policy=policy,
+    ), 2)
+    stop = round(reference - contract.atr_stop_multiplier * atr, 2)
+    base = {
+        "replay_version": 1,
+        "contract_source": contract_source,
+        "contract": asdict(contract),
+        "as_of": as_of.isoformat(),
+        "entry_trigger": trigger,
+        "entry_limit": limit,
+        "stop_price": stop,
+        "entry_timing_basis": "remaining complete 1-minute bars in DAY session",
+        "exit_timing_basis": "next-session open after completed daily signal",
+    }
+    if stop <= 0 or stop >= trigger:
+        return _empty_result(
+            status="not_eligible",
+            basis=_DONCHIAN_REPLAY_BASIS,
+            metadata={
+                **base,
+                "unresolved_reason": "production risk gate would reject the stop",
+            },
+        )
+    minutes = _bars(entry_minutes, name="entry minute")
+    session_close = datetime.combine(
+        observed.astimezone(_NY).date(), time(16, 0), _NY
+    ).astimezone(timezone.utc)
+    usable = minutes[
+        (minutes.index >= pd.Timestamp(observed).ceil("min"))
+        & (minutes.index < session_close)
+    ]
+    entry_at = None
+    entry = None
+    for timestamp, row in usable.iterrows():
+        open_price = float(row["open"])
+        if float(row["high"]) < trigger or float(row["low"]) > limit:
+            continue
+        entry_at = pd.Timestamp(timestamp)
+        entry = limit if open_price > limit else max(open_price, trigger)
+        break
+    if entry_at is None or entry is None:
+        return _empty_result(
+            status="not_filled" if entry_window_complete else "pending_data",
+            basis=_DONCHIAN_REPLAY_BASIS,
+            metadata={
+                **base,
+                "fill_status": "not_filled" if entry_window_complete else "pending_data",
+            },
+        )
+    return _resolve_equity_after_entry(
+        strategy=DonchianBreakout(
+            entry_window=contract.entry_window,
+            exit_window=contract.exit_window,
+        ),
+        daily_bars=daily_bars,
+        entry_minutes=usable,
+        entry_at=entry_at,
+        entry=float(entry),
+        stop=stop,
+        as_of=as_of,
+        slippage_bps=contract.modeled_exit_slippage_bps,
+        basis=_DONCHIAN_REPLAY_BASIS,
+        metadata={
+            **base,
+            "fill_status": "filled",
+            "entry_at": entry_at.isoformat(),
+            "entry_price_basis": "stop_limit_minute_model",
+            "excursion_precision": "one_minute_bounds",
+        },
+    )
+
+
 __all__ = [
+    "DonchianReplayContract",
     "RSIReplayContract",
+    "SMAReplayContract",
     "ShadowReplayResult",
+    "candidate_is_capacity_refusal",
     "replay_contract_for_candidate",
+    "resolve_donchian_shadow",
     "resolve_rsi_shadow",
+    "resolve_sma_shadow",
     "historical_contract_from_settings_source",
 ]
