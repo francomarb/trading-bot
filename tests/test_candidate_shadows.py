@@ -14,6 +14,7 @@ from reporting.candidate_shadows import (
     DonchianReplayContract,
     RSIReplayContract,
     SMAReplayContract,
+    candidate_is_capacity_refusal,
     historical_contract_from_settings_source,
     replay_contract_for_candidate,
     resolve_donchian_shadow,
@@ -235,6 +236,8 @@ class TestRSIShadowReplay:
         assert result.entry_price == 99.0
         assert result.exit_price == pytest.approx(110.0 * 0.9995)
         assert result.metadata["exit_reason"] == "rsi_signal"
+        assert result.exit_at is not None
+        assert (result.exit_at.hour, result.exit_at.minute) == (13, 30)
         assert result.return_pct == pytest.approx(result.exit_price / 99.0 - 1.0)
         assert result.r_multiple == pytest.approx(
             (result.exit_price - 99.0) / 9.0
@@ -469,7 +472,7 @@ def _sma_contract() -> SMAReplayContract:
             "slow_window": 3,
             "entry_order_type": "market",
             "entry_time_in_force": "day",
-            "stop_anchor": "reference",
+            "stop_anchor": "fill",
             "atr_stop_multiplier": 2.0,
             "exit_order_type": "market",
             "modeled_exit_slippage_bps": 5.0,
@@ -498,7 +501,7 @@ def _donchian_contract() -> DonchianReplayContract:
 
 
 class TestEquityShadowReplay:
-    def test_sma_market_entry_uses_first_complete_minute_and_reference_stop(self) -> None:
+    def test_sma_market_entry_uses_first_complete_minute_and_fill_stop(self) -> None:
         candidate = _candidate(
             strategy="sma_crossover",
             strategy_features_json=json.dumps({"fast_window": 2, "slow_window": 3}),
@@ -518,7 +521,8 @@ class TestEquityShadowReplay:
 
         assert result.status == "resolved"
         assert result.entry_price == 101.0
-        assert result.metadata["stop_price"] == 90.0
+        assert result.metadata["reference_stop_price"] == 90.0
+        assert result.metadata["stop_price"] == 91.0
         assert result.exit_price == pytest.approx(89.0 * 0.9995)
         assert result.metadata["exit_reason"] == "protective_stop_entry_session"
         assert result.outcome_basis == "sma_market_stop_daily_v1"
@@ -596,6 +600,7 @@ class TestEquityHistoricalContracts:
     SOURCE = """
 SLIPPAGE_MODEL_MARKET_BPS = 5.0
 ATR_STOP_MULTIPLIER = 2.0
+FRACTIONAL_ENABLED = True
 ENTRY_PRICE_CAPS: dict = {
     "donchian_breakout": EntryPriceCap(
         max_chase_bps=500,
@@ -626,7 +631,31 @@ ENTRY_PRICE_CAPS: dict = {
 
         assert isinstance(contract, SMAReplayContract)
         assert (contract.fast_window, contract.slow_window) == (20, 50)
+        assert contract.entry_time_in_force == "day"
+        assert contract.stop_anchor == "fill"
         assert source == "historical_commit:aaaaaaaaaa"
+
+    def test_legacy_subshare_sleeve_rejection_uses_worst_entry_price(
+        self, tmp_path
+    ) -> None:
+        candidate = _candidate(
+            strategy="donchian_breakout",
+            disposition="position_too_small",
+            reference_price=100.0,
+            atr=5.0,
+            strategy_features_json=json.dumps(
+                {"entry_window": 3, "exit_window": 2, "entry_trigger": 102.0}
+            ),
+            common_context_json=json.dumps(
+                {"sleeve": {"max_position_notional": 101.0}}
+            ),
+        )
+
+        assert candidate_is_capacity_refusal(
+            candidate,
+            repo_root=tmp_path,
+            contract=_donchian_contract(),
+        )
 
     def test_donchian_legacy_contract_recovers_cap_without_executing_source(
         self, tmp_path, monkeypatch

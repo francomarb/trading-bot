@@ -39,6 +39,7 @@ def main() -> int:
         report = build_candidate_comparison_report(
             conn,
             strategies=args.strategy or SUPPORTED_STRATEGIES,
+            repo_root=ROOT,
         )
     finally:
         conn.close()

@@ -241,6 +241,10 @@ class RiskRejection:
     message: str
     symbol: str
     strategy_name: str
+    # A zero-quantity rejection can be caused by a capacity brake rather
+    # than by the strategy's risk budget. Preserve that distinction for
+    # candidate-observation evidence even though no order was approved.
+    risk_clip_kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1358,13 +1362,18 @@ class RiskManager:
 
     @staticmethod
     def _reject(
-        code: RejectionCode, message: str, signal: Signal
+        code: RejectionCode,
+        message: str,
+        signal: Signal,
+        *,
+        risk_clip_kind: str | None = None,
     ) -> RiskRejection:
         rej = RiskRejection(
             code=code,
             message=message,
             symbol=signal.symbol,
             strategy_name=signal.strategy_name,
+            risk_clip_kind=risk_clip_kind,
         )
         logger.info(
             f"risk rejected {signal.symbol} ({signal.strategy_name}): "
@@ -1686,6 +1695,7 @@ class RiskManager:
                 f"sized position rounds to 0 shares "
                 f"(equity=${account.equity:.2f}, {detail})",
                 signal,
+                risk_clip_kind=risk_clip_kind,
             )
 
         approved_risk_dollars: float | None = None

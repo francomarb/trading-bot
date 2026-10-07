@@ -11,9 +11,10 @@ import json
 import sqlite3
 from collections import defaultdict
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Iterable
 
-from engine.candidate_observation import _CAPACITY_DISPOSITIONS
+from reporting.candidate_shadows import candidate_is_capacity_refusal
 
 
 SUPPORTED_STRATEGIES = (
@@ -130,8 +131,13 @@ def _selected_outcome(conn: sqlite3.Connection, position_uid: str | None) -> dic
     }
 
 
-def _refused_outcome(row: sqlite3.Row) -> dict[str, Any]:
-    if str(row["disposition"]) not in _CAPACITY_DISPOSITIONS:
+def _refused_outcome(
+    row: sqlite3.Row, *, repo_root: str | Path
+) -> dict[str, Any]:
+    capacity_refusal = candidate_is_capacity_refusal(
+        dict(row), repo_root=repo_root
+    )
+    if not capacity_refusal:
         return {
             "status": "not_eligible",
             "basis": "production_rejection",
@@ -143,6 +149,7 @@ def _refused_outcome(row: sqlite3.Row) -> dict[str, Any]:
             "duration": None,
             "exit_reason": None,
             "operator_modified": False,
+            "capacity_refusal": False,
         }
     metadata = _decoded(row["shadow_metadata"])
     entry_at = metadata.get("entry_at")
@@ -157,6 +164,7 @@ def _refused_outcome(row: sqlite3.Row) -> dict[str, Any]:
         "duration": _duration(entry_at, row["shadow_exit_at"]),
         "exit_reason": metadata.get("exit_reason"),
         "operator_modified": False,
+        "capacity_refusal": True,
     }
 
 
@@ -218,6 +226,7 @@ def build_candidate_comparison_report(
     conn: sqlite3.Connection,
     *,
     strategies: Iterable[str] = SUPPORTED_STRATEGIES,
+    repo_root: str | Path | None = None,
 ) -> str:
     """Return a deterministic Markdown report of real contention groups."""
     selected_strategies = tuple(dict.fromkeys(strategies))
@@ -225,6 +234,7 @@ def build_candidate_comparison_report(
     if invalid:
         raise ValueError(f"unsupported strategies: {invalid}")
     conn.row_factory = sqlite3.Row
+    resolved_repo_root = Path(repo_root or Path(__file__).resolve().parents[1])
     placeholders = ",".join("?" for _ in selected_strategies)
     rows = conn.execute(
         f"""
@@ -251,7 +261,7 @@ def build_candidate_comparison_report(
         outcome = (
             _selected_outcome(conn, row["position_uid"])
             if bool(row["selected"])
-            else _refused_outcome(row)
+            else _refused_outcome(row, repo_root=resolved_repo_root)
         )
         groups[
             (
@@ -278,7 +288,7 @@ def build_candidate_comparison_report(
         for row, outcome in items:
             if bool(row["selected"]):
                 kind = "selected"
-            elif str(row["disposition"]) in _CAPACITY_DISPOSITIONS:
+            elif bool(outcome.get("capacity_refusal")):
                 kind = "refused"
             else:
                 bucket["other_rejected"] += 1

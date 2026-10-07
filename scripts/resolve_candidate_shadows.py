@@ -24,10 +24,12 @@ from config import settings  # noqa: E402
 from data.fetcher import fetch_symbol  # noqa: E402
 from engine.candidate_observation import CandidateObservationStore  # noqa: E402
 from engine.candidate_observation import _CAPACITY_DISPOSITIONS  # noqa: E402
+from risk.manager import RejectionCode  # noqa: E402
 from reporting.candidate_shadows import (  # noqa: E402
     DonchianReplayContract,
     RSIReplayContract,
     SMAReplayContract,
+    candidate_is_capacity_refusal,
     replay_contract_for_candidate,
     resolve_donchian_shadow,
     resolve_rsi_shadow,
@@ -54,6 +56,10 @@ def _load_work(
 ) -> list[dict[str, object]]:
     conn.row_factory = sqlite3.Row
     placeholders = ",".join("?" for _ in _REFRESHABLE)
+    candidate_dispositions = sorted(
+        {*_CAPACITY_DISPOSITIONS, RejectionCode.POSITION_TOO_SMALL.value}
+    )
+    disposition_placeholders = ",".join("?" for _ in candidate_dispositions)
     sql = f"""
         SELECT d.*, s.status AS shadow_status,
                s.outcome_basis AS shadow_outcome_basis,
@@ -75,10 +81,10 @@ def _load_work(
         JOIN entry_candidate_shadow_outcomes AS s USING(candidate_uid)
         WHERE d.selected = 0
           AND d.capacity_contended = 1
-          AND d.disposition IN ({','.join('?' for _ in _CAPACITY_DISPOSITIONS)})
+          AND d.disposition IN ({disposition_placeholders})
           AND s.status IN ({placeholders})
     """
-    params: list[object] = [*sorted(_CAPACITY_DISPOSITIONS), *_REFRESHABLE]
+    params: list[object] = [*candidate_dispositions, *_REFRESHABLE]
     if strategy != "all":
         sql += " AND d.strategy = ?"
         params.append(strategy)
@@ -164,6 +170,19 @@ def main() -> int:
             contract, contract_source = replay_contract_for_candidate(
                 candidate, repo_root=ROOT
             )
+            if not candidate_is_capacity_refusal(
+                candidate, repo_root=ROOT, contract=contract
+            ):
+                continue
+            # Legacy rows predate durable rejection clip attribution. The
+            # classifier above proved that the stored sleeve cap caused the
+            # zero quantity; annotate the in-memory replay input only.
+            if (
+                candidate.get("disposition")
+                == RejectionCode.POSITION_TOO_SMALL.value
+                and not candidate.get("risk_clip_kind")
+            ):
+                candidate["risk_clip_kind"] = "sleeve_notional"
             observed = _parse_utc(str(candidate["observed_at"]))
             signal_at = _parse_utc(str(candidate["signal_at"]))
             minute_start, minute_end = _entry_window(observed)

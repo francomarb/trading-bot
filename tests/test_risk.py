@@ -827,6 +827,27 @@ class TestPerStrategyRiskTargets:
         assert result.risk_clip_kind == "sleeve_notional"
         assert "sleeve notional_cap" in "".join(messages)
 
+    def test_zero_quantity_rejection_preserves_binding_sleeve_cap(self):
+        mgr = self._target_mgr(max_position_notional_pct=1.0)
+
+        result = mgr.evaluate(
+            _signal(
+                strategy="donchian_breakout",
+                price=100.0,
+                atr=1.0,
+                order_type=OrderType.STOP_LIMIT,
+                entry_trigger_price=102.0,
+                limit_price=105.0,
+            ),
+            _account(equity=100_000.0),
+            now=T0,
+            notional_cap=50.0,
+        )
+
+        assert isinstance(result, RiskRejection)
+        assert result.code is RejectionCode.POSITION_TOO_SMALL
+        assert result.risk_clip_kind == "sleeve_notional"
+
     @pytest.mark.parametrize(
         ("live", "notional_cap", "expected_qty", "expected_clip"),
         [

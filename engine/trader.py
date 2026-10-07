@@ -3379,6 +3379,7 @@ class TradingEngine:
                 candidate_uid,
                 disposition=decision.code.value,
                 disposition_reason=decision.message,
+                risk_clip_kind=decision.risk_clip_kind,
             )
             # Already logged by risk; alert the operator.
             self.alerts.order_rejection(

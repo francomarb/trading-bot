@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 
@@ -187,3 +188,29 @@ class TestCandidateComparisonReport:
 
         assert "CCC | refused | invalid_stop | not_eligible" in report
         assert "production_rejection" in report
+
+    def test_legacy_subshare_sleeve_rejection_remains_in_refused_pool(
+        self, tmp_path
+    ) -> None:
+        conn, store = _connection()
+        selected = store.start(_candidate("AAA", 0), observed_at=NOW)
+        capacity = store.start(_candidate("BBB", 1), observed_at=NOW)
+        subshare = store.start(_candidate("CCC", 2), observed_at=NOW)
+        store.update(selected, selected=True, disposition="filled")
+        store.update(capacity, disposition="sleeve_full")
+        store.update(subshare, disposition="position_too_small")
+        conn.execute(
+            "UPDATE entry_candidate_decisions SET common_context_json = ? "
+            "WHERE candidate_uid = ?",
+            (
+                json.dumps({"sleeve": {"max_position_notional": 99.0}}),
+                subshare,
+            ),
+        )
+        conn.commit()
+        store.finalize_cycle("cycle-sma")
+
+        report = build_candidate_comparison_report(conn, repo_root=tmp_path)
+
+        assert "sma_crossover | TRENDING | 1 | 0/1 | 0/2 | 0" in report
+        assert "CCC | refused | position_too_small | pending" in report

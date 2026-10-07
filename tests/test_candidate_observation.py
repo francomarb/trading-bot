@@ -248,7 +248,50 @@ class TestCandidateObservationStore:
             )
         }
         assert queued == {selected, capacity}
-        assert invalid not in queued
+
+    def test_cap_driven_zero_quantity_is_capacity_contention(
+        self, store: CandidateObservationStore
+    ) -> None:
+        selected = store.start(_start(symbol="AAPL", ordinal=0), observed_at=NOW)
+        blocked = store.start(_start(symbol="MSFT", ordinal=1), observed_at=NOW)
+        store.update(
+            selected,
+            selected=True,
+            disposition="filled",
+            position_uid="position-1",
+        )
+        store.update(
+            blocked,
+            disposition="position_too_small",
+            risk_clip_kind="sleeve_notional",
+        )
+
+        store.finalize_cycle("cycle-1")
+
+        rows = {row["symbol"]: row for row in store.read_cycle("cycle-1")}
+        assert rows["MSFT"]["capacity_contended"] == 1
+        queued = {
+            row[0]
+            for row in store._conn.execute(
+                "SELECT candidate_uid FROM entry_candidate_shadow_outcomes"
+            )
+        }
+        assert queued == {selected, blocked}
+
+    def test_risk_driven_zero_quantity_is_not_capacity_contention(
+        self, store: CandidateObservationStore
+    ) -> None:
+        selected = store.start(_start(symbol="AAPL", ordinal=0), observed_at=NOW)
+        blocked = store.start(_start(symbol="MSFT", ordinal=1), observed_at=NOW)
+        store.update(selected, selected=True, disposition="filled")
+        store.update(blocked, disposition="position_too_small")
+
+        store.finalize_cycle("cycle-1")
+
+        assert all(
+            row["capacity_contended"] == 0
+            for row in store.read_cycle("cycle-1")
+        )
 
     def test_unknown_update_field_is_rejected(self, store: CandidateObservationStore) -> None:
         uid = store.start(_start(), observed_at=NOW)
@@ -288,8 +331,8 @@ class TestStrategyCandidateFeatures:
         assert contract["fast_window"] == 20
         assert contract["slow_window"] == 50
         assert contract["entry_order_type"] == "market"
-        assert "entry_time_in_force" not in contract
-        assert contract["stop_anchor"] == "reference"
+        assert contract["entry_time_in_force"] == "day"
+        assert contract["stop_anchor"] == "fill"
 
     def test_rsi_features_describe_oversold_depth_and_reversion_distance(self) -> None:
         frame = self._frame()

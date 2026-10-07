@@ -436,10 +436,13 @@ picker facts already computed by the real execution path through
 output never feeds back into trading. Same-strategy/same-signal-bar groups retain
 explicit slot, watchlist, and global evaluation order. Groups where one
 candidate was selected and another hit a capacity gate enqueue a disposable
-counterfactual outcome row. RSI, SMA, and Donchian candidates freeze
+counterfactual outcome row. Cap-driven zero-share sizing rejections preserve
+their binding cap and count as capacity refusals; risk-driven zeroes and invalid
+stops do not. RSI, SMA, and Donchian candidates freeze
 strategy-specific replay contracts through `candidate_replay_contract()` and
 resolve offline from post-observation minute bars plus completed daily bars.
 RSI records the broker's ordinary entry TIF and local stale-LIMIT age;
+SMA records its fractional DAY market route and fill-anchored stop;
 Donchian declares its stricter routing invariant directly because STOP_LIMIT
 entries are always DAY. The shared framework never substitutes a generic
 fill/exit model: RSI limit, SMA market, and Donchian stop-limit mechanics

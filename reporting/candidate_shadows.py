@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from engine.candidate_observation import _CAPACITY_DISPOSITIONS
+from engine.candidate_observation import is_capacity_disposition
 from execution.entry_guard import EntryPriceCap, compute_cap_price
 from strategies.donchian_breakout import DonchianBreakout
 from strategies.rsi_reversion import RSIReversion
@@ -173,8 +173,10 @@ class SMAReplayContract:
             raise ValueError("SMA shadow replay requires MARKET entry and exit")
         if self.entry_time_in_force not in {"day", "gtc"}:
             raise ValueError("SMA shadow replay requires a known entry TIF")
-        if self.stop_anchor != "reference":
-            raise ValueError("SMA shadow replay requires reference stop anchoring")
+        if self.stop_anchor not in {"reference", "fill"}:
+            raise ValueError("SMA shadow replay requires a known stop anchor")
+        if self.stop_anchor == "fill" and self.entry_time_in_force != "day":
+            raise ValueError("fill-anchored SMA replay requires its DAY entry route")
         if (
             not math.isfinite(self.atr_stop_multiplier)
             or not math.isfinite(self.modeled_exit_slippage_bps)
@@ -570,13 +572,15 @@ def replay_contract_for_candidate(
         peer_tif = str(candidate.get("peer_entry_time_in_force") or "").lower()
         if peer_tif not in {"day", "gtc"}:
             raise ValueError("legacy SMA candidate has no selected-peer entry TIF")
+        fractional_enabled = bool(_literal_setting(source, "FRACTIONAL_ENABLED"))
         contract = SMAReplayContract.from_mapping(
             {
                 **common_values,
                 "fast_window": features["fast_window"],
                 "slow_window": features["slow_window"],
                 "entry_order_type": "market",
-                "entry_time_in_force": peer_tif,
+                "entry_time_in_force": "day" if fractional_enabled else peer_tif,
+                "stop_anchor": "fill" if fractional_enabled else "reference",
             }
         )
     elif strategy == "donchian_breakout":
@@ -595,6 +599,63 @@ def replay_contract_for_candidate(
     else:
         raise ValueError(f"unsupported candidate strategy {strategy!r}")
     return contract, f"historical_commit:{commit[:10]}"
+
+
+def candidate_is_capacity_refusal(
+    candidate: Mapping[str, Any],
+    *,
+    repo_root: str | Path,
+    contract: (
+        RSIReplayContract | SMAReplayContract | DonchianReplayContract | None
+    ) = None,
+) -> bool:
+    """Classify explicit and legacy cap-driven candidate refusals.
+
+    New rows preserve the binding cap directly. Older ``position_too_small``
+    rows predate that field, so the remaining sleeve allowance is compared
+    with the exact worst permitted one-share entry price.
+    """
+    disposition = str(candidate.get("disposition") or "")
+    clip_kind = candidate.get("risk_clip_kind")
+    if is_capacity_disposition(
+        disposition,
+        str(clip_kind) if clip_kind else None,
+    ):
+        return True
+    if disposition != "position_too_small":
+        return False
+    common = _decoded(candidate.get("common_context_json"))
+    sleeve = common.get("sleeve")
+    if not isinstance(sleeve, Mapping):
+        return False
+    try:
+        remaining = float(sleeve["max_position_notional"])
+        sizing_price = float(candidate["reference_price"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if str(candidate.get("strategy") or "") == "donchian_breakout":
+        try:
+            if contract is None:
+                contract, _source = replay_contract_for_candidate(
+                    candidate, repo_root=repo_root
+                )
+            if not isinstance(contract, DonchianReplayContract):
+                return False
+            features = _decoded(candidate.get("strategy_features_json"))
+            trigger = float(features["entry_trigger"])
+            atr = float(candidate["atr"])
+            sizing_price = compute_cap_price(
+                reference_price=trigger,
+                atr=atr,
+                side="buy",
+                policy=EntryPriceCap(
+                    max_chase_bps=contract.max_chase_bps,
+                    max_chase_atr_fraction=contract.max_chase_atr_fraction,
+                ),
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
+    return math.isfinite(remaining) and 0 <= remaining < sizing_price
 
 
 def _bars(value: pd.DataFrame, *, name: str) -> pd.DataFrame:
@@ -661,7 +722,10 @@ def resolve_rsi_shadow(
     """
     if candidate.get("strategy") != "rsi_reversion":
         raise ValueError("resolve_rsi_shadow received a non-RSI candidate")
-    if candidate.get("disposition") not in _CAPACITY_DISPOSITIONS:
+    if not is_capacity_disposition(
+        str(candidate.get("disposition") or ""),
+        str(candidate.get("risk_clip_kind") or "") or None,
+    ):
         raise ValueError("RSI shadow resolver accepts capacity refusals only")
     observed = datetime.fromisoformat(str(candidate["observed_at"]))
     if observed.tzinfo is None:
@@ -965,7 +1029,9 @@ def resolve_rsi_shadow(
                 entry=entry,
                 stop=stop,
                 exit_price=exit_price,
-                exit_at=pd.Timestamp(timestamp).to_pydatetime(),
+                exit_at=datetime.combine(
+                    row["_session_date"], time(9, 30), _NY
+                ).astimezone(timezone.utc),
                 high=high,
                 low=low,
                 metadata={**base_meta, "exit_reason": reason},
@@ -1143,12 +1209,17 @@ def _resolve_equity_after_entry(
             continue
         high = max(high, raw_exit)
         low = min(low, raw_exit)
+        modeled_exit_at = pd.Timestamp(timestamp).to_pydatetime()
+        if reason in {"strategy_signal", "protective_stop_gap"}:
+            modeled_exit_at = datetime.combine(
+                row["_session_date"], time(9, 30), _NY
+            ).astimezone(timezone.utc)
         return _metric_result(
             status="resolved",
             entry=entry,
             stop=stop,
             exit_price=raw_exit * (1.0 - slippage_bps / 10_000.0),
-            exit_at=pd.Timestamp(timestamp).to_pydatetime(),
+            exit_at=modeled_exit_at,
             high=high,
             low=low,
             metadata={
@@ -1189,7 +1260,10 @@ def resolve_sma_shadow(
     """Replay one refused SMA market entry and its production exits."""
     if candidate.get("strategy") != "sma_crossover":
         raise ValueError("resolve_sma_shadow received a non-SMA candidate")
-    if candidate.get("disposition") not in _CAPACITY_DISPOSITIONS:
+    if not is_capacity_disposition(
+        str(candidate.get("disposition") or ""),
+        str(candidate.get("risk_clip_kind") or "") or None,
+    ):
         raise ValueError("SMA shadow resolver accepts capacity refusals only")
     observed = datetime.fromisoformat(str(candidate["observed_at"]))
     if observed.tzinfo is None:
@@ -1200,7 +1274,7 @@ def resolve_sma_shadow(
     atr = float(candidate["atr"])
     if not all(math.isfinite(value) and value > 0 for value in (reference, atr)):
         raise ValueError("candidate reference/ATR must be finite and positive")
-    stop = round(reference - contract.atr_stop_multiplier * atr, 2)
+    reference_stop = round(reference - contract.atr_stop_multiplier * atr, 2)
     base = {
         "replay_version": 1,
         "contract_source": contract_source,
@@ -1208,9 +1282,9 @@ def resolve_sma_shadow(
         "as_of": as_of.isoformat(),
         "entry_timing_basis": "first complete 1-minute bar after observation",
         "exit_timing_basis": "next-session open after completed daily signal",
-        "stop_price": stop,
+        "reference_stop_price": reference_stop,
     }
-    if stop <= 0:
+    if reference_stop <= 0:
         return _empty_result(status="not_eligible", basis=_SMA_REPLAY_BASIS, metadata={
             **base, "unresolved_reason": "production stop would be non-positive"
         })
@@ -1237,6 +1311,14 @@ def resolve_sma_shadow(
         )
     entry_at = usable.index[0]
     entry = float(usable.iloc[0]["open"])
+    stop_anchor = entry if contract.stop_anchor == "fill" else reference
+    stop = round(stop_anchor - contract.atr_stop_multiplier * atr, 2)
+    stop_anchor_fallback = False
+    if stop <= 0 or stop >= entry:
+        # Match RiskDecision.stop_for_fill(): an unusable fill-anchored stop
+        # falls back to the valid pre-fill reference stop.
+        stop = reference_stop
+        stop_anchor_fallback = True
     return _resolve_equity_after_entry(
         strategy=SMACrossover(
             fast=contract.fast_window,
@@ -1255,6 +1337,8 @@ def resolve_sma_shadow(
             "fill_status": "filled",
             "entry_at": entry_at.isoformat(),
             "entry_price_basis": "minute_open_proxy",
+            "stop_price": stop,
+            "stop_anchor_fallback": stop_anchor_fallback,
             "excursion_precision": "one_minute_bounds",
         },
     )
@@ -1273,7 +1357,10 @@ def resolve_donchian_shadow(
     """Replay one refused Donchian DAY stop-limit and its production exits."""
     if candidate.get("strategy") != "donchian_breakout":
         raise ValueError("resolve_donchian_shadow received a non-Donchian candidate")
-    if candidate.get("disposition") not in _CAPACITY_DISPOSITIONS:
+    if not is_capacity_disposition(
+        str(candidate.get("disposition") or ""),
+        str(candidate.get("risk_clip_kind") or "") or None,
+    ):
         raise ValueError("Donchian shadow resolver accepts capacity refusals only")
     observed = datetime.fromisoformat(str(candidate["observed_at"]))
     if observed.tzinfo is None:
@@ -1369,6 +1456,7 @@ __all__ = [
     "RSIReplayContract",
     "SMAReplayContract",
     "ShadowReplayResult",
+    "candidate_is_capacity_refusal",
     "replay_contract_for_candidate",
     "resolve_donchian_shadow",
     "resolve_rsi_shadow",

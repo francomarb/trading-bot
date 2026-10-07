@@ -87,7 +87,12 @@ strategy retains its own entry, protection, and exit resolver. A contended
 cycle can also contain a candidate production rejected for an unrelated reason
 such as an invalid stop. Such a row remains visible in the permanent audit and
 comparison report as `not_eligible`; it is not queued or replayed as though
-removing capacity would have made it tradable.
+removing capacity would have made it tradable. A `position_too_small`
+rejection is different when sizing first allowed a share and a sleeve, cash,
+gross-exposure, or global-notional cap then reduced it to zero. New rows retain
+that binding cap directly and are valid capacity refusals. Legacy rows are
+classified from their stored sleeve allowance and frozen worst entry price;
+genuine risk-budget zeroes remain excluded.
 
 The resolvers are explicit offline commands:
 
@@ -130,13 +135,17 @@ missing configuration and stale-age default by parsing settings from their
 immutable stored bot commit; historical Python is never executed and current
 settings are never substituted.
 
-SMA models an immediate market entry from the first complete minute after
-observation, its reference-anchored ATR stop, and the raw crossunder exit.
+SMA models the production fractional route: an immediate DAY market entry from
+the first complete minute after observation, a fill-anchored ATR stop, and the
+raw crossunder exit. Pre-contract SMA rows recover whether fractional routing
+was enabled from their immutable commit rather than borrowing current settings.
 Donchian models only the remaining session of its DAY stop-limit order, the
 frozen trigger/chase cap, its reference-anchored ATR stop, and the raw channel
 exit. Same-minute entry/stop ordering stays `needs_review`; unavailable bars
 stay pending rather than being guessed. Pre-contract rows recover literal
 settings from their immutable Git commit without executing historical Python.
+Modeled next-session-open exits use 09:30 New York time rather than the daily
+bar's midnight timestamp so reported holding periods retain the correct clock.
 
 The resolver command only updates `entry_candidate_shadow_outcomes` when
 `--apply` is passed. It never changes a decision, lifecycle, allocator state,
