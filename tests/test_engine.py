@@ -5603,6 +5603,242 @@ class TestAsyncOptionEntryIdentity:
         ] == []
 
 
+class TestAsyncOptionFillCycleOrdering:
+    """Stream-first cycle ordering must retain terminal worker semantics."""
+
+    OCC = "SPY261016C00764000"
+
+    @classmethod
+    def _decision(cls, strategy_name="fake_strategy"):
+        return RiskDecision(
+            symbol=cls.OCC,
+            side=Side.BUY,
+            qty=3,
+            entry_reference_price=11.60,
+            stop_price=8.70,
+            strategy_name=strategy_name,
+            reason="opt entry",
+            order_type=OrderType.LIMIT,
+            limit_price=11.60,
+        )
+
+    def _wire(self, engine_factory):
+        from unittest.mock import patch
+
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        engine.alerts = MagicMock()
+        slot = engine.slots[0]
+        slot.strategy.register_fill = MagicMock()
+        slot.strategy.build_option_execution = (
+            lambda *_args, **_kwargs: (self.OCC, 11.60, 34.80, 8.70)
+        )
+        slot.strategy.preferred_order_type = OrderType.LIMIT
+        engine._reject_if_contract_conflict = MagicMock(return_value=None)
+        engine.risk.evaluate = MagicMock(
+            return_value=self._decision(slot.strategy.name)
+        )
+        real_broker = AlpacaBroker(
+            client=MagicMock(),
+            max_attempts=1,
+            base_delay=0.0,
+            lifecycle_orders_store=engine.lifecycle_orders_store,
+            lifecycle_store=engine.lifecycle_store,
+        )
+        broker.place_order.side_effect = real_broker.place_order
+        broker.drain_option_fills.side_effect = real_broker.drain_option_fills
+        broker.drain_lifecycle_attaches.side_effect = (
+            real_broker.drain_lifecycle_attaches
+        )
+        captured = {}
+
+        def _capture_worker(
+            *, on_fill, on_submitted, client_order_id, **_kwargs
+        ):
+            captured.update(
+                on_fill=on_fill,
+                on_submitted=on_submitted,
+                client_order_id=client_order_id,
+            )
+            return MagicMock()
+
+        snapshot = _snapshot()
+        engine._session_start_equity = snapshot.account.equity
+        with patch(
+            "execution.broker.OptionsExecutionWorker",
+            side_effect=_capture_worker,
+        ):
+            engine._process_symbol(
+                "AAPL",
+                snapshot,
+                snapshot.account,
+                slot.strategy,
+                slot.timeframe,
+            )
+        captured["on_submitted"](
+            captured["client_order_id"], "alpaca-opt-normal-1"
+        )
+        engine._drain_lifecycle_attaches()
+        engine._stream_manager = MagicMock()
+        return engine, captured
+
+    @staticmethod
+    def _stream_fill(engine, snapshot, status, qty, price, updated_at):
+        engine._stream_manager.drain_lifecycle_events.return_value = [
+            OrderEvent(
+                order_id="alpaca-opt-normal-1",
+                status=status,
+                filled_qty=qty,
+                avg_fill_price=price,
+                broker_updated_at=updated_at,
+            )
+        ]
+        engine._drain_lifecycle_events(snapshot)
+
+    def test_normal_stream_fill_keeps_standard_option_alert(
+        self, engine_factory
+    ):
+        engine, captured = self._wire(engine_factory)
+        snapshot = _snapshot(
+            positions={
+                self.OCC: Position(self.OCC, 3, 12.40, 3_720.0),
+            }
+        )
+
+        self._stream_fill(
+            engine,
+            snapshot,
+            "filled",
+            3.0,
+            12.40,
+            "2026-10-10T14:31:00+00:00",
+        )
+        captured["on_fill"]("filled", 3.0, 12.40, "alpaca-opt-normal-1")
+        engine._drain_option_fills()
+
+        engine.alerts.trade_executed.assert_called_once()
+        alert = engine.alerts.trade_executed.call_args.kwargs
+        assert alert["reason"] == "fake_strategy options entry"
+        assert (alert["qty"], alert["price"]) == (3.0, 12.40)
+
+    def test_partial_stream_waits_for_final_cumulative_fill_alert(
+        self, engine_factory
+    ):
+        engine, captured = self._wire(engine_factory)
+        self._stream_fill(
+            engine,
+            _snapshot(
+                positions={
+                    self.OCC: Position(self.OCC, 1, 12.40, 1_240.0),
+                }
+            ),
+            "partially_filled",
+            1.0,
+            12.40,
+            "2026-10-10T14:31:00+00:00",
+        )
+        engine.alerts.trade_executed.assert_not_called()
+
+        final_snapshot = _snapshot(
+            positions={
+                self.OCC: Position(self.OCC, 3, 12.42, 3_726.0),
+            }
+        )
+        self._stream_fill(
+            engine,
+            final_snapshot,
+            "filled",
+            3.0,
+            12.42,
+            "2026-10-10T14:31:05+00:00",
+        )
+        captured["on_fill"]("filled", 3.0, 12.42, "alpaca-opt-normal-1")
+        engine._drain_option_fills()
+
+        engine.alerts.trade_executed.assert_called_once()
+        alert = engine.alerts.trade_executed.call_args.kwargs
+        assert alert["reason"] == "fake_strategy options entry"
+        assert (alert["qty"], alert["price"]) == (3.0, 12.42)
+
+    def test_fill_refresh_preserves_hwm_and_live_stop_state(
+        self, engine_factory
+    ):
+        engine, _broker = engine_factory(entries=[False])
+        engine.alerts = MagicMock()
+        position_uid = "pos_option_existing"
+        engine._register_single_leg(
+            strategy_name="fake_strategy",
+            symbol=self.OCC,
+            position_id=position_uid,
+        )
+        engine.option_trailing_store.upsert(
+            position_uid=position_uid,
+            occ_symbol=self.OCC,
+            strategy="fake_strategy",
+            owner_key="SPY",
+            qty=1.0,
+            entry_premium=12.40,
+            hwm_premium=15.00,
+            trail_activation_pct=0.10,
+            trail_pct=0.15,
+            current_stop_price=12.75,
+            alpaca_stop_order_id="option-stop-existing",
+            stop_order_status="accepted",
+            last_observed_premium=14.50,
+        )
+
+        applied = engine._apply_single_leg_option_entry_fill_effects(
+            decision=self._decision(),
+            fill_price=12.45,
+            fill_qty=3.0,
+            position_uid=position_uid,
+            alert_reason="fake_strategy options entry",
+        )
+
+        assert applied is False
+        refreshed = engine.option_trailing_store.get_by_occ(self.OCC)
+        assert refreshed.qty == pytest.approx(3.0)
+        assert refreshed.entry_premium == pytest.approx(12.45)
+        assert refreshed.hwm_premium == pytest.approx(15.00)
+        assert refreshed.current_stop_price == pytest.approx(12.75)
+        assert refreshed.alpaca_stop_order_id == "option-stop-existing"
+        assert refreshed.stop_order_status == "accepted"
+        assert refreshed.last_observed_premium == pytest.approx(14.50)
+        engine.alerts.trade_executed.assert_not_called()
+
+    def test_fill_refuses_trailing_state_owned_by_other_lifecycle(
+        self, engine_factory
+    ):
+        engine, _broker = engine_factory(entries=[False])
+        engine.alerts = MagicMock()
+        engine.option_trailing_store.upsert(
+            position_uid="pos_option_old",
+            occ_symbol=self.OCC,
+            strategy="fake_strategy",
+            owner_key="SPY",
+            qty=1.0,
+            entry_premium=12.40,
+            hwm_premium=12.40,
+            trail_activation_pct=0.10,
+            trail_pct=0.15,
+        )
+
+        applied = engine._apply_single_leg_option_entry_fill_effects(
+            decision=self._decision(),
+            fill_price=12.45,
+            fill_qty=3.0,
+            position_uid="pos_option_new",
+            alert_reason="fake_strategy options entry",
+        )
+
+        assert applied is False
+        existing = engine.option_trailing_store.get_by_occ(self.OCC)
+        assert existing.position_uid == "pos_option_old"
+        assert existing.qty == pytest.approx(1.0)
+        assert self.OCC not in engine._entry_prices
+        assert not engine._has_position(self.OCC)
+        engine.alerts.trade_executed.assert_not_called()
+
+
 class TestAmbiguousAsyncOptionEntryResolution:
     """Ambiguous option entries must not become false external closes."""
 

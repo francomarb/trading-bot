@@ -3829,7 +3829,7 @@ class TradingEngine:
                 fill_price=fill_price,
                 fill_qty=fill_qty,
                 position_uid=position_uid,
-                alert_reason=f"{decision.reason} {reason_suffix}".strip(),
+                alert_reason=f"{decision.strategy_name} options entry",
             )
             return
         self._register_single_leg(
@@ -3874,7 +3874,10 @@ class TradingEngine:
         order settles.  Ownership therefore cannot prove that the later fill
         confirmation completed the entry-basis, trailing-state, strategy
         anchor, counter, and alert work.  The durable trailing row for the
-        same lifecycle UID is that marker instead.
+        same lifecycle UID is that marker instead.  This relies on the cycle
+        invariant that lifecycle reconciliation and the option-fill drain run
+        before ``_sync_option_trailing_stops``; preserve that ordering so the
+        synchronizer cannot create the marker before fill effects run.
 
         Repeated cumulative PARTIAL/FILLED events still refresh quantity and
         average entry premium.  Existing stop identity and the premium HWM
@@ -4108,7 +4111,9 @@ class TradingEngine:
             # The focused-UPDATE accounting block below doesn't need a
             # RiskDecision; it reads everything off `order_row` and
             # `event`.
-            if not ownership_already_bound or is_single_leg_option:
+            if not ownership_already_bound or (
+                is_single_leg_option and event.status == "filled"
+            ):
                 if snapshot is None:
                     logger.warning(
                         f"substrate entry-fill dispatch: skipped "
@@ -4268,12 +4273,20 @@ class TradingEngine:
                             entry_order_id=event.order_id,
                         )
                         if effects_applied:
-                            logger.warning(
-                                f"substrate entry-fill dispatch: completed "
-                                f"recovered fill effects for {symbol} "
-                                f"({pos_row.strategy}) via "
-                                f"order_id={event.order_id}"
-                            )
+                            if is_single_leg_option:
+                                logger.info(
+                                    f"substrate entry-fill dispatch: completed "
+                                    f"option fill effects for {symbol} "
+                                    f"({pos_row.strategy}) via "
+                                    f"order_id={event.order_id}"
+                                )
+                            else:
+                                logger.warning(
+                                    f"substrate entry-fill dispatch: completed "
+                                    f"recovered fill effects for {symbol} "
+                                    f"({pos_row.strategy}) via "
+                                    f"order_id={event.order_id}"
+                                )
                         else:
                             logger.debug(
                                 f"substrate entry-fill dispatch: fill effects "
