@@ -6680,14 +6680,34 @@ class TradingEngine:
                     stop_order_id=existing.order_id,
                 )
         for existing in existing_stops:
-            if not self.broker.cancel_order(existing.order_id):
+            cancellation = self.broker.cancel_order_and_confirm(
+                order_id=existing.order_id,
+                symbol=lifecycle_row.symbol,
+                requested_qty=existing.qty,
+            )
+            if (
+                cancellation.status is not OrderStatus.CANCELED
+                or cancellation.filled_qty > 0
+            ):
                 return _ResidualProtectionOutcome(
                     status="failed", residual_qty=residual_qty,
                     note=(
-                        "could not cancel stale/wrong-sized protective stop "
-                        f"{existing.order_id}"
+                        "could not confirm zero-fill cancellation of stale/"
+                        f"wrong-sized protective stop {existing.order_id}"
                     ),
                 )
+        if existing_stops and not self.broker.wait_for_position_qty_available(
+            symbol=lifecycle_row.symbol,
+            required_qty=residual_qty,
+        ):
+            return _ResidualProtectionOutcome(
+                status="failed",
+                residual_qty=residual_qty,
+                note=(
+                    "stale protective stop cancellation reached terminal status, "
+                    "but Alpaca did not release the residual quantity"
+                ),
+            )
 
         try:
             if is_occ_option(lifecycle_row.symbol):
@@ -9610,17 +9630,30 @@ class TradingEngine:
                     position_uid, entry_order_id, target_stop = fill_anchor
                     failure_key = (symbol, existing.order_id)
                     try:
-                        rebuilt = (
-                            self.broker.replace_protective_stop_with_standalone_gtc(
+                        if str(existing.order_class or "").lower() == "simple":
+                            rebuilt = self.broker.replace_standalone_equity_stop(
                                 symbol=symbol,
-                                stop_order_id=existing.order_id,
+                                order_id=existing.order_id,
                                 qty=stop_qty,
                                 stop_price=target_stop,
-                                fallback_stop_price=float(existing.stop_price),
-                                client_order_id_prefix=f"{owner}-fill-stop-gtc",
+                                client_order_id_prefix=f"{owner}-fill-stop-replace",
                                 position_uid=position_uid,
                             )
-                        )
+                        else:
+                            # Alpaca does not support replacing an OTO child.
+                            # Confirm terminal cancellation and released shares
+                            # before rebuilding it as a standalone GTC stop.
+                            rebuilt = (
+                                self.broker.replace_protective_stop_with_standalone_gtc(
+                                    symbol=symbol,
+                                    stop_order_id=existing.order_id,
+                                    qty=stop_qty,
+                                    stop_price=target_stop,
+                                    fallback_stop_price=float(existing.stop_price),
+                                    client_order_id_prefix=f"{owner}-fill-stop-gtc",
+                                    position_uid=position_uid,
+                                )
+                            )
                         snapshot.open_orders.remove(existing)
                         snapshot.open_orders.append(rebuilt)
                         actual_stop = float(rebuilt.stop_price)

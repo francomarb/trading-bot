@@ -82,6 +82,16 @@ def _build_engine(
     # open_positions.get(symbol) returns a Position with broker_qty.
     engine.broker = MagicMock()
     engine.broker.cancel_order.return_value = True
+    engine.broker.cancel_order_and_confirm.return_value = OrderResult(
+        status=OrderStatus.CANCELED,
+        order_id="existing-stop",
+        symbol=symbol,
+        requested_qty=broker_qty,
+        filled_qty=0.0,
+        avg_fill_price=None,
+        raw_status="canceled",
+    )
+    engine.broker.wait_for_position_qty_available.return_value = True
     engine.broker.settle_close_order.side_effect = lambda result: replace(
         result, raw_status="canceled"
     )

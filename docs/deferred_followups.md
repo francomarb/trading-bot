@@ -112,6 +112,16 @@ What a paper confirmation of this fix looks like: a DAY child cancel event, one
 standalone GTC protective stop, no duplicate SELL exposure, and a substrate row
 whose TIF matches broker truth.
 
+Follow-up incident, 2026-10-09: INTC showed that an accepted DELETE response is
+not cancellation confirmation. The bot submitted the replacement milliseconds
+after the request, while Alpaca still held the position quantity for the old
+stop, so both the target and fallback were rejected. A later repair cycle
+restored protection, but the position spent several minutes without a stop.
+The corrected contract is two-part: attached OTO children wait for terminal
+`canceled` state and released `qty_available` before rebuilding; an already
+standalone simple GTC stop is repriced through Alpaca's native replace endpoint
+and does not enter another cancel/recreate window.
+
 ## 3. SPY options reversion blocked before enough paper trades
 
 On June 22, 2026, `spy_options_reversion` produced valid entry signals but was

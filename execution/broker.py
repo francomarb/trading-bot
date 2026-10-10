@@ -105,6 +105,7 @@ from config.settings import (
     ALPACA_SECRET_KEY,
     DRY_RUN,
     FRACTIONAL_ENABLED,
+    ORDER_CANCEL_CONFIRM_TIMEOUT_SECONDS,
     ORDER_CONFIRM_TIMEOUT_SECONDS,
     RESTING_ENTRY_CONFIRM_TIMEOUT_SECONDS,
 )
@@ -234,6 +235,7 @@ class OpenOrder:
     stop_price: float | None
     client_order_id: str | None = None
     time_in_force: str | None = None
+    order_class: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2874,18 +2876,140 @@ class AlpacaBroker:
             ))
 
     def cancel_order(self, order_id: str) -> bool:
-        """Cancel an order by id. Returns True on success, False on failure."""
+        """Request cancellation by id; True does not mean terminal cancellation."""
         try:
             self._with_retry(
                 lambda: self._api.cancel_order_by_id(order_id),
                 op_desc=f"cancel_order({order_id})",
                 retry_safe=False,
             )
-            logger.info(f"canceled order {order_id}")
+            logger.info(f"cancel requested for order {order_id}")
             return True
         except APIError as e:
             logger.warning(f"cancel_order({order_id}) failed: {e}")
             return False
+
+    def cancel_order_and_confirm(
+        self,
+        *,
+        order_id: str,
+        symbol: str,
+        requested_qty: float,
+        release_qty: float | None = None,
+        timeout: float = ORDER_CANCEL_CONFIRM_TIMEOUT_SECONDS,
+        interval: float = 0.25,
+    ) -> OrderResult:
+        """Request cancellation and wait for broker-terminal truth.
+
+        alpaca-py's ``cancel_order_by_id`` returns ``None`` when the DELETE
+        request is accepted; it does not prove that the order is canceled.
+        Callers that submit another close-side order must use this method so
+        the old order cannot continue reserving the same shares.
+        """
+        request_error: Exception | None = None
+        try:
+            self._with_retry(
+                lambda: self._api.cancel_order_by_id(order_id),
+                op_desc=f"cancel_order({order_id})",
+                retry_safe=False,
+            )
+            logger.info(f"cancel requested for order {order_id}; awaiting terminal status")
+        except (
+            APIError,
+            RequestsConnectionError,
+            RequestsTimeout,
+            ConnectionError,
+            TimeoutError,
+        ) as exc:
+            # A failed or timed-out DELETE does not establish broker state.
+            # Read the order anyway: it may already be terminal, or Alpaca may
+            # have accepted an ambiguous request before the response failed.
+            request_error = exc
+            logger.warning(
+                f"cancel request for {order_id} raised {type(exc).__name__}; "
+                "reconciling broker order status before proceeding"
+            )
+
+        try:
+            settled = self._poll_until_terminal(
+                order_id=order_id,
+                symbol=symbol,
+                requested_qty=requested_qty,
+                timeout=timeout,
+                interval=interval,
+            )
+        except Exception as exc:
+            detail = f"cancel status reconciliation failed: {exc}"
+            if request_error is not None:
+                detail = f"cancel request failed ({request_error}); {detail}"
+            return OrderResult(
+                status=OrderStatus.UNKNOWN,
+                order_id=order_id,
+                symbol=symbol,
+                requested_qty=requested_qty,
+                filled_qty=0.0,
+                avg_fill_price=None,
+                raw_status=None,
+                message=detail,
+            )
+        if settled.status is not OrderStatus.CANCELED or settled.filled_qty > 0:
+            return settled
+        if release_qty is None:
+            return settled
+        if self.wait_for_position_qty_available(
+            symbol=symbol,
+            required_qty=release_qty,
+            timeout=timeout,
+            interval=interval,
+        ):
+            return settled
+        return replace(
+            settled,
+            status=OrderStatus.UNKNOWN,
+            message=(
+                f"cancellation reached {settled.raw_status}, but Alpaca did not "
+                f"release {release_qty:g} {symbol} shares before timeout"
+            ),
+        )
+
+    def wait_for_position_qty_available(
+        self,
+        *,
+        symbol: str,
+        required_qty: float,
+        timeout: float = ORDER_CANCEL_CONFIRM_TIMEOUT_SECONDS,
+        interval: float = 0.25,
+    ) -> bool:
+        """Wait until Alpaca reports enough unreserved position quantity."""
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                position = self._with_retry(
+                    lambda: self._api.get_open_position(symbol),
+                    op_desc=f"get_open_position({symbol})",
+                )
+            except APIError as exc:
+                if getattr(exc, "status_code", None) == 404:
+                    return False
+                logger.warning(
+                    f"could not verify released quantity for {symbol}: {exc}"
+                )
+                return False
+            except Exception as exc:
+                logger.warning(
+                    f"could not verify released quantity for {symbol}: {exc}"
+                )
+                return False
+            raw_available = getattr(position, "qty_available", None)
+            if raw_available is not None:
+                try:
+                    if abs(float(raw_available)) + 1e-9 >= required_qty:
+                        return True
+                except (TypeError, ValueError):
+                    pass
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(interval)
 
     def close_position(
         self,
@@ -2952,14 +3076,44 @@ class AlpacaBroker:
         # freed for the close.  BUY orders do not reserve the held position
         # and must not be canceled merely because they share a symbol.
         cancel_failures: list[str] = []
+        canceled_sell_orders = 0
         for o in self.get_open_orders():
             if o.symbol == symbol and o.side is Side.SELL:
-                if not self.cancel_order(o.order_id):
+                outcome = self.cancel_order_and_confirm(
+                    order_id=o.order_id,
+                    symbol=symbol,
+                    requested_qty=o.qty,
+                )
+                if (
+                    outcome.status is not OrderStatus.CANCELED
+                    or outcome.filled_qty > 0
+                ):
                     cancel_failures.append(o.order_id)
+                else:
+                    canceled_sell_orders += 1
         if cancel_failures:
             message = (
                 "could not confirm cancellation of close-side order(s): "
                 + ", ".join(cancel_failures)
+            )
+            logger.error(f"close_position({symbol}) refused: {message}")
+            return OrderResult(
+                status=OrderStatus.REJECTED,
+                order_id=None,
+                symbol=symbol,
+                requested_qty=qty,
+                filled_qty=0.0,
+                avg_fill_price=None,
+                raw_status=None,
+                message=message,
+            )
+        if canceled_sell_orders and not self.wait_for_position_qty_available(
+            symbol=symbol,
+            required_qty=qty,
+        ):
+            message = (
+                "sell cancellation reached terminal status, but Alpaca did not "
+                "release the position quantity before timeout"
             )
             logger.error(f"close_position({symbol}) refused: {message}")
             return OrderResult(
@@ -3235,9 +3389,19 @@ class AlpacaBroker:
             f"rebuilding protective stop {stop_order_id} as standalone GTC: "
             f"sell {whole_qty} {symbol} @ ${stop_price:.2f}"
         )
-        if not self.cancel_order(stop_order_id):
+        cancellation = self.cancel_order_and_confirm(
+            order_id=stop_order_id,
+            symbol=symbol,
+            requested_qty=whole_qty,
+            release_qty=whole_qty,
+        )
+        if (
+            cancellation.status is not OrderStatus.CANCELED
+            or cancellation.filled_qty > 0
+        ):
             raise BrokerError(
-                f"could not cancel protective stop {stop_order_id}"
+                f"protective stop {stop_order_id} cancellation was not "
+                f"confirmed without fills: {cancellation.message}"
             )
         if self._stream_manager is not None:
             self._stream_manager.unregister_stop_leg(stop_order_id)
@@ -3249,7 +3413,18 @@ class AlpacaBroker:
                 client_order_id_prefix=client_order_id_prefix,
                 position_uid=position_uid,
             )
-        except Exception as primary_exc:
+        except (
+            APIError,
+            RequestsConnectionError,
+            RequestsTimeout,
+            ConnectionError,
+            TimeoutError,
+        ) as primary_exc:
+            if is_ambiguous_write_error(primary_exc):
+                raise BrokerError(
+                    f"replacement stop outcome is unknown ({primary_exc}); "
+                    "fallback suppressed to avoid duplicate protection"
+                ) from primary_exc
             logger.critical(
                 f"{symbol}: replacement stop @ ${stop_price:.2f} failed after "
                 f"cancel; restoring prior protection @ ${fallback_stop_price:.2f}"
@@ -3267,6 +3442,61 @@ class AlpacaBroker:
                     f"replacement stop failed ({primary_exc}); restoration also "
                     f"failed ({fallback_exc})"
                 ) from fallback_exc
+
+    def replace_standalone_equity_stop(
+        self,
+        *,
+        symbol: str,
+        order_id: str,
+        qty: float,
+        stop_price: float,
+        client_order_id_prefix: str = "equity-stop-replace",
+        position_uid: str | None = None,
+    ) -> OpenOrder:
+        """Atomically reprice a simple equity GTC stop through Alpaca PATCH."""
+        whole_qty = int(qty)
+        if whole_qty < 1 or abs(float(qty) - whole_qty) > 1e-9:
+            raise BrokerError(
+                f"equity stop replacement requires whole-share qty: {qty}"
+            )
+        if not order_id:
+            raise BrokerError("equity stop replacement requires an order id")
+        if stop_price <= 0:
+            raise BrokerError(
+                f"equity stop replacement requires positive stop price: {stop_price}"
+            )
+
+        client_order_id = f"{client_order_id_prefix}-{uuid.uuid4().hex[:10]}"
+        request = ReplaceOrderRequest(
+            qty=whole_qty,
+            time_in_force=TimeInForce.GTC,
+            stop_price=round(stop_price, 2),
+            client_order_id=client_order_id,
+        )
+        logger.warning(
+            f"replacing standalone equity stop {order_id}: sell {whole_qty} "
+            f"{symbol} @ ${stop_price:.2f} (client_id={client_order_id})"
+        )
+        order = self._with_retry(
+            lambda: self._api.replace_order_by_id(order_id, request),
+            op_desc=f"replace_equity_stop({order_id})",
+            retry_safe=False,
+        )
+        if self._stream_manager is not None:
+            self._stream_manager.unregister_stop_leg(order_id)
+        self._register_standalone_stop_leg(order)
+        self._lifecycle_orders_record_stop(
+            position_uid=position_uid,
+            role="replacement_stop",
+            client_order_id=client_order_id,
+            broker_order_id=str(order.id),
+            stop_price=float(stop_price),
+            qty=float(whole_qty),
+            parent_order_id=None,
+            order_class="simple",
+            replaces_order_id=order_id,
+        )
+        return self._to_open_order(order)
 
     def submit_option_gtc_stop(
         self,
@@ -3804,6 +4034,7 @@ class AlpacaBroker:
             stop_price=float(o.stop_price) if getattr(o, "stop_price", None) else None,
             client_order_id=getattr(o, "client_order_id", None),
             time_in_force=tif_val,
+            order_class=order_class_val,
         )
 
     @staticmethod
