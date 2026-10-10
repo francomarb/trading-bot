@@ -6644,16 +6644,6 @@ class TradingEngine:
                     "stop protection requires whole shares/contracts"
                 ),
             )
-        if qty_available is not None and qty_available + 1e-9 < residual_qty:
-            return _ResidualProtectionOutcome(
-                status="failed",
-                residual_qty=residual_qty,
-                note=(
-                    f"broker reports only {qty_available:g} of {residual_qty:g} "
-                    "available; a close-side order may still be working"
-                ),
-            )
-
         try:
             open_orders = list(self.broker.get_open_orders())
         except Exception as exc:
@@ -6667,6 +6657,20 @@ class TradingEngine:
             and order.side is Side.SELL
             and order.stop_price is not None
         ]
+        if (
+            qty_available is not None
+            and qty_available + 1e-9 < residual_qty
+            and not existing_stops
+        ):
+            return _ResidualProtectionOutcome(
+                status="failed",
+                residual_qty=residual_qty,
+                note=(
+                    f"broker reports only {qty_available:g} of {residual_qty:g} "
+                    "available with no protective stop explaining the "
+                    "reservation; another close-side order may still be working"
+                ),
+            )
         for existing in existing_stops:
             if not replace_existing and self._operator_stop_matches(
                 existing,

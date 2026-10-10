@@ -1089,7 +1089,10 @@ class TestEntryMaxPriceCap:
                 filled_avg_price=None,
             ),
         ]
-        api.get_open_position.return_value = SimpleNamespace(qty_available="10")
+        api.get_open_position.side_effect = [
+            SimpleNamespace(qty_available="0"),
+            SimpleNamespace(qty_available="10"),
+        ]
         broker = _broker_with_mock(api)
 
         result = broker.place_order(
@@ -1212,7 +1215,10 @@ class TestEntryMaxPriceCap:
             id="day-stop-1", status="canceled", filled_qty=0,
             filled_avg_price=None,
         )
-        api.get_open_position.return_value = SimpleNamespace(qty_available="10")
+        api.get_open_position.side_effect = [
+            SimpleNamespace(qty_available="0"),
+            SimpleNamespace(qty_available="10"),
+        ]
         broker = AlpacaBroker(
             client=api,
             max_attempts=1,
@@ -1651,11 +1657,15 @@ class TestClosePosition:
                 status="filled", filled_qty=10, filled_avg_price=101.0,
             ),
         ]
-        api.get_open_position.return_value = SimpleNamespace(qty_available="10")
+        api.get_open_position.side_effect = [
+            SimpleNamespace(qty_available="0"),
+            SimpleNamespace(qty_available="10"),
+        ]
         result = _broker_with_mock(api).close_position("AAPL", poll_timeout=0.0)
         assert result.status is OrderStatus.FILLED
         # Only the AAPL sibling was canceled, not the unrelated MSFT order.
         api.cancel_order_by_id.assert_called_once_with("aapl-stop")
+        assert api.get_open_position.call_count == 2
 
     def test_close_is_suppressed_when_sibling_stop_fills_during_cancel(self):
         api = MagicMock()
@@ -1681,6 +1691,7 @@ class TestClosePosition:
 
         assert result.status is OrderStatus.REJECTED
         api.close_position.assert_not_called()
+        api.get_open_position.assert_not_called()
 
     def test_close_does_not_cancel_same_symbol_buy_order(self):
         api = MagicMock()
@@ -1723,7 +1734,16 @@ class TestClosePosition:
             )
         ]
         broker = _broker_with_mock(api)
-        broker.cancel_order = MagicMock(return_value=False)
+        broker.cancel_order_and_confirm = MagicMock(return_value=OrderResult(
+            status=OrderStatus.TIMEOUT,
+            order_id="aapl-stop",
+            symbol="AAPL",
+            requested_qty=10.0,
+            filled_qty=0.0,
+            avg_fill_price=None,
+            raw_status="pending_cancel",
+            message="cancellation did not reach terminal state",
+        ))
 
         result = broker.close_position("AAPL", poll_timeout=0.0)
 
@@ -4326,17 +4346,41 @@ class TestDayStopRebuildSubstrate:
         assert api.submit_order.call_args_list[1].args[0].stop_price == 95.0
         assert result.stop_price == pytest.approx(95.0)
 
-    def test_ambiguous_target_submit_does_not_create_a_duplicate_fallback(self):
+    def test_ambiguous_target_submit_uses_idempotent_fallback(self):
         api = MagicMock()
-        api.submit_order.side_effect = RequestsTimeout("response lost")
+        api.submit_order.side_effect = [
+            RequestsTimeout("response lost"),
+            self._gtc_stop(id="fallback-stop", cli="target-client-id"),
+        ]
+        api.get_order_by_client_id.side_effect = _api_error(404, "not found")
         broker = self._broker(api, MagicMock())
 
-        with pytest.raises(BrokerError, match="fallback suppressed"):
-            broker.replace_protective_stop_with_standalone_gtc(
-                symbol="AAPL", stop_order_id="attached-stop", qty=10,
-                stop_price=90.0, fallback_stop_price=95.0,
-            )
+        result = broker.replace_protective_stop_with_standalone_gtc(
+            symbol="AAPL", stop_order_id="attached-stop", qty=10,
+            stop_price=90.0, fallback_stop_price=95.0,
+        )
 
+        assert result.order_id == "fallback-stop"
+        assert api.submit_order.call_count == 2
+        first = api.submit_order.call_args_list[0].args[0]
+        second = api.submit_order.call_args_list[1].args[0]
+        assert second.client_order_id == first.client_order_id
+        assert second.stop_price == 95.0
+
+    def test_ambiguous_target_submit_recovers_existing_stop_by_client_id(self):
+        api = MagicMock()
+        api.submit_order.side_effect = RequestsTimeout("response lost")
+        api.get_order_by_client_id.return_value = self._gtc_stop(
+            id="target-stop", cli="broker-returned-cli",
+        )
+        broker = self._broker(api, MagicMock())
+
+        result = broker.replace_protective_stop_with_standalone_gtc(
+            symbol="AAPL", stop_order_id="attached-stop", qty=10,
+            stop_price=90.0, fallback_stop_price=95.0,
+        )
+
+        assert result.order_id == "target-stop"
         api.submit_order.assert_called_once()
 
     def test_rebuild_does_not_submit_until_cancel_and_release_are_confirmed(self):
@@ -4352,7 +4396,10 @@ class TestDayStopRebuildSubstrate:
                 filled_avg_price=None,
             ),
         ]
-        api.get_open_position.return_value = SimpleNamespace(qty_available="10")
+        api.get_open_position.side_effect = [
+            SimpleNamespace(qty_available="0"),
+            SimpleNamespace(qty_available="10"),
+        ]
         api.submit_order.return_value = self._gtc_stop(
             id="replacement-stop", cli="replacement-cli",
         )
@@ -4376,6 +4423,7 @@ class TestDayStopRebuildSubstrate:
 
         assert result.order_id == "replacement-stop"
         assert api.get_order_by_id.call_count == 2
+        assert api.get_open_position.call_count == 2
         api.submit_order.assert_called_once()
 
     def test_rebuild_refuses_submit_when_stop_fills_during_cancel(self):

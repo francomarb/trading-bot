@@ -3280,6 +3280,7 @@ class AlpacaBroker:
         qty: int,
         stop_price: float,
         client_order_id_prefix: str = "repair-stop",
+        client_order_id: str | None = None,
         position_uid: str | None = None,
     ) -> OpenOrder:
         """
@@ -3294,7 +3295,9 @@ class AlpacaBroker:
         and the substrate write is skipped — the broker order still
         goes out.
         """
-        client_order_id = f"{client_order_id_prefix}-{uuid.uuid4().hex[:10]}"
+        client_order_id = client_order_id or (
+            f"{client_order_id_prefix}-{uuid.uuid4().hex[:10]}"
+        )
         order_request = StopOrderRequest(
             symbol=symbol,
             qty=qty,
@@ -3312,21 +3315,91 @@ class AlpacaBroker:
             op_desc=f"submit_repair_stop({symbol})",
             retry_safe=False,
         )
+        return self._adopt_protective_stop_order(
+            order=order,
+            position_uid=position_uid,
+            client_order_id=client_order_id,
+            stop_price=float(stop_price),
+            qty=float(qty),
+        )
+
+    def _adopt_protective_stop_order(
+        self,
+        *,
+        order,
+        position_uid: str | None,
+        client_order_id: str,
+        stop_price: float,
+        qty: float,
+    ) -> OpenOrder:
+        """Register a broker-confirmed standalone stop in local substrates."""
         self._register_standalone_stop_leg(order)
-        # P-4: record the substrate row AFTER the broker accepts the
-        # repair stop. POST-submit semantics — the stop is already
-        # live; any substrate failure is logged CRITICAL and absorbed
-        # by the helper.
+        # P-4: record the substrate row only after broker acceptance. The
+        # helper also covers a submit recovered by exact client_order_id.
         self._lifecycle_orders_record_protective_stop(
             position_uid=position_uid,
             client_order_id=client_order_id,
             broker_order_id=str(order.id),
-            stop_price=float(stop_price),
-            qty=float(qty),
+            stop_price=stop_price,
+            qty=qty,
             parent_order_id=None,
             order_class="simple",
         )
-        return self._to_open_order(order)
+        normalized = self._to_open_order(order)
+        if normalized is None:
+            raise BrokerError(
+                f"broker returned malformed protective stop {getattr(order, 'id', None)}"
+            )
+        return normalized
+
+    def _reconcile_protective_stop_submit(
+        self,
+        *,
+        client_order_id: str,
+        symbol: str,
+        qty: int,
+        stop_price: float,
+        position_uid: str | None,
+    ) -> tuple[bool, OpenOrder | None]:
+        """Resolve one ambiguous stop submit by its idempotency key.
+
+        Returns ``(found, order)``. ``found=False`` means Alpaca returned 404.
+        A found zero-fill terminal rejection/cancel returns ``(True, None)``;
+        a working stop is adopted. Any fill suppresses fallback submission.
+        """
+        try:
+            order = self._with_retry(
+                lambda: self._api.get_order_by_client_id(client_order_id),
+                op_desc=f"get_order_by_client_id({client_order_id})",
+            )
+        except APIError as exc:
+            if getattr(exc, "status_code", None) == 404:
+                return False, None
+            raise
+
+        status_value = getattr(order, "status", None)
+        raw_status = str(
+            status_value.value
+            if hasattr(status_value, "value")
+            else status_value or ""
+        ).lower()
+        filled_qty = float(getattr(order, "filled_qty", 0) or 0)
+        if filled_qty > 0 or raw_status in {"filled", "stopped"}:
+            raise BrokerError(
+                f"protective stop {client_order_id} filled while its submit "
+                "response was unclear; fallback suppressed"
+            )
+        if raw_status in {
+            "canceled", "cancelled", "expired", "rejected", "done_for_day",
+        }:
+            return True, None
+        return True, self._adopt_protective_stop_order(
+            order=order,
+            position_uid=position_uid,
+            client_order_id=client_order_id,
+            stop_price=float(getattr(order, "stop_price", None) or stop_price),
+            qty=float(qty),
+        )
 
     def replace_day_stop_with_standalone_gtc(
         self,
@@ -3405,12 +3478,16 @@ class AlpacaBroker:
             )
         if self._stream_manager is not None:
             self._stream_manager.unregister_stop_leg(stop_order_id)
+        target_client_order_id = (
+            f"{client_order_id_prefix}-{uuid.uuid4().hex[:10]}"
+        )
         try:
             return self.place_protective_stop(
                 symbol=symbol,
                 qty=whole_qty,
                 stop_price=stop_price,
                 client_order_id_prefix=client_order_id_prefix,
+                client_order_id=target_client_order_id,
                 position_uid=position_uid,
             )
         except (
@@ -3421,10 +3498,37 @@ class AlpacaBroker:
             TimeoutError,
         ) as primary_exc:
             if is_ambiguous_write_error(primary_exc):
-                raise BrokerError(
-                    f"replacement stop outcome is unknown ({primary_exc}); "
-                    "fallback suppressed to avoid duplicate protection"
-                ) from primary_exc
+                try:
+                    found, recovered = self._reconcile_protective_stop_submit(
+                        client_order_id=target_client_order_id,
+                        symbol=symbol,
+                        qty=whole_qty,
+                        stop_price=stop_price,
+                        position_uid=position_uid,
+                    )
+                except BrokerError:
+                    raise
+                except Exception as reconcile_exc:
+                    logger.warning(
+                        f"{symbol}: target stop submit was ambiguous and exact "
+                        f"client-id lookup failed: {reconcile_exc}"
+                    )
+                    found, recovered = False, None
+                if recovered is not None:
+                    logger.warning(
+                        f"{symbol}: recovered ambiguous target stop "
+                        f"{recovered.order_id} by client_order_id"
+                    )
+                    return recovered
+                # Reuse the same client id after a 404/unclear lookup. Alpaca's
+                # uniqueness constraint makes the fallback idempotent if the
+                # first request is merely delayed. A known terminal rejection
+                # gets a fresh id because the old one is already consumed.
+                fallback_client_order_id = (
+                    None if found else target_client_order_id
+                )
+            else:
+                fallback_client_order_id = None
             logger.critical(
                 f"{symbol}: replacement stop @ ${stop_price:.2f} failed after "
                 f"cancel; restoring prior protection @ ${fallback_stop_price:.2f}"
@@ -3435,9 +3539,36 @@ class AlpacaBroker:
                     qty=whole_qty,
                     stop_price=fallback_stop_price,
                     client_order_id_prefix=f"{client_order_id_prefix}-fallback",
+                    client_order_id=fallback_client_order_id,
                     position_uid=position_uid,
                 )
             except Exception as fallback_exc:
+                for candidate_client_id, candidate_stop in {
+                    target_client_order_id: stop_price,
+                    fallback_client_order_id: fallback_stop_price,
+                }.items():
+                    if candidate_client_id is None:
+                        continue
+                    try:
+                        _found, recovered = (
+                            self._reconcile_protective_stop_submit(
+                                client_order_id=candidate_client_id,
+                                symbol=symbol,
+                                qty=whole_qty,
+                                stop_price=candidate_stop,
+                                position_uid=position_uid,
+                            )
+                        )
+                    except BrokerError:
+                        raise
+                    except Exception:
+                        continue
+                    if recovered is not None:
+                        logger.warning(
+                            f"{symbol}: recovered protective stop "
+                            f"{recovered.order_id} after fallback response failed"
+                        )
+                        return recovered
                 raise BrokerError(
                     f"replacement stop failed ({primary_exc}); restoration also "
                     f"failed ({fallback_exc})"
