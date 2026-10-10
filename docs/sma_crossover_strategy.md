@@ -53,7 +53,7 @@ classifying the macro BEAR state from SPY. The 200 SMA is a *structural gate*;
 | Sleeve weight | 0.30 of deployable capital (target) | `settings.STRATEGY_ALLOCATIONS["sma_crossover"]["target_pct"]` |
 | ATR stop | `entry − 2.0 × ATR(14)` (static) | `settings.ATR_STOP_MULTIPLIER` |
 | Watchlist | 100 ranked v3 names plus lifecycle preservation | `config/settings.py` |
-| Stop time-in-force | GTC (DAY at submit → promoted to GTC) | `engine/trader.py` |
+| Stop time-in-force | GTC (attached DAY child → confirmed cancel/rebuild as standalone GTC) | `engine/trader.py` |
 | Fractional shares | Enabled when MARKET path active | `settings.FRACTIONAL_ENABLED` |
 
 ---

@@ -82,6 +82,16 @@ def _build_engine(
     # open_positions.get(symbol) returns a Position with broker_qty.
     engine.broker = MagicMock()
     engine.broker.cancel_order.return_value = True
+    engine.broker.cancel_order_and_confirm.return_value = OrderResult(
+        status=OrderStatus.CANCELED,
+        order_id="existing-stop",
+        symbol=symbol,
+        requested_qty=broker_qty,
+        filled_qty=0.0,
+        avg_fill_price=None,
+        raw_status="canceled",
+    )
+    engine.broker.wait_for_position_qty_available.return_value = True
     engine.broker.settle_close_order.side_effect = lambda result: replace(
         result, raw_status="canceled"
     )
@@ -1680,6 +1690,15 @@ class TestImmediateResidualProtection:
                 avg_entry_price=100.0, market_value=700.0,
             )
         }
+        engine.broker.get_open_orders.side_effect = [
+            [
+                SimpleNamespace(
+                    order_id="existing-stop", symbol="AAPL", side=Side.SELL,
+                    qty=10.0, stop_price=90.0, time_in_force="gtc",
+                )
+            ],
+            [],
+        ]
 
         uid = new_command_uid()
         queue.insert(
@@ -1694,6 +1713,42 @@ class TestImmediateResidualProtection:
         assert row.result["protection_status"] == "failed"
         assert "only 5 of 7 available" in row.result["protection_note"]
         engine.broker.place_protective_stop.assert_not_called()
+
+    def test_stale_stop_reservation_is_canceled_before_replacement(self, tmp_path):
+        engine, queue = _build_engine(tmp_path, broker_qty=10.0)
+        pos_uid = _seed_open_lifecycle(engine)
+        engine.broker.close_position.return_value = OrderResult(
+            status=OrderStatus.FILLED, order_id="reduce-filled", symbol="AAPL",
+            requested_qty=3.0, filled_qty=3.0,
+            avg_fill_price=108.0, raw_status="filled",
+        )
+        engine.broker.get_positions.return_value = {
+            "AAPL": Position(
+                symbol="AAPL", qty=7.0, qty_available=0.0,
+                avg_entry_price=100.0, market_value=700.0,
+            )
+        }
+
+        uid = new_command_uid()
+        queue.insert(
+            command_uid=uid, action="reduce-position", reason="test",
+            target_position_uid=pos_uid, params={"qty": 3},
+        )
+        engine._process_operator_commands()
+
+        row = queue.get_by_command_uid(uid)
+        assert row.status == "succeeded"
+        engine.broker.cancel_order_and_confirm.assert_called_once_with(
+            order_id="existing-stop", symbol="AAPL", requested_qty=10.0,
+        )
+        engine.broker.wait_for_position_qty_available.assert_called_once_with(
+            symbol="AAPL", required_qty=7.0,
+        )
+        engine.broker.place_protective_stop.assert_called_once_with(
+            symbol="AAPL", qty=7, stop_price=90.0,
+            client_order_id_prefix="operator-residual-stop",
+            position_uid=pos_uid,
+        )
 
     def test_fresh_empty_position_set_reports_flat_without_stop(self, tmp_path):
         engine, _queue = _build_engine(tmp_path, broker_qty=10.0)

@@ -178,6 +178,12 @@ ORDER_CONFIRM_TIMEOUT_SECONDS: float = float(
     os.getenv("ORDER_CONFIRM_TIMEOUT_SECONDS", "240")
 )
 
+# A successful DELETE only proves Alpaca accepted the cancellation request.
+# Dependent SELL orders must wait for terminal broker status and released qty.
+ORDER_CANCEL_CONFIRM_TIMEOUT_SECONDS: float = float(
+    os.getenv("ORDER_CANCEL_CONFIRM_TIMEOUT_SECONDS", "10")
+)
+
 # Broker order confirmation window — broker-resting STOP_LIMIT entries (PLAN 11.47).
 # Resting orders are EXPECTED to be unfilled at submit time (the stop arms only
 # when price trades through the trigger). Polling for 240s would stall the

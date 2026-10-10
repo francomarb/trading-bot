@@ -401,6 +401,10 @@ Eight independent layers are active when Donchian runs in production:
 > `entry_reference_price = fill`, which makes that offset collapse to
 > `fill − stop` and re-anchoring a no-op. Fails safe: any missing input
 > leaves the broker's existing stop untouched.
+> The attached child is canceled only through a broker-confirmed terminal
+> transition; the standalone GTC order is submitted after Alpaca reports the
+> position quantity released. Later repricing of that simple stop uses the
+> native replace endpoint and does not create a second cancellation gap.
 >
 > **Existing open positions were deliberately not touched** — the rebuild
 > branch fires only while the live stop is DAY, and an open position already

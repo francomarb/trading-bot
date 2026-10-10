@@ -8474,7 +8474,8 @@ class TestPostFillStopReAnchor:
         at its reference-derived price just because ownership is restored."""
         old_stop = replace(
             _open_stop_order("AAPL", 90.0),
-            order_id="attached-stop", qty=10, time_in_force="gtc",
+            order_id="standalone-stop", qty=10, time_in_force="gtc",
+            order_class="simple",
         )
         new_stop = replace(
             old_stop, order_id="fill-stop", stop_price=86.0,
@@ -8498,17 +8499,15 @@ class TestPostFillStopReAnchor:
                 intended_stop_price=90.0, avg_fill_price=96.0,
             )
         ]
-        broker.replace_protective_stop_with_standalone_gtc.return_value = new_stop
+        broker.replace_standalone_equity_stop.return_value = new_stop
         engine.trade_logger.rebase_entry_stop = MagicMock(return_value=True)
 
         engine._repair_missing_protective_stops(snapshot)
 
-        kwargs = (
-            broker.replace_protective_stop_with_standalone_gtc.call_args.kwargs
-        )
-        assert kwargs["stop_order_id"] == "attached-stop"
+        kwargs = broker.replace_standalone_equity_stop.call_args.kwargs
+        assert kwargs["order_id"] == "standalone-stop"
         assert kwargs["stop_price"] == pytest.approx(86.0)
-        assert kwargs["fallback_stop_price"] == pytest.approx(90.0)
+        broker.replace_protective_stop_with_standalone_gtc.assert_not_called()
         engine.trade_logger.rebase_entry_stop.assert_called_once_with(
             order_id="entry-order", new_stop_price=86.0,
         )
