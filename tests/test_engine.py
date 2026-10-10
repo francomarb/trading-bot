@@ -5612,7 +5612,9 @@ class TestAmbiguousAsyncOptionEntryResolution:
         from unittest.mock import patch
 
         engine, broker = engine_factory(entries=[False] * 59 + [True])
+        engine.alerts = MagicMock()
         slot = engine.slots[0]
+        slot.strategy.register_fill = MagicMock()
         slot.strategy.build_option_execution = (
             lambda *_args, **_kwargs: (self.OCC, 11.60, 34.80, 8.70)
         )
@@ -5720,6 +5722,65 @@ class TestAmbiguousAsyncOptionEntryResolution:
         assert row.status == "working"
         parent = engine.lifecycle_store.get_by_position_uid(row.position_uid)
         assert parent.status == "pending"
+
+    def test_recovered_fill_completes_option_effects_once(
+        self, engine_factory,
+    ):
+        """A pre-owned ambiguous option still receives its fill-time state."""
+        engine, broker, client_order_id = self._dispatch_ambiguous(
+            engine_factory
+        )
+        broker.get_order_by_client_id_for_sweep.return_value = SimpleNamespace(
+            id="alpaca-opt-filled-1",
+            status=SimpleNamespace(value="filled"),
+            filled_qty="3",
+            filled_avg_price="12.40",
+            updated_at="2026-10-10T14:31:00+00:00",
+            submitted_at="2026-10-10T14:29:30+00:00",
+            filled_at="2026-10-10T14:31:00+00:00",
+        )
+        snapshot = _snapshot(
+            positions={
+                self.OCC: Position(self.OCC, 3, 12.40, 3_720.0),
+            }
+        )
+
+        engine._sweep_null_order_id_attaches(
+            snapshot, reason="cycle", budget=5,
+        )
+
+        order_row = engine.lifecycle_orders_store.get_by_client_order_id(
+            client_order_id
+        )
+        trailing = engine.option_trailing_store.get_by_occ(self.OCC)
+        strategy = engine.slots[0].strategy
+        assert order_row.status == "filled"
+        assert engine._entry_prices[self.OCC] == pytest.approx(12.40)
+        assert trailing is not None
+        assert trailing.position_uid == order_row.position_uid
+        assert trailing.qty == pytest.approx(3.0)
+        assert trailing.entry_premium == pytest.approx(12.40)
+        assert trailing.hwm_premium == pytest.approx(12.40)
+        strategy.register_fill.assert_called_once_with(self.OCC, 12.40)
+        engine.alerts.trade_executed.assert_called_once()
+
+        # A duplicate delivery may refresh cumulative fill data, but must not
+        # create a second execution alert or a second logical entry.
+        engine._maybe_dispatch_substrate_entry_fill(
+            event=OrderEvent(
+                order_id="alpaca-opt-filled-1",
+                status="filled",
+                filled_qty=3.0,
+                avg_fill_price=12.45,
+                broker_updated_at="2026-10-10T14:31:01+00:00",
+            ),
+            snapshot=snapshot,
+        )
+        engine.alerts.trade_executed.assert_called_once()
+        assert strategy.register_fill.call_count == 2
+        refreshed = engine.option_trailing_store.get_by_occ(self.OCC)
+        assert refreshed.entry_premium == pytest.approx(12.45)
+        assert refreshed.hwm_premium == pytest.approx(12.45)
 
 
 class TestGenericSingleLegOptionTrailingStops:

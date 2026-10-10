@@ -441,12 +441,12 @@ earnings/IV persistence, or asynchronous order settlement is included.
 - **Yahoo metadata:** move earnings/IV refresh to shared durable prewarm only if
   the new phase/endpoint logs show it remains a material recurring delay. Preserve
   each strategy's current fail-open/fallback semantics in that separate design.
-- **Recovered option-fill completeness:** when an ambiguous single-leg option
-  entry later fills, route the recovered fill through the normal option-fill
-  effects so the execution alert, exact entry basis, and trailing-state seed are
-  populated. The current fallback still installs broker stop protection on the
-  next cycle, so this is accounting/observability completeness rather than an
-  unprotected-position defect.
+- **Recovered option-fill completeness — implemented:** an ambiguous
+  single-leg option entry that later reconciles as filled now uses the same
+  lifecycle-exact completion routine as a normal async fill. Exact basis,
+  trailing state, strategy anchoring, lifecycle counting, and the execution
+  alert are populated. The durable trailing row de-duplicates alerts and counts
+  while later cumulative fill events may refresh quantity and average basis.
 - **Cycle scheduling and evaluation order:** consider fixed-rate non-overlapping
   starts or owned-position-first processing only after start-lag and owned-position
   telemetry demonstrate a decision-relevant breach.

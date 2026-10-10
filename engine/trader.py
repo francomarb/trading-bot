@@ -621,6 +621,11 @@ class TradingEngine:
         except Exception as exc:
             logger.warning(f"option trailing store init skipped: {exc}")
             self.option_trailing_store = None
+        # Fallback de-duplication only.  The durable trailing row is the
+        # authoritative marker that a single-leg option fill's engine effects
+        # have run; this set preserves the same contract if that store is
+        # temporarily unavailable during one process lifetime.
+        self._completed_option_entry_fill_uids: set[str] = set()
         self.option_stop_audit_store = None
         self._option_stop_audit_last_pruned_at: datetime | None = None
         if self.config.option_stop_replace_audit_enabled:
@@ -3774,7 +3779,7 @@ class TradingEngine:
         position_uid: str | None = None,
         reason_suffix: str = "(recovered)",
         entry_order_id: str | None = None,
-    ) -> None:
+    ) -> bool:
         """Fire the engine-side side effects that happen when a
         bot-submitted entry is adopted on the recovery path.
 
@@ -3802,7 +3807,10 @@ class TradingEngine:
              have one attached (recovered entries lose their
              original stop_loss leg when confirmation fails before
              OTO completion).
-          4. Fire the trade_executed alert.
+          4. For a single-leg option, complete the same exact-basis,
+             trailing-state, strategy-anchor, counter, and alert effects as
+             the normal asynchronous option-fill path.
+          5. Fire the trade_executed alert for an equity entry.
 
         Trade-log writes (_record_fill / _log_entry) are NOT in
         this helper — they're called inline by each caller because
@@ -3811,13 +3819,19 @@ class TradingEngine:
         capture provenance differently. Keeping that distinction
         explicit at the call site.
 
-        Idempotent on items 1-2-3: register/cache/stop check
-        already-present state and no-op if so. NOT idempotent on
-        item 4 (alert) — callers must de-dup at their own layer
-        (the suspect path pops the cache; the substrate path uses
-        _has_position).
+        Option effects are idempotent by lifecycle UID through their durable
+        trailing-state row.  Equity alerts remain caller-de-duplicated.
         """
         symbol = decision.symbol
+        if owner_key_for(symbol) != symbol:
+            return self._apply_single_leg_option_entry_fill_effects(
+                decision=decision,
+                fill_price=fill_price,
+                fill_qty=fill_qty,
+                position_uid=position_uid,
+                alert_reason=f"{decision.reason} {reason_suffix}".strip(),
+            )
+            return
         self._register_single_leg(
             strategy_name=decision.strategy_name,
             symbol=symbol,
@@ -3843,6 +3857,164 @@ class TradingEngine:
                 position_uid or self._lookup_position_uid_for_owner(symbol)
             ),
         )
+        return True
+
+    def _apply_single_leg_option_entry_fill_effects(
+        self,
+        *,
+        decision: RiskDecision,
+        fill_price: float,
+        fill_qty: float,
+        position_uid: str | None,
+        alert_reason: str,
+    ) -> bool:
+        """Complete a confirmed single-leg option entry exactly once.
+
+        Async option ownership is deliberately registered before the LIMIT
+        order settles.  Ownership therefore cannot prove that the later fill
+        confirmation completed the entry-basis, trailing-state, strategy
+        anchor, counter, and alert work.  The durable trailing row for the
+        same lifecycle UID is that marker instead.
+
+        Repeated cumulative PARTIAL/FILLED events still refresh quantity and
+        average entry premium.  Existing stop identity and the premium HWM
+        are preserved, while the entry counter and execution alert fire only
+        for the first confirmation.
+        """
+        symbol = decision.symbol
+        underlying = owner_key_for(symbol)
+        if underlying == symbol or fill_price <= 0 or fill_qty <= 0:
+            return False
+
+        existing = None
+        if self.option_trailing_store is not None:
+            try:
+                existing = self.option_trailing_store.get_by_occ(symbol)
+            except Exception as exc:
+                logger.warning(
+                    f"[{decision.strategy_name}] option trailing state lookup "
+                    f"failed for {symbol}: {exc}"
+                )
+
+        same_lifecycle = bool(
+            position_uid
+            and existing is not None
+            and existing.position_uid == position_uid
+        )
+        first_confirmation = not (
+            same_lifecycle
+            or (
+                position_uid is not None
+                and position_uid in self._completed_option_entry_fill_uids
+            )
+        )
+        if (
+            existing is not None
+            and position_uid is not None
+            and existing.position_uid != position_uid
+        ):
+            logger.critical(
+                f"[{decision.strategy_name}] refusing option fill effects for "
+                f"{symbol}: trailing state belongs to lifecycle "
+                f"{existing.position_uid}, not {position_uid}"
+            )
+            return False
+
+        self._register_single_leg(
+            strategy_name=decision.strategy_name,
+            symbol=symbol,
+            position_id=position_uid,
+        )
+        self._entry_prices[symbol] = float(fill_price)
+        strategy = self._strategy_by_name(decision.strategy_name)
+
+        if self.option_trailing_store is not None and position_uid is not None:
+            try:
+                self.option_trailing_store.upsert(
+                    position_uid=position_uid,
+                    occ_symbol=symbol,
+                    strategy=decision.strategy_name,
+                    owner_key=underlying,
+                    qty=float(fill_qty),
+                    entry_premium=float(fill_price),
+                    hwm_premium=max(
+                        float(fill_price),
+                        float(existing.hwm_premium) if existing else float(fill_price),
+                    ),
+                    trail_activation_pct=(
+                        float(existing.trail_activation_pct)
+                        if existing
+                        else float(getattr(strategy, "trail_activation_pct", 0.10))
+                    ),
+                    trail_pct=(
+                        float(existing.trail_pct)
+                        if existing
+                        else float(getattr(strategy, "trail_pct", 0.15))
+                    ),
+                    current_stop_price=(
+                        existing.current_stop_price
+                        if existing
+                        else round(
+                            float(fill_price)
+                            * float(
+                                getattr(
+                                    getattr(strategy, "config", None),
+                                    "stop_loss_multiple",
+                                    0.75,
+                                )
+                            ),
+                            2,
+                        )
+                    ),
+                    alpaca_stop_order_id=(
+                        existing.alpaca_stop_order_id if existing else None
+                    ),
+                    stop_order_status=(
+                        existing.stop_order_status if existing else "pending_sync"
+                    ),
+                    last_observed_premium=(
+                        existing.last_observed_premium
+                        if existing and existing.last_observed_premium is not None
+                        else float(fill_price)
+                    ),
+                    lifecycle_order_id=(
+                        existing.lifecycle_order_id if existing else None
+                    ),
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"[{decision.strategy_name}] option trailing state seed "
+                    f"failed for {symbol}: {exc}"
+                )
+
+        register_fill = getattr(strategy, "register_fill", None)
+        if register_fill is not None:
+            try:
+                register_fill(symbol, float(fill_price))
+            except Exception as exc:
+                logger.warning(
+                    f"[{decision.strategy_name}] register_fill failed "
+                    f"for {symbol}: {exc}"
+                )
+
+        if position_uid is not None:
+            self._completed_option_entry_fill_uids.add(position_uid)
+        if not first_confirmation:
+            return False
+
+        lifecycle_counter = self._lifecycle_counter_for(decision.strategy_name)
+        if lifecycle_counter is not None:
+            lifecycle_counter.filled_entries += 1
+        self.alerts.trade_executed(
+            symbol=symbol,
+            strategy=decision.strategy_name,
+            side="buy",
+            qty=fill_qty,
+            price=fill_price,
+            reason=alert_reason,
+            position_uid=position_uid,
+        )
+        return True
 
     def _maybe_dispatch_substrate_entry_fill(
         self,
@@ -3856,10 +4028,10 @@ class TradingEngine:
 
         Called from _drain_lifecycle_events (stream) and
         _reconcile_substrate_via_rest (cycle / startup) after each
-        successful apply_order_event. De-dup guard: if
-        _has_position(symbol) is already true, the synchronous
-        path bound ownership at submit time and the side effects
-        already fired — skip.
+        successful apply_order_event. Equity side effects are de-duplicated
+        by ownership. Single-leg options are different: ownership is bound
+        before their async LIMIT settles, so their durable trailing row
+        de-duplicates the normal fill effects instead.
 
         Concretely this replaces the cache-driven path the legacy
         _suspect_orders cache provides: on the rare submit-succeeds-
@@ -3924,8 +4096,9 @@ class TradingEngine:
             # the first-partial slippage (e.g. row.avg_fill_price=
             # 150.50 alongside slippage computed against 150.40).
             ownership_already_bound = self._has_position(symbol)
+            is_single_leg_option = owner_key_for(symbol) != symbol
 
-            # ── Side effects (single-shot via ownership gate) ──
+            # ── Side effects ──
             #
             # Build the RiskDecision only when recovery actually needs
             # side effects. Policy and stop intent come from the substrate,
@@ -3935,7 +4108,7 @@ class TradingEngine:
             # The focused-UPDATE accounting block below doesn't need a
             # RiskDecision; it reads everything off `order_row` and
             # `event`.
-            if not ownership_already_bound:
+            if not ownership_already_bound or is_single_leg_option:
                 if snapshot is None:
                     logger.warning(
                         f"substrate entry-fill dispatch: skipped "
@@ -4084,7 +4257,7 @@ class TradingEngine:
                             ),
                             **recovered_extra_kwargs,
                         )
-                        self._apply_recovered_entry_side_effects(
+                        effects_applied = self._apply_recovered_entry_side_effects(
                             snapshot=snapshot,
                             position=position,
                             decision=recovered_decision,
@@ -4094,11 +4267,19 @@ class TradingEngine:
                             reason_suffix="(substrate)",
                             entry_order_id=event.order_id,
                         )
-                        logger.warning(
-                            f"substrate entry-fill dispatch: bound "
-                            f"ownership for {symbol} ({pos_row.strategy}) "
-                            f"via order_id={event.order_id}"
-                        )
+                        if effects_applied:
+                            logger.warning(
+                                f"substrate entry-fill dispatch: completed "
+                                f"recovered fill effects for {symbol} "
+                                f"({pos_row.strategy}) via "
+                                f"order_id={event.order_id}"
+                            )
+                        else:
+                            logger.debug(
+                                f"substrate entry-fill dispatch: fill effects "
+                                f"already complete for {symbol} via "
+                                f"order_id={event.order_id}"
+                            )
 
             # ── Accounting completeness (runs on every event) ──
             # The substrate's apply_order_event UPSERT writes the
@@ -11417,83 +11598,14 @@ class TradingEngine:
             )
             self._log_entry(decision, result, decision.entry_reference_price)
             if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
-                # PLAN 11.10f: lifecycle counter — filled_entries for
-                # the async options fill path. The submitted++ already
-                # happened in _process_symbol when broker.place_order
-                # returned ACCEPTED; this is the deferred fill confirm.
-                # Counter accumulator is reset each cycle but option
-                # fills land asynchronously across cycles — that's OK,
-                # they just land in whichever cycle's bucket they
-                # arrive in, accumulated into the same weekly row via
-                # upsert ON CONFLICT.
-                _lc = self._lifecycle_counter_for(decision.strategy_name)
-                if _lc is not None:
-                    _lc.filled_entries += 1
-                # Update the exact contract's entry basis. The logical Position
-                # was pre-registered under this lifecycle UID at dispatch.
-                underlying = owner_key_for(decision.symbol)
-                if underlying != decision.symbol and avg_fill_price:
-                    self._register_single_leg(
-                        strategy_name=decision.strategy_name,
-                        symbol=decision.symbol,
-                        position_id=position_uid,
-                    )
-                    self._entry_prices[decision.symbol] = avg_fill_price
-                    strategy = self._strategy_by_name(decision.strategy_name)
-                    if self.option_trailing_store is not None:
-                        try:
-                            self.option_trailing_store.upsert(
-                                position_uid=position_uid,
-                                occ_symbol=decision.symbol,
-                                strategy=decision.strategy_name,
-                                owner_key=underlying,
-                                qty=float(filled_qty or decision.qty),
-                                entry_premium=float(avg_fill_price),
-                                hwm_premium=float(avg_fill_price),
-                                trail_activation_pct=float(
-                                    getattr(strategy, "trail_activation_pct", 0.10)
-                                ),
-                                trail_pct=float(getattr(strategy, "trail_pct", 0.15)),
-                                current_stop_price=round(
-                                    float(avg_fill_price)
-                                    * float(
-                                        getattr(
-                                            getattr(strategy, "config", None),
-                                            "stop_loss_multiple",
-                                            0.75,
-                                        )
-                                    ),
-                                    2,
-                                ),
-                                stop_order_status="pending_sync",
-                                last_observed_premium=float(avg_fill_price),
-                            )
-                        except Exception as e:
-                            logger.warning(
-                                f"[{decision.strategy_name}] option trailing "
-                                f"state seed failed for {decision.symbol}: {e}"
-                            )
-                    # A3: anchor the strategy's trailing-stop base to the
-                    # confirmed fill premium so the activation threshold is
-                    # measured against actual cost basis, not the first
-                    # Black-Scholes valuation. Opt-in via register_fill so
-                    # strategies without trailing logic are unaffected.
-                    register_fill = getattr(strategy, "register_fill", None)
-                    if register_fill is not None and avg_fill_price:
-                        try:
-                            register_fill(decision.symbol, float(avg_fill_price))
-                        except Exception as e:
-                            logger.warning(
-                                f"[{decision.strategy_name}] register_fill failed "
-                                f"for {decision.symbol}: {e}"
-                            )
-                self.alerts.trade_executed(
-                    symbol=decision.symbol,
-                    strategy=decision.strategy_name,
-                    side="buy",
-                    qty=filled_qty,
-                    price=avg_fill_price or decision.entry_reference_price,
-                    reason=f"{decision.strategy_name} options entry",
+                self._apply_single_leg_option_entry_fill_effects(
+                    decision=decision,
+                    fill_price=float(
+                        avg_fill_price or decision.entry_reference_price
+                    ),
+                    fill_qty=float(filled_qty or decision.qty),
+                    position_uid=position_uid,
+                    alert_reason=f"{decision.strategy_name} options entry",
                 )
             else:
                 # Order was canceled/rejected — remove pre-registered ownership
