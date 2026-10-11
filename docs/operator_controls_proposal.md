@@ -821,6 +821,8 @@ For **Operator Controls Phase C** this means:
 
 These subsystems read `position_uid` for clarity but don't drive lifecycle state. Each can adopt independently when next revised; the original "let it spread organically" recommendation still applies here:
 
+- **Dashboard open positions.** Shipped: equity and single-leg option rows show the full lifecycle ID from a read-only query of the durable lifecycle store. The join uses the exact owner key and confirms the strategy; ambiguous or legacy rows display no ID rather than a guessed one. This is display-only. The dashboard remains unsecured and exposes no operator command actions.
+
 - **Strategy Health & Edge Monitor.** Lifecycle ID makes "trade count" unambiguous and removes the partial-exit accounting concern raised in §10. Per-lifecycle realized R becomes a direct query rather than a symbol+time-window heuristic.
 - **Sleeve allocator.** Reserve/release keyed by `(strategy, position_uid)` makes reopened symbols within the same strategy provably distinct from positions that were never closed.
 - **PnL and R-multiple reporting.** Per-lifecycle final R, win/loss attribution, and reopened-symbol distinction all become single-query operations.

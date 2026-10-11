@@ -16,6 +16,7 @@ from dashboard import (
     _days_in_phase_label,
     _phase_since_label,
     _streak_label,
+    attach_open_position_lifecycle_ids,
     broker_position_detail,
     compute_equity_curve,
     filter_realized_curve_window,
@@ -27,6 +28,7 @@ from dashboard import (
     format_local_timestamp,
     format_delta_currency,
     load_engine_state,
+    load_open_lifecycle_identities,
     load_trades,
     merge_display_positions_detail,
     multi_leg_display_rows,
@@ -88,6 +90,103 @@ class TestLoadTrades:
         assert isinstance(df, pd.DataFrame)
         assert df.empty
 
+
+class TestOpenLifecycleIdentities:
+    @staticmethod
+    def _make_lifecycle_table(path: Path) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(path))
+        conn.execute(
+            """
+            CREATE TABLE position_lifecycle (
+                owner_key TEXT,
+                position_uid TEXT,
+                strategy TEXT,
+                position_type TEXT,
+                status TEXT,
+                created_at TEXT
+            )
+            """
+        )
+        return conn
+
+    def test_loads_active_single_leg_claims_read_only(self, tmp_path):
+        db = tmp_path / "trades.db"
+        conn = self._make_lifecycle_table(db)
+        conn.executemany(
+            "INSERT INTO position_lifecycle VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                ("AAPL", "pos_equity", "sma_crossover", "single_leg", "open", _ts(0)),
+                (
+                    "SPY260618C00746000",
+                    "pos_option",
+                    "spy_options_reversion",
+                    "single_leg",
+                    "partially_filled",
+                    _ts(1),
+                ),
+                ("closed", "pos_closed", "sma_crossover", "single_leg", "closed", _ts(2)),
+                ("spread-1", "pos_spread", "credit_spread", "spread", "open", _ts(3)),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        identities = load_open_lifecycle_identities(str(db))
+
+        assert identities == {
+            "AAPL": {"position_uid": "pos_equity", "strategy": "sma_crossover"},
+            "SPY260618C00746000": {
+                "position_uid": "pos_option",
+                "strategy": "spy_options_reversion",
+            },
+        }
+
+    def test_omits_ambiguous_active_claim(self, tmp_path):
+        db = tmp_path / "trades.db"
+        conn = self._make_lifecycle_table(db)
+        conn.executemany(
+            "INSERT INTO position_lifecycle VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                ("AAPL", "pos_one", "sma_crossover", "single_leg", "open", _ts(0)),
+                ("AAPL", "pos_two", "rsi_reversion", "single_leg", "error", _ts(1)),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        assert load_open_lifecycle_identities(str(db)) == {}
+
+    def test_missing_lifecycle_table_is_non_fatal(self, tmp_path):
+        db = tmp_path / "trades.db"
+        sqlite3.connect(str(db)).close()
+
+        assert load_open_lifecycle_identities(str(db)) == {}
+
+    def test_attach_requires_exact_owner_and_strategy(self):
+        detail = {
+            "AAPL": {"qty": 2.0},
+            "SPY260618C00746000": {"qty": 1.0},
+        }
+        owners = {
+            "AAPL": "sma_crossover",
+            "SPY260618C00746000": "spy_options_reversion",
+        }
+        identities = {
+            "AAPL": {"position_uid": "pos_aapl", "strategy": "sma_crossover"},
+            "SPY260618C00746000": {
+                "position_uid": "pos_wrong",
+                "strategy": "another_strategy",
+            },
+        }
+
+        enriched = attach_open_position_lifecycle_ids(detail, owners, identities)
+
+        assert enriched["AAPL"]["position_uid"] == "pos_aapl"
+        assert "position_uid" not in enriched["SPY260618C00746000"]
+        assert "position_uid" not in detail["AAPL"]
+
+
+class TestLoadTradesAdditional:
     def test_empty_frame_advertises_unified_slippage_columns(self, tmp_path):
         """Phase 2 slippage unification — empty-frame placeholder must
         include the new taxonomy columns so dashboard sections that
