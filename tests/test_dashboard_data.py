@@ -7,6 +7,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pandas as pd
 import pytest
@@ -116,30 +117,36 @@ class TestOpenLifecycleIdentities:
             "INSERT INTO position_lifecycle VALUES (?, ?, ?, ?, ?, ?)",
             [
                 ("AAPL", "pos_equity", "sma_crossover", "single_leg", "open", _ts(0)),
+                ("MSFT", "pos_pending", "rsi_reversion", "single_leg", "pending", _ts(1)),
                 (
                     "SPY260618C00746000",
                     "pos_option",
                     "spy_options_reversion",
                     "single_leg",
                     "partially_filled",
-                    _ts(1),
+                    _ts(2),
                 ),
-                ("closed", "pos_closed", "sma_crossover", "single_leg", "closed", _ts(2)),
-                ("spread-1", "pos_spread", "credit_spread", "spread", "open", _ts(3)),
+                ("closed", "pos_closed", "sma_crossover", "single_leg", "closed", _ts(3)),
+                ("spread-1", "pos_spread", "credit_spread", "spread", "open", _ts(4)),
             ],
         )
         conn.commit()
         conn.close()
 
-        identities = load_open_lifecycle_identities(str(db))
+        with patch("dashboard.sqlite3.connect", wraps=sqlite3.connect) as connect:
+            identities = load_open_lifecycle_identities(str(db))
 
         assert identities == {
             "AAPL": {"position_uid": "pos_equity", "strategy": "sma_crossover"},
+            "MSFT": {"position_uid": "pos_pending", "strategy": "rsi_reversion"},
             "SPY260618C00746000": {
                 "position_uid": "pos_option",
                 "strategy": "spy_options_reversion",
             },
         }
+        connection_uri = connect.call_args.args[0]
+        assert connection_uri.endswith("?mode=ro")
+        assert connect.call_args.kwargs["uri"] is True
 
     def test_omits_ambiguous_active_claim(self, tmp_path):
         db = tmp_path / "trades.db"

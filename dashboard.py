@@ -32,11 +32,12 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from config import settings
+from engine.lifecycle_orders import OWNER_KEY_LOCK_STATUSES
+from engine.positions import build_credit_spread_snapshot
 from reporting.logger import (
     STOP_GAP_KINDS,
     is_execution_quality_measurement,
 )
-from engine.positions import build_credit_spread_snapshot
 from monitors.leveraged_trend import (
     Phase,
     TrendMonitorState,
@@ -191,15 +192,19 @@ def load_open_lifecycle_identities(db_path: str) -> dict[str, dict[str, str]]:
     try:
         uri = f"{path.resolve().as_uri()}?mode=ro"
         with sqlite3.connect(uri, uri=True) as conn:
+            status_placeholders = ", ".join(
+                "?" for _ in OWNER_KEY_LOCK_STATUSES
+            )
             rows = conn.execute(
-                """
+                f"""
                 SELECT owner_key, position_uid, strategy
                 FROM position_lifecycle
                 WHERE position_type = 'single_leg'
-                  AND status IN ('pending', 'open', 'partially_filled', 'error')
+                  AND status IN ({status_placeholders})
                   AND owner_key IS NOT NULL
                 ORDER BY created_at ASC
-                """
+                """,
+                OWNER_KEY_LOCK_STATUSES,
             ).fetchall()
     except (OSError, sqlite3.Error):
         return {}
