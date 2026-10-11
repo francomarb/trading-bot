@@ -32,11 +32,12 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from config import settings
+from engine.lifecycle_orders import OWNER_KEY_LOCK_STATUSES
+from engine.positions import build_credit_spread_snapshot
 from reporting.logger import (
     STOP_GAP_KINDS,
     is_execution_quality_measurement,
 )
-from engine.positions import build_credit_spread_snapshot
 from monitors.leveraged_trend import (
     Phase,
     TrendMonitorState,
@@ -175,6 +176,68 @@ def load_trades(db_path: str) -> pd.DataFrame:
         return df
     except Exception as exc:
         return _empty(f"Failed to load trades DB '{db_path}': {type(exc).__name__}: {exc}")
+
+
+def load_open_lifecycle_identities(db_path: str) -> dict[str, dict[str, str]]:
+    """Return unambiguous durable identities for active single-leg owners.
+
+    The dashboard opens SQLite explicitly in read-only mode. Duplicate active
+    claims should be prevented by the lifecycle schema; if a damaged database
+    contains them, omit that owner rather than displaying a guessed identity.
+    """
+    path = Path(db_path)
+    if not path.exists():
+        return {}
+
+    try:
+        uri = f"{path.resolve().as_uri()}?mode=ro"
+        with sqlite3.connect(uri, uri=True) as conn:
+            status_placeholders = ", ".join(
+                "?" for _ in OWNER_KEY_LOCK_STATUSES
+            )
+            rows = conn.execute(
+                f"""
+                SELECT owner_key, position_uid, strategy
+                FROM position_lifecycle
+                WHERE position_type = 'single_leg'
+                  AND status IN ({status_placeholders})
+                  AND owner_key IS NOT NULL
+                ORDER BY created_at ASC
+                """,
+                OWNER_KEY_LOCK_STATUSES,
+            ).fetchall()
+    except (OSError, sqlite3.Error):
+        return {}
+
+    by_owner: dict[str, list[tuple[str, str]]] = {}
+    for owner_key, position_uid, strategy in rows:
+        if not owner_key or not position_uid or not strategy:
+            continue
+        by_owner.setdefault(str(owner_key), []).append(
+            (str(position_uid), str(strategy))
+        )
+
+    return {
+        owner_key: {"position_uid": claims[0][0], "strategy": claims[0][1]}
+        for owner_key, claims in by_owner.items()
+        if len(claims) == 1
+    }
+
+
+def attach_open_position_lifecycle_ids(
+    positions_detail: dict[str, dict[str, Any]],
+    open_positions: dict[str, str],
+    lifecycle_identities: dict[str, dict[str, str]],
+) -> dict[str, dict[str, Any]]:
+    """Attach exact, strategy-matched lifecycle IDs to display-only rows."""
+    enriched = {symbol: dict(detail) for symbol, detail in positions_detail.items()}
+    for symbol, strategy in open_positions.items():
+        identity = lifecycle_identities.get(symbol)
+        if identity is None or identity.get("strategy") != strategy:
+            continue
+        detail = enriched.setdefault(symbol, {})
+        detail["position_uid"] = identity.get("position_uid")
+    return enriched
 
 
 def _realized_pnl_events(
@@ -1796,6 +1859,7 @@ def render_dashboard() -> None:
     live_trading = state.get("live_trading", settings.LIVE_TRADING)
     db_path = settings.TRADE_LOG_DB_LIVE if live_trading else settings.TRADE_LOG_DB_PAPER
     trades_df = load_trades(db_path)
+    lifecycle_identities = load_open_lifecycle_identities(db_path)
     trades_load_error = trades_df.attrs.get("load_error")
 
     if trades_load_error:
@@ -1827,6 +1891,11 @@ def render_dashboard() -> None:
             state,
             broker_positions_detail,
         )
+    display_state["positions_detail"] = attach_open_position_lifecycle_ids(
+        display_state.get("positions_detail") or {},
+        display_state.get("open_positions") or {},
+        lifecycle_identities,
+    )
     display_state["multi_leg_positions"] = refresh_multi_leg_positions(
         state,
         broker_positions_detail=broker_positions_detail,
@@ -2123,6 +2192,7 @@ def render_dashboard() -> None:
                 pos_data.append({
                     "Symbol": symbol_url(sym),
                     "Strategy": strat,
+                    "Lifecycle ID": detail.get("position_uid") or "—",
                     "Qty": qty,
                     "Entry": entry,
                     "Cost Basis": cost_basis,
@@ -2144,6 +2214,13 @@ def render_dashboard() -> None:
                         "Symbol": st.column_config.LinkColumn(
                             "Symbol",
                             display_text=r"https://finance\.yahoo\.com/quote/([^/]+)/",
+                        ),
+                        "Lifecycle ID": st.column_config.TextColumn(
+                            "Lifecycle ID",
+                            help=(
+                                "Durable read-only position identity used by "
+                                "the operator CLI."
+                            ),
                         ),
                         "Qty": st.column_config.NumberColumn(format="%.2f"),
                         "Entry": st.column_config.NumberColumn(format="$%.2f"),

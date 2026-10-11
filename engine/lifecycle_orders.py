@@ -47,6 +47,17 @@ from utils.option_symbols import is_occ_option
 LIFECYCLE_ORDERS_SCHEMA_VERSION = 1
 
 
+# Statuses that retain the durable owner-key lock. This public tuple is the
+# shared contract for the partial unique index, migration preflight, and
+# read-only consumers that need to identify current ownership claims.
+OWNER_KEY_LOCK_STATUSES: tuple[str, ...] = (
+    "pending",
+    "open",
+    "partially_filled",
+    "error",
+)
+
+
 # ── DDL ──
 
 _CREATE_POSITION_LIFECYCLE_ORDERS_SQL = """
@@ -293,10 +304,13 @@ _IDX_LIFECYCLE_ORDERS_REPLACES_SQL = (
 # have UUID owner_keys (always unique), while equities use their ticker and
 # single-leg options use the exact OCC contract. Distinct contracts on one
 # underlying may coexist; the same broker-aggregated instrument may not.
+_OWNER_KEY_LOCK_STATUSES_SQL = ", ".join(
+    f"'{status}'" for status in OWNER_KEY_LOCK_STATUSES
+)
 _UNIQ_ONE_ACTIVE_POSITION_PER_OWNER_KEY_SQL = (
     "CREATE UNIQUE INDEX IF NOT EXISTS uniq_one_active_position_per_owner_key "
     "ON position_lifecycle(owner_key) "
-    "WHERE status IN ('pending', 'open', 'partially_filled', 'error')"
+    f"WHERE status IN ({_OWNER_KEY_LOCK_STATUSES_SQL})"
 )
 
 # trades dedup key per discovery doc §6.5 (R5-C1 + R5-C2 fixes):
@@ -383,20 +397,6 @@ ENTRY_SIDE_ROLES = frozenset({"entry_primary", "entry_residual"})
 
 
 # ── Migration preflight (discovery doc §12.2) ──
-
-
-# Status set used by the position-level uniq_one_active_position_per_owner_key
-# index. Preflight detection must mirror this set EXACTLY — if the
-# preflight check uses a different status filter than the index's
-# WHERE clause, duplicates that the index would reject can slip
-# through preflight and break CREATE UNIQUE INDEX at runtime
-# (PR #59 review-9 P1c).
-_OWNER_KEY_LOCK_STATUSES: tuple[str, ...] = (
-    "pending",
-    "open",
-    "partially_filled",
-    "error",
-)
 
 
 @dataclass(frozen=True)
@@ -523,7 +523,7 @@ def detect_owner_key_duplicates(
     if has_table is None:
         return ()
 
-    status_placeholders = ", ".join("?" for _ in _OWNER_KEY_LOCK_STATUSES)
+    status_placeholders = ", ".join("?" for _ in OWNER_KEY_LOCK_STATUSES)
     rows = conn.execute(
         f"""
         SELECT owner_key, COUNT(*) AS n,
@@ -534,7 +534,7 @@ def detect_owner_key_duplicates(
         HAVING COUNT(*) > 1
         ORDER BY owner_key
         """,
-        _OWNER_KEY_LOCK_STATUSES,
+        OWNER_KEY_LOCK_STATUSES,
     ).fetchall()
     duplicates: list[OwnerKeyDuplicate] = []
     for owner_key, count, uids_csv in rows:
