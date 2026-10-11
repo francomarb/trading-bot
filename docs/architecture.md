@@ -45,7 +45,7 @@ Watchlist → raw strategy signal → edge filter (+ sector momentum/IV) → reg
 - **Defined-risk spread path** sizes from max loss and sleeve capacity, then dispatches atomic MLEG orders
 - **Execution** only places orders after all upstream gates pass
 
-For single-leg options, the execution path diverges after the risk manager: the broker detects the OCC symbol and dispatches an `OptionsExecutionWorker` thread for the async DAY limit entry. After a fill, the engine seeds durable trailing state and synchronizes the protective stop; profit and defensive exits remain engine-managed. Multi-leg options strategies such as credit spreads bypass `RiskManager.evaluate` after the sleeve check because max loss is defined by the spread; they route through the MLEG combo path and `SpreadExecutionWorker`.
+For single-leg options, the execution path diverges after the risk manager: the broker detects the OCC symbol and dispatches an `OptionsExecutionWorker` thread for the async DAY limit entry. After a fill, the engine seeds durable trailing state and synchronizes the protective stop; profit and defensive exits remain engine-managed. If an ambiguous submission is confirmed later by lifecycle reconciliation, it uses the same fill-completion routine. The lifecycle-specific trailing row makes execution alerts and lifecycle counts idempotent while cumulative quantity and average entry basis can still refresh. Multi-leg options strategies such as credit spreads bypass `RiskManager.evaluate` after the sleeve check because max loss is defined by the spread; they route through the MLEG combo path and `SpreadExecutionWorker`.
 
 Single-leg equity lifecycle policy is explicit and durable. Traditional
 strategies use `STOP_DISTANCE + BROKER_STOP`; intentionally stopless trend
