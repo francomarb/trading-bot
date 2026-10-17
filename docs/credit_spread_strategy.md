@@ -123,6 +123,10 @@ lookup. The allocator routes them through a single shared sleeve.
 ### Operational status
 
 - Paper-trading on SPY + QQQ since PLAN 11.29 landed.
+- MLEG close accounting is receipt-driven: broker/lifecycle terminality records
+  order state, while an atomic two-leg trade-log write proves P&L and ownership
+  side effects completed. Recovered fills run before generic external-close
+  fallback and can rebuild entry economics after both broker legs have vanished.
 - Allocated 10% of equity in the isolated-options pool (shared sleeve).
 - Health monitor floor: 25 trades for `CONCLUSIVE` verdict; the sleeve
   takes a while to accumulate that many trades — and **slower still under
