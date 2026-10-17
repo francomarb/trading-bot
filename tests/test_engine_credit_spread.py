@@ -2375,6 +2375,93 @@ class TestSpreadCloseSubstrate:
         assert non_terminal[0].role == "partial_close"
         assert non_terminal[0].status == "pending"
 
+    def test_terminal_substrate_without_trade_receipt_still_accounts_close(
+        self, tmp_path,
+    ):
+        """QQQ regression: stream terminality must not suppress accounting."""
+        from engine.positions import spread_substrate_uid
+
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        self._setup_open_spread(engine, strategy, "p-qqq")
+        strategy.release_spread("p-qqq")
+        strategy.register_spread(_open_spread("p-qqq", net_credit=1.98))
+        engine.lifecycle_orders_store.insert_pending(
+            position_uid=spread_substrate_uid("p-qqq"),
+            role="exit",
+            client_order_id="close-qqq",
+            order_type="limit",
+            order_class="mleg",
+            time_in_force="day",
+            side="buy",
+            intended_qty=1.0,
+            intended_limit_price=4.41,
+        )
+        engine.lifecycle_orders_store.mark_terminal_after_dispatch(
+            client_order_id="close-qqq",
+            broker_order_id="qqq-close-order",
+            status="filled",
+            filled_qty=1.0,
+            avg_fill_price=4.41,
+        )
+        broker.drain_spread_fills.return_value = [
+            (
+                "p-qqq", "credit_spread", True, "filled", 1.0,
+                4.41, "qqq-close-order", 4.41,
+            ),
+        ]
+
+        engine._drain_spread_fills()
+
+        assert "p-qqq" not in engine._positions
+        rows = [
+            row for row in engine.trade_logger.read_all()
+            if row["order_id"] == "qqq-close-order"
+        ]
+        assert len(rows) == 2
+        economic_row = next(row for row in rows if row["side"] == "buy")
+        assert economic_row["avg_fill_price"] == pytest.approx(4.41)
+        assert economic_row["realized_pnl"] == pytest.approx(-243.0)
+        assert engine.trade_logger.has_recorded_spread_fill(
+            order_id="qqq-close-order",
+            position_id="p-qqq",
+        )
+
+    def test_recovered_close_uses_persisted_entry_when_runtime_is_gone(
+        self, tmp_path,
+    ):
+        """A restart can recover exact accounting after broker legs vanish."""
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        engine.trade_logger.log_spread_fill(
+            position_id="p-restart",
+            strategy="credit_spread",
+            short_occ="SPY260618P00568000",
+            long_occ="SPY260618P00558000",
+            qty=1.0,
+            net_price=1.98,
+            order_id="entry-order",
+            opening=True,
+        )
+        broker.drain_spread_fills.return_value = [
+            (
+                "p-restart", "credit_spread", True, "filled", 1.0,
+                4.41, "close-order", 4.41,
+            ),
+        ]
+
+        engine._drain_spread_fills()
+
+        rows = [
+            row for row in engine.trade_logger.read_all()
+            if row["order_id"] == "close-order"
+        ]
+        assert len(rows) == 2
+        economic_row = next(row for row in rows if row["side"] == "buy")
+        assert economic_row["symbol"] == "SPY260618P00568000"
+        assert economic_row["realized_pnl"] == pytest.approx(-243.0)
+        assert economic_row["status"] == "filled"
+
     def test_close_drain_canceled_finalizes_substrate_row_as_canceled(
         self, tmp_path
     ):
@@ -2475,7 +2562,7 @@ class TestSpreadCloseReconciler:
 
     def test_cycle_reconciler_advances_terminal_close_row(self, tmp_path):
         """Broker shows the close order is filled; substrate row gets
-        advanced from pending → filled."""
+        advanced from pending → filled and accounting is queued."""
         from engine.positions import spread_substrate_uid
         engine, broker, _ = self._setup_with_pending_close_row(tmp_path)
         # Broker open_orders does NOT contain our order (it's terminal).
@@ -2495,6 +2582,16 @@ class TestSpreadCloseReconciler:
         assert row.status == "filled"
         assert row.filled_qty == 1.0
         assert row.avg_fill_price == pytest.approx(0.60)
+        broker.queue_recovered_spread_outcome.assert_called_once_with(
+            position_id="p1",
+            strategy_name="credit_spread",
+            closing=True,
+            status="filled",
+            filled_qty=1.0,
+            avg_fill_price=0.60,
+            order_id="b-1",
+            submitted_limit_price=None,
+        )
 
     def test_recovered_unknown_close_is_queued_for_normal_accounting(
         self, tmp_path,

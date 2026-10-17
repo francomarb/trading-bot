@@ -2178,7 +2178,9 @@ class TradeLogger:
         # realized_pnl, initial_risk_dollars, and r_multiple ride the short-leg
         # row alongside the net economics; the long-leg row has no individual
         # fill or reference price in Alpaca's combo result, so both are NULL.
-        self.log(_leg_record(
+        # Insert both legs in one transaction.  The pair is the durable MLEG
+        # accounting receipt used to deduplicate worker/stream/REST replays.
+        short_record = _leg_record(
             short_occ,
             short_side,
             float(net_price) if float(net_price) > 0 else None,
@@ -2191,10 +2193,10 @@ class TradeLogger:
             new_benchmark_price=short_new_benchmark_price,
             new_signed_bps=short_new_signed_bps,
             new_adverse_bps=short_new_adverse_bps,
-        ))
+        )
         # Long leg is structural — new columns write NULL/'unavailable'.
         # Legacy columns also NULL (Phase 1 dual-write removed).
-        self.log(_leg_record(
+        long_record = _leg_record(
             long_occ,
             long_side,
             None,
@@ -2207,11 +2209,76 @@ class TradeLogger:
             new_benchmark_price=None,
             new_signed_bps=None,
             new_adverse_bps=None,
-        ))
+        )
+        conn = self._ensure_db()
+        records = (short_record, long_record)
+        columns = ", ".join(TRADE_COLUMNS)
+        placeholders = ", ".join(["?"] * len(TRADE_COLUMNS))
+        try:
+            conn.executemany(
+                f"INSERT INTO trades ({columns}) VALUES ({placeholders})",
+                [list(record.as_dict().values()) for record in records],
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         logger.info(
             f"spread {'entry' if opening else 'exit'} logged: {short_occ}/{long_occ} "
             f"qty={qty} net=${net_price:.2f}/sh [{strategy}] position_id={position_id[:8]}"
         )
+
+    def read_spread_entry_context(self, *, position_id: str) -> dict | None:
+        """Return the persisted opening economics for one spread lifecycle.
+
+        This intentionally ignores whether broker legs are still open.  Close
+        reconciliation may run after both legs disappeared, when runtime
+        ownership cannot be reconstructed but the original entry rows remain
+        authoritative for symbols, quantity, credit, and strategy attribution.
+        """
+        if not os.path.exists(self._path):
+            return None
+        try:
+            conn = self._ensure_db()
+        except sqlite3.Error:
+            return None
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT strategy, symbol, side, qty, avg_fill_price, "
+            "exit_timestamp, status "
+            "FROM trades WHERE position_type = 'spread' "
+            "AND position_id = ? AND status IN ('filled', 'partial') "
+            "ORDER BY id",
+            (position_id,),
+        ).fetchall()
+        opening_rows = [row for row in rows if row["exit_timestamp"] is None]
+        short_row = next(
+            (row for row in opening_rows if row["side"] == "sell"), None
+        )
+        long_row = next(
+            (row for row in opening_rows if row["side"] == "buy"), None
+        )
+        if short_row is None or long_row is None:
+            return None
+        net_credit = float(short_row["avg_fill_price"] or 0.0)
+        opened_qty = float(short_row["qty"] or 0.0)
+        partial_close_qty = sum(
+            float(row["qty"] or 0.0)
+            for row in rows
+            if row["exit_timestamp"] is not None
+            and row["status"] == "partial"
+            and row["side"] == "buy"
+        )
+        qty = opened_qty - partial_close_qty
+        if net_credit <= 0.0 or qty <= 0.0:
+            return None
+        return {
+            "strategy": short_row["strategy"],
+            "short_occ": short_row["symbol"],
+            "long_occ": long_row["symbol"],
+            "qty": qty,
+            "net_credit": net_credit,
+        }
 
     def _read_latest_open_spread_risk_basis(
         self, *, position_id: str
@@ -3177,6 +3244,34 @@ class TradeLogger:
             (order_id,),
         )
         return cursor.fetchone() is not None
+
+    def has_recorded_spread_fill(
+        self,
+        *,
+        order_id: str | None,
+        position_id: str,
+    ) -> bool:
+        """True when both legs of an MLEG fill are durably recorded.
+
+        Lifecycle order state is deliberately not consulted here: a broker
+        order can become terminal before the specialized spread accounting
+        path records P&L and releases ownership.  ``log_spread_fill`` commits
+        both legs atomically, so two distinct symbols are the completion
+        receipt for replay idempotency.
+        """
+        if not order_id or not os.path.exists(self._path):
+            return False
+        try:
+            conn = self._ensure_db()
+        except sqlite3.Error:
+            return False
+        row = conn.execute(
+            "SELECT COUNT(DISTINCT symbol) FROM trades "
+            "WHERE order_id = ? AND position_id = ? "
+            "AND position_type = 'spread'",
+            (order_id, position_id),
+        ).fetchone()
+        return bool(row and int(row[0] or 0) >= 2)
 
     def _read_single_leg_open_state(self) -> dict[str, dict[str, Any]]:
         """Return open state keyed by symbol, including weighted fill basis.
