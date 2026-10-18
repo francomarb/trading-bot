@@ -12970,6 +12970,9 @@ class TradingEngine:
                                 else open_qty
                             )
                         )
+                        filled_max_loss = (
+                            (plan.width - net_credit) * 100.0
+                        )
                         if open_qty < requested_qty:
                             # The worker reports cumulative quantity after
                             # canceling the unfilled remainder.  Resize both
@@ -12992,15 +12995,25 @@ class TradingEngine:
                                     ),
                                 ],
                             )
-                            if strategy is not None:
-                                strategy.register_spread(
-                                    replace(
-                                        plan,
-                                        qty=int(open_qty),
-                                        net_credit=net_credit,
-                                        max_loss=(plan.width - net_credit) * 100,
-                                    ).to_open_spread(position_id=position_id)
+                        # Pre-registration uses the planned credit so ownership
+                        # exists before the worker starts. Once filled, broker
+                        # truth must replace that estimate even when quantity
+                        # filled in full: exit thresholds and realized P&L both
+                        # read this OpenSpread until the next restart.
+                        if strategy is not None:
+                            strategy.register_spread(
+                                strategy.build_open_spread_record(
+                                    position_id=position_id,
+                                    short_occ=plan.short_occ,
+                                    long_occ=plan.long_occ,
+                                    short_strike=plan.short_strike,
+                                    long_strike=plan.long_strike,
+                                    expiration_date=plan.expiration_date,
+                                    net_credit=net_credit,
+                                    width=plan.width,
+                                    qty=int(open_qty),
                                 )
+                            )
                         # §10.7 spread lifecycle PR: transition the
                         # substrate row to 'open' once the combo fill
                         # lands. The pending row was created in
@@ -13022,8 +13035,8 @@ class TradingEngine:
                         # recover the R-multiple basis without depending on
                         # `released` being in scope.
                         spread_risk_dollars = (
-                            float(plan.max_loss) * open_qty
-                            if plan.max_loss > 0 else None
+                            filled_max_loss * open_qty
+                            if filled_max_loss > 0 else None
                         )
                         self.trade_logger.log_spread_fill(
                             position_id=position_id,
@@ -13162,6 +13175,27 @@ class TradingEngine:
                     float(peeked.qty)
                     if peeked is not None else persisted_open_qty
                 )
+                entry_credit = (
+                    float(peeked.net_credit)
+                    if peeked is not None
+                    else float(persisted_entry["net_credit"])
+                    if persisted_entry is not None
+                    else None
+                )
+                entry_short_occ = (
+                    peeked.short_occ
+                    if peeked is not None
+                    else persisted_entry["short_occ"]
+                    if persisted_entry is not None
+                    else None
+                )
+                entry_long_occ = (
+                    peeked.long_occ
+                    if peeked is not None
+                    else persisted_entry["long_occ"]
+                    if persisted_entry is not None
+                    else None
+                )
                 close_qty = float(
                     filled_qty or open_qty or 1
                 )
@@ -13205,7 +13239,7 @@ class TradingEngine:
                             )
                         )
                         # Residual qty = open_qty - close_qty.
-                        residual_qty = float(peeked.qty - close_qty)
+                        residual_qty = float(open_qty - close_qty)
                         self._lifecycle_orders_insert_spread_close(
                             position_id=position_id,
                             role="partial_close",
@@ -13216,7 +13250,7 @@ class TradingEngine:
                     logger.critical(
                         f"[{strategy_name}] credit spread PARTIAL close detected — "
                         f"position_id={position_id[:8]} close_qty={close_qty} < "
-                        f"open_qty={peeked.qty} — state NOT released; "
+                        f"open_qty={open_qty} — state NOT released; "
                         f"position remains pending close (no duplicate dispatch); "
                         f"awaiting residual fill or operator reconciliation."
                     )
@@ -13224,7 +13258,7 @@ class TradingEngine:
                         self.alerts.broker_error(
                             f"credit_spread partial close: "
                             f"position_id={position_id[:8]} "
-                            f"close_qty={close_qty}/{peeked.qty} "
+                            f"close_qty={close_qty}/{open_qty} "
                             f"(state preserved, awaiting residual)"
                         )
                     except Exception:
@@ -13232,10 +13266,15 @@ class TradingEngine:
                     # Still log the partial event so the trade-log is
                     # honest about what happened and the dollar math
                     # reflects the partial P&L.
-                    if peeked is not None and avg_fill_price is not None:
+                    if (
+                        entry_credit is not None
+                        and entry_short_occ is not None
+                        and entry_long_occ is not None
+                        and avg_fill_price is not None
+                    ):
                         partial_net_debit = abs(avg_fill_price)
                         partial_pnl = (
-                            (peeked.net_credit - partial_net_debit)
+                            (entry_credit - partial_net_debit)
                             * close_qty * 100.0
                         )
                         if self._allocator is not None:
@@ -13248,8 +13287,8 @@ class TradingEngine:
                             self.trade_logger.log_spread_fill(
                                 position_id=position_id,
                                 strategy=strategy_name,
-                                short_occ=peeked.short_occ,
-                                long_occ=peeked.long_occ,
+                                short_occ=entry_short_occ,
+                                long_occ=entry_long_occ,
                                 qty=close_qty,
                                 net_price=partial_net_debit,
                                 order_id=order_id,
@@ -13339,13 +13378,6 @@ class TradingEngine:
                     )
                 else:
                     net_debit = abs(avg_fill_price)
-                    entry_credit = (
-                        float(accounting_spread.net_credit)
-                        if accounting_spread is not None
-                        else float(persisted_entry["net_credit"])
-                        if persisted_entry is not None
-                        else None
-                    )
                     if entry_credit is not None:
                         # Realized P&L = (credit collected − debit paid) × qty
                         # × 100. Feed the allocator HWM / sleeve-drawdown gate

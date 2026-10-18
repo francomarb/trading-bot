@@ -505,7 +505,7 @@ Entry:
 3. Before dispatch, `_reject_if_contract_conflict` checks every leg OCC against `_contract_owner` (PLAN 11.44); fires `CONTRACT_CONFLICT` and aborts if any leg collides with a contract already owned by another strategy.
 4. `broker.dispatch_spread_order` builds the MLEG `LimitOrderRequest` and starts a `SpreadExecutionWorker` thread. Returns `ACCEPTED` immediately; the worker watches the combo via the WebSocket stream and cancels if unfilled past its timeout.
 5. The engine pre-registers a two-leg `Position` (keyed by a UUID `position_id`, `position_type='spread'`) and calls `strategy.register_spread(OpenSpread(...))`. Pre-registration is rolled back on cancel/reject.
-6. Each cycle `_drain_spread_fills` consumes the worker's terminal events: fills → log to trade DB and fire the alert; cancels → release the pre-registration.
+6. Each cycle `_drain_spread_fills` consumes the worker's terminal events: fills replace the pre-registered planned credit/quantity/max loss with actual broker-fill economics, then log to the trade DB and fire the alert; cancels release the pre-registration. This keeps live profit-target, stop-loss, P&L, and risk basis identical to restart reconstruction even when a later walk rung fills away from the original plan.
 
 Exit:
 1. `_process_credit_spread_exits` runs before any entry gating (exits are never blocked by halt / regime / sleeve). Iterates `strategy.open_spreads`; for each runs `evaluate_spread_exit`.

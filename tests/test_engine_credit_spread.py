@@ -455,6 +455,7 @@ class TestDrainSpreadFills:
         assert "p1" in engine._positions
         assert "p1" not in engine._pending_spread_plans
         assert len(strategy.open_spreads) == 1
+        assert strategy.get_open_spread("p1").net_credit == pytest.approx(1.50)
         # Logged to the trade DB as a spread entry — one row per leg, both
         # keyed by the same position_id (needed for restart reconstruction).
         rows = engine.trade_logger.read_all()
@@ -464,6 +465,79 @@ class TestDrainSpreadFills:
         assert all(r["position_uid"] == "pos_p1" for r in rows)
         # Short leg sold to open, long leg bought to open.
         assert {r["side"] for r in rows} == {"sell", "buy"}
+        economic_row = next(r for r in rows if r["side"] == "sell")
+        assert economic_row["initial_risk_dollars"] == pytest.approx(850.0)
+
+    def test_full_entry_fill_credit_drives_live_exit_and_close_accounting(
+        self, tmp_path,
+    ):
+        """Broker fill credit replaces the plan without requiring restart."""
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        broker.dispatch_spread_order.return_value = OrderResult(
+            status=OrderStatus.ACCEPTED,
+            order_id="entry-accepted",
+            symbol="SPY",
+            requested_qty=1,
+            filled_qty=0.0,
+            avg_fill_price=None,
+            raw_status="accepted",
+            message="",
+        )
+        with patch(
+            "strategies.credit_spread.find_best_put_spread",
+            return_value=_pick(net_credit=2.11),
+        ):
+            engine._enter_multi_leg(
+                strategy=strategy,
+                symbol="SPY",
+                underlying_close=745.0,
+                notional_cap=2_000.0,
+                signal_key=_SIGNAL_KEY,
+                signal_bar=_SIGNAL_BAR,
+                strategy_statuses={},
+                strategy_reasons={},
+            )
+        position_id = broker.dispatch_spread_order.call_args.kwargs["position_id"]
+        broker.drain_spread_fills.return_value = [
+            (
+                position_id, "credit_spread", False, "filled", 1.0,
+                -1.98, "entry-fill", -2.11,
+            ),
+        ]
+
+        engine._drain_spread_fills()
+
+        opened = strategy.get_open_spread(position_id)
+        assert opened is not None
+        assert opened.net_credit == pytest.approx(1.98)
+        assert strategy._classify_exit(
+            opened,
+            spread_mid=3.95,
+            underlying_close=745.0,
+            today=date.today(),
+        )[0] is None
+        assert strategy._classify_exit(
+            opened,
+            spread_mid=3.96,
+            underlying_close=745.0,
+            today=date.today(),
+        )[0] == "stop_loss"
+        _mark_close_pending_in_substrate(engine, position_id)
+        broker.drain_spread_fills.return_value = [
+            (
+                position_id, "credit_spread", True, "filled", 1.0,
+                4.41, "close-fill", 4.41,
+            ),
+        ]
+
+        engine._drain_spread_fills()
+
+        close_row = next(
+            row for row in engine.trade_logger.read_all()
+            if row["order_id"] == "close-fill" and row["side"] == "buy"
+        )
+        assert close_row["realized_pnl"] == pytest.approx(-243.0)
 
     def test_open_filled_logs_slippage_vs_submitted_credit(self, tmp_path):
         strategy = _strategy()
@@ -2383,6 +2457,7 @@ class TestSpreadCloseSubstrate:
 
         strategy = _strategy()
         engine, broker = _engine(tmp_path, strategy)
+        engine._allocator = MagicMock()
         self._setup_open_spread(engine, strategy, "p-qqq")
         strategy.release_spread("p-qqq")
         strategy.register_spread(_open_spread("p-qqq", net_credit=1.98))
@@ -2426,6 +2501,16 @@ class TestSpreadCloseSubstrate:
             order_id="qqq-close-order",
             position_id="p-qqq",
         )
+        engine._allocator.record_realized_pnl.assert_called_once()
+
+        engine._drain_spread_fills()
+
+        replay_rows = [
+            row for row in engine.trade_logger.read_all()
+            if row["order_id"] == "qqq-close-order"
+        ]
+        assert len(replay_rows) == 2
+        engine._allocator.record_realized_pnl.assert_called_once()
 
     def test_recovered_close_uses_persisted_entry_when_runtime_is_gone(
         self, tmp_path,
@@ -2461,6 +2546,78 @@ class TestSpreadCloseSubstrate:
         assert economic_row["symbol"] == "SPY260618P00568000"
         assert economic_row["realized_pnl"] == pytest.approx(-243.0)
         assert economic_row["status"] == "filled"
+
+    def test_recovered_partial_close_uses_persisted_entry_without_runtime(
+        self, tmp_path,
+    ):
+        """A future multi-contract recovery must not dereference runtime state."""
+        from engine.positions import spread_substrate_uid
+
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        engine._allocator = MagicMock()
+        engine.alerts = MagicMock()
+        engine.trade_logger.log_spread_fill(
+            position_id="p-partial-restart",
+            strategy="credit_spread",
+            short_occ="SPY260618P00568000",
+            long_occ="SPY260618P00558000",
+            qty=2.0,
+            net_price=1.98,
+            order_id="entry-partial-restart",
+            opening=True,
+        )
+        engine._lifecycle_begin_spread(
+            position_id="p-partial-restart",
+            strategy_name="credit_spread",
+            symbol="SPY260618P00568000",
+            qty=2,
+        )
+        engine._lifecycle_mark_spread_open(
+            position_id="p-partial-restart",
+            avg_entry_price=1.98,
+            current_qty=2.0,
+        )
+        engine.lifecycle_orders_store.insert_pending(
+            position_uid=spread_substrate_uid("p-partial-restart"),
+            role="exit",
+            client_order_id="partial-restart-close",
+            order_type="limit",
+            order_class="mleg",
+            time_in_force="day",
+            side="buy",
+            intended_qty=2.0,
+            intended_limit_price=4.41,
+        )
+        broker.drain_spread_fills.return_value = [
+            (
+                "p-partial-restart", "credit_spread", True, "filled", 1.0,
+                4.41, "partial-restart-order", 4.41,
+            ),
+        ]
+
+        engine._drain_spread_fills()
+
+        close_rows = [
+            row for row in engine.trade_logger.read_all()
+            if row["order_id"] == "partial-restart-order"
+        ]
+        assert len(close_rows) == 2
+        economic_row = next(row for row in close_rows if row["side"] == "buy")
+        assert economic_row["status"] == "partial"
+        assert economic_row["realized_pnl"] == pytest.approx(-243.0)
+        remaining = engine.trade_logger.read_spread_entry_context(
+            position_id="p-partial-restart",
+        )
+        assert remaining is not None
+        assert remaining["qty"] == pytest.approx(1.0)
+        pending = engine.lifecycle_orders_store.get_non_terminal_by_role(
+            spread_substrate_uid("p-partial-restart"),
+            ("exit", "partial_close"),
+        )
+        assert len(pending) == 1
+        assert pending[0].role == "partial_close"
+        assert pending[0].intended_qty == pytest.approx(1.0)
 
     def test_close_drain_canceled_finalizes_substrate_row_as_canceled(
         self, tmp_path
