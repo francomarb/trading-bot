@@ -1560,6 +1560,22 @@ class TestProcessSymbol:
 
 
 class TestRunOneCycle:
+    def test_spread_fills_are_drained_before_external_close_fallback(
+        self, engine_factory,
+    ):
+        engine, _broker = engine_factory(entries=[False] * 60)
+        observed: list[str] = []
+        engine._drain_spread_fills = MagicMock(
+            side_effect=lambda: observed.append("spread_fill")
+        )
+        engine._detect_external_closes = MagicMock(
+            side_effect=lambda _snapshot: observed.append("external_close")
+        )
+
+        engine._run_one_cycle()
+
+        assert observed.index("spread_fill") < observed.index("external_close")
+
     def test_broker_snapshot_engages_restart_safe_account_halt(
         self, engine_factory
     ):

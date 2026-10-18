@@ -1201,6 +1201,19 @@ The text below preserves the *original deferral framing* this discovery doc capt
 
 **What actually shipped (PR #72, 7 commits + whitespace fix):** spread closes write into `position_lifecycle_orders` (C1–C2); cycle + startup reconciler walks non-terminal close rows (C3); `_spreads_pending_close` fully retired (C4); docs (C5). Review-fix R1 (commit `a5f8352`) added per-submit eager attach via worker `on_submitted` callback queued through `AlpacaBroker._pending_lifecycle_close_attaches`, plus `sqlite_errorname` discriminator and cumulative-fill double-release guard. Review-fix R2 (commit `991d5dc`) added crash-durable substrate write from the worker thread via its own sqlite3 connection (the in-memory queue alone left a one-cycle-interval crash window; the durable write closes it). Worker partial-fill behavior kept as WAIT (evidence: zero historical spread partial-fill events on paper). Acceptance test `test_durable_attach_persists_order_id_before_engine_drain` opens a fresh sqlite connection (simulating restart) and confirms the substrate row has `order_id` set without any engine drain having run.
 
+**2026-10-17 accounting-race correction:** a terminal per-order row proves only
+that Alpaca order state is known; it does not prove `_drain_spread_fills` has
+released runtime ownership, recorded both legs, or booked realized P&L. Worker,
+stream, and REST observations may arrive in either order. MLEG fill idempotency
+therefore uses the atomic two-leg `trades` receipt for `(position_id, order_id)`,
+while the substrate remains authoritative for order state and quantity. Close
+reconciliation queues terminal broker truth regardless of whether the prior row
+was `pending`, `working`, or `unknown`; the common drain suppresses a replay only
+after both leg rows exist. Generic external-close detection runs after lifecycle
+reconciliation and specialized fill drains. If both legs already vanished on a
+restart, the drain reads the original symbols, credit, and residual quantity from
+the spread entry rows rather than fabricating a zero-P&L external close.
+
 ### 10.8 PR #58 disposition — rebuild, do not cherry-pick
 
 | Aspect | Detail |

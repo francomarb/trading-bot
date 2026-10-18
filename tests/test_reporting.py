@@ -1204,6 +1204,35 @@ class TestSpreadLogging:
         assert by_symbol[self._LONG]["avg_fill_price"] is None
         assert by_symbol[self._LONG]["entry_reference_price"] is None
 
+    def test_two_leg_receipt_rolls_back_if_second_leg_insert_fails(
+        self, tmp_csv,
+    ):
+        tl = TradeLogger(path=tmp_csv)
+        conn = tl._ensure_db()
+        conn.execute(
+            "CREATE TRIGGER fail_long_spread_leg BEFORE INSERT ON trades "
+            f"WHEN NEW.symbol = '{self._LONG}' "
+            "BEGIN SELECT RAISE(ABORT, 'test second-leg failure'); END"
+        )
+        conn.commit()
+
+        with pytest.raises(sqlite3.IntegrityError, match="second-leg failure"):
+            tl.log_spread_fill(
+                position_id="uuid-atomic",
+                strategy="credit_spread",
+                short_occ=self._SHORT,
+                long_occ=self._LONG,
+                qty=1,
+                net_price=2.54,
+                order_id="combo-atomic",
+                opening=True,
+            )
+
+        assert [
+            row for row in tl.read_all()
+            if row["order_id"] == "combo-atomic"
+        ] == []
+
     def test_close_reverses_leg_sides(self, tmp_csv):
         tl = TradeLogger(path=tmp_csv)
         tl.log_spread_fill(
