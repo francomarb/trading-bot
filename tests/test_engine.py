@@ -190,6 +190,7 @@ class TestDonchianExitObservation:
         engine, _broker = engine_factory(entries=[False] * 60)
         strategy = engine.slots[0].strategy
         strategy.name = "donchian_breakout"
+        engine._register_single_leg(strategy_name=strategy.name, symbol="AAPL")
         snapshot = _snapshot(
             positions={"AAPL": Position("AAPL", 10, 100.0, 1_000.0)}
         )
@@ -933,6 +934,7 @@ class TestProcessSymbol:
 
     def test_entry_signal_with_existing_position_no_order(self, engine_factory):
         engine, broker = engine_factory(entries=[False] * 59 + [True])
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
         positions = {
             "AAPL": Position("AAPL", 10, 100.0, 1010.0),
         }
@@ -945,6 +947,7 @@ class TestProcessSymbol:
 
     def test_exit_signal_with_position_calls_close(self, engine_factory):
         engine, broker = engine_factory(exits=[False] * 59 + [True])
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
         positions = {"AAPL": Position("AAPL", 10, 100.0, 1010.0)}
         snap = _snapshot(positions=positions)
         engine._session_start_equity = snap.account.equity
@@ -954,6 +957,7 @@ class TestProcessSymbol:
 
     def test_global_halt_does_not_block_exit(self, engine_factory):
         engine, broker = engine_factory(exits=[False] * 59 + [True])
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
         positions = {"AAPL": Position("AAPL", 10, 100.0, 1010.0)}
         snap = _snapshot(positions=positions)
         for _ in range(10):
@@ -993,6 +997,7 @@ class TestProcessSymbol:
         with an exit signal must still close — same invariant
         `test_global_halt_does_not_block_exit` proves for halt."""
         engine, broker = engine_factory(exits=[False] * 59 + [True])
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
         positions = {"AAPL": Position("AAPL", 10, 100.0, 1010.0)}
         snap = _snapshot(positions=positions)
         engine._session_start_equity = snap.account.equity
@@ -1012,6 +1017,7 @@ class TestProcessSymbol:
         self, engine_factory,
     ):
         engine, broker = engine_factory(exits=[False] * 59 + [True])
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
         positions = {"AAPL": Position("AAPL", 10, 100.0, 1010.0)}
         snap = _snapshot(positions=positions)
         engine._session_start_equity = snap.account.equity
@@ -1032,6 +1038,7 @@ class TestProcessSymbol:
         let the operator command finish. Otherwise both threads can
         SELL the same shares and oversell."""
         engine, broker = engine_factory(exits=[False] * 59 + [True])
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
         positions = {"AAPL": Position("AAPL", 10, 100.0, 1010.0)}
         snap = _snapshot(positions=positions)
         engine._session_start_equity = snap.account.equity
@@ -1151,6 +1158,7 @@ class TestProcessSymbol:
         engine.slots[0].strategy = TargetStateStrategy(
             target=PositionTarget.FLAT
         )
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
         positions = {"AAPL": Position("AAPL", 10, 100.0, 1_010.0)}
         snapshot = _snapshot(positions=positions)
 
@@ -1164,6 +1172,7 @@ class TestProcessSymbol:
         engine.slots[0].strategy = TargetStateStrategy(
             target=PositionTarget.LONG
         )
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
         positions = {"AAPL": Position("AAPL", 10, 100.0, 1_010.0)}
         snapshot = _snapshot(positions=positions)
 
@@ -1291,6 +1300,7 @@ class TestProcessSymbol:
         engine, broker = engine_factory()
         strategy = TargetStateStrategy(target=PositionTarget.FLAT)
         engine.slots[0].strategy = strategy
+        engine._register_single_leg(strategy_name=strategy.name, symbol="AAPL")
         positions = {"AAPL": Position("AAPL", 10, 100.0, 1_010.0)}
         snapshot = _snapshot(
             positions=positions,
@@ -1452,6 +1462,7 @@ class TestProcessSymbol:
 
     def test_pending_close_order_blocks_redundant_close(self, engine_factory):
         engine, broker = engine_factory(exits=[False] * 59 + [True])
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
         positions = {"AAPL": Position("AAPL", 10, 100.0, 1010.0)}
         snap = _snapshot(positions=positions, open_orders=[_open_sell_order("AAPL")])
         engine._session_start_equity = snap.account.equity
@@ -1460,6 +1471,7 @@ class TestProcessSymbol:
 
     def test_protective_stop_does_not_block_signal_close(self, engine_factory):
         engine, broker = engine_factory(exits=[False] * 59 + [True])
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
         positions = {"AAPL": Position("AAPL", 10, 100.0, 1010.0)}
         snap = _snapshot(positions=positions, open_orders=[_open_stop_order("AAPL")])
         engine._session_start_equity = snap.account.equity
@@ -2698,17 +2710,113 @@ class TestPositionOwnership:
         # Ownership cleared after close.
         assert not engine._has_position("AAPL")
 
-    def test_exit_allowed_when_no_owner_recorded(self, engine_factory):
-        """Pre-existing positions (no recorded owner) can be closed by anyone."""
+    def test_exit_refused_when_no_owner_recorded(self, engine_factory):
+        """Unmanaged broker positions cannot be closed by a strategy."""
         engine, broker = engine_factory(exits=[False] * 59 + [True])
         positions = {"AAPL": Position("AAPL", 10, 100.0, 1010.0)}
         snap = _snapshot(positions=positions)
         engine._session_start_equity = snap.account.equity
 
-        # No ownership recorded — should still allow close.
         slot = engine.slots[0]
         engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
-        broker.close_position.assert_called_once_with("AAPL", position_uid=None)
+        broker.close_position.assert_not_called()
+
+    def test_stale_snapshot_cannot_be_closed_after_owner_exits(self, engine_factory):
+        """A later strategy cannot act on a position closed earlier this cycle."""
+        engine, broker = engine_factory(exits=[False] * 59 + [True])
+        broker.close_position.return_value = _filled_result("AAPL", 10, 100.0)
+        position = Position("AAPL", 10, 100.0, 1010.0)
+        snap = _snapshot(positions={"AAPL": position})
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
+
+        owner_strategy = engine.slots[0].strategy
+        assert engine._close_single_leg_position(
+            symbol="AAPL",
+            strategy=owner_strategy,
+            position=position,
+            snapshot=snap,
+            latest_close=101.0,
+            alert_reason="exit signal",
+        )
+        assert not engine._has_position("AAPL")
+
+        peer_strategy = FakeStrategy(
+            entries=[False] * 59 + [False],
+            exits=[False] * 59 + [True],
+        )
+        peer_strategy.name = "peer_strategy"
+        broker.close_position.reset_mock()
+
+        engine._process_symbol(
+            "AAPL",
+            snap,
+            snap.account,
+            peer_strategy,
+            engine.slots[0].timeframe,
+        )
+
+        broker.close_position.assert_not_called()
+
+    def test_close_boundary_refuses_stale_unowned_position(self, engine_factory):
+        """Direct callers cannot bypass the strategy ownership invariant."""
+        engine, broker = engine_factory()
+        position = Position("AAPL", 10, 100.0, 1010.0)
+        snap = _snapshot(positions={"AAPL": position})
+
+        closed = engine._close_single_leg_position(
+            symbol="AAPL",
+            strategy=engine.slots[0].strategy,
+            position=position,
+            snapshot=snap,
+            latest_close=101.0,
+            alert_reason="exit signal",
+        )
+
+        assert closed is False
+        broker.close_position.assert_not_called()
+
+    def test_close_boundary_refuses_different_owner(self, engine_factory):
+        """The final submit boundary independently enforces exact ownership."""
+        engine, broker = engine_factory()
+        engine._register_single_leg(strategy_name="other_strategy", symbol="AAPL")
+        position = Position("AAPL", 10, 100.0, 1010.0)
+
+        closed = engine._close_single_leg_position(
+            symbol="AAPL",
+            strategy=engine.slots[0].strategy,
+            position=position,
+            snapshot=_snapshot(positions={"AAPL": position}),
+            latest_close=101.0,
+            alert_reason="exit signal",
+        )
+
+        assert closed is False
+        broker.close_position.assert_not_called()
+
+    def test_processed_bar_stale_snapshot_after_reconciliation_cannot_close(
+        self, engine_factory, patch_fetch
+    ):
+        """A stop/recovery cleanup cannot expose its old snapshot to exit retry."""
+        engine, broker = engine_factory(exits=[False] * 59 + [True])
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
+        engine._pop_position("AAPL")
+        signal_key = ("fake_strategy", "AAPL", engine.slots[0].timeframe)
+        engine._processed_signal_bars[signal_key] = pd.Timestamp(
+            patch_fetch["df"].index[-1]
+        )
+        snap = _snapshot(
+            positions={"AAPL": Position("AAPL", 10, 100.0, 1010.0)}
+        )
+
+        engine._process_symbol(
+            "AAPL",
+            snap,
+            snap.account,
+            engine.slots[0].strategy,
+            engine.slots[0].timeframe,
+        )
+
+        broker.close_position.assert_not_called()
 
     def test_entry_registers_ownership(self, engine_factory):
         """A successful entry fill records the strategy as position owner."""
@@ -7658,6 +7766,7 @@ class TestSharedSymbolConflict:
             side_effect=RuntimeError("disk unavailable"),
         ):
             engine, broker = engine_factory(exits=[False] * 59 + [True])
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
         positions = {"AAPL": Position("AAPL", 10, 100.0, 1_010.0)}
         snap = _snapshot(positions=positions)
         engine._session_start_equity = snap.account.equity
@@ -8014,6 +8123,7 @@ class TestExitPathBenchmarkKind:
         """No arrival quote → the row falls back to the prior bar close
         and says so, exactly as before this path learned to fetch."""
         engine, broker = self._engine_with_real_logger(tmp_path)
+        engine._register_single_leg(strategy_name=engine.strategy.name, symbol="AAPL")
         broker.get_latest_quote_midpoint.return_value = None
         position, snap = self._equity_position_and_snapshot()
         engine._log_close = MagicMock()
@@ -8036,6 +8146,7 @@ class TestExitPathBenchmarkKind:
         state, tagged as a primary execution-quality measurement, and
         feeds the drift kill switch."""
         engine, broker = self._engine_with_real_logger(tmp_path)
+        engine._register_single_leg(strategy_name=engine.strategy.name, symbol="AAPL")
         broker.get_latest_quote_midpoint.return_value = 149.60
         position, snap = self._equity_position_and_snapshot()
         engine._log_close = MagicMock()
@@ -8063,6 +8174,7 @@ class TestExitPathBenchmarkKind:
         """The midpoint must be captured before the close is submitted —
         a quote read afterwards is contaminated by our own order."""
         engine, broker = self._engine_with_real_logger(tmp_path)
+        engine._register_single_leg(strategy_name=engine.strategy.name, symbol="AAPL")
         call_order: list[str] = []
         broker.get_latest_quote_midpoint.side_effect = (
             lambda *_a, **_k: call_order.append("quote") or 149.60
@@ -8086,6 +8198,11 @@ class TestExitPathBenchmarkKind:
     def test_option_exit_tags_unavailable(self, tmp_path):
         engine, broker = self._engine_with_real_logger(tmp_path)
         occ = "SPY260620C00520000"
+        engine._register_single_leg(
+            strategy_name=engine.strategy.name,
+            symbol=occ,
+            position_id="pos_option_exit_benchmark",
+        )
         broker.close_position.return_value = _filled_result(occ, 2, 12.50)
         from execution.broker import BrokerSnapshot
         position = SimpleNamespace(
