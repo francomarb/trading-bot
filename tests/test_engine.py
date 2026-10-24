@@ -2721,6 +2721,22 @@ class TestPositionOwnership:
         engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
         broker.close_position.assert_not_called()
 
+    def test_entry_refused_when_broker_position_has_no_owner(self, engine_factory):
+        """The risk duplicate-position gate still blocks an unowned broker row."""
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        engine.alerts = MagicMock()
+        snap = _snapshot(
+            positions={"AAPL": Position("AAPL", 10, 100.0, 1010.0)}
+        )
+
+        slot = engine.slots[0]
+        engine._process_symbol(
+            "AAPL", snap, snap.account, slot.strategy, slot.timeframe
+        )
+
+        broker.place_order.assert_not_called()
+        assert engine.alerts.order_rejection.call_args.args[3] == "duplicate_position"
+
     def test_stale_snapshot_cannot_be_closed_after_owner_exits(self, engine_factory):
         """A later strategy cannot act on a position closed earlier this cycle."""
         engine, broker = engine_factory(exits=[False] * 59 + [True])
