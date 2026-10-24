@@ -914,12 +914,10 @@ class TradingEngine:
             underlying=underlying,
         )
         if tracked is None or tracked.primary_leg is None:
-            # Legacy/unowned equity positions remain manageable during
-            # startup recovery. An underlying ticker cannot safely select an
-            # arbitrary OCC contract, so options require durable ownership.
-            if self._get_owner(underlying) is not None:
-                return None
-            return snapshot.account.open_positions.get(underlying)
+            # Startup reconciliation owns legacy assignment. During normal
+            # strategy evaluation, an unowned broker row must remain unmanaged:
+            # a cycle-start snapshot can outlive an earlier same-cycle close.
+            return None
         return snapshot.account.open_positions.get(tracked.primary_leg.symbol)
 
     def _register_single_leg(
@@ -11664,13 +11662,6 @@ class TradingEngine:
         logger.warning(
             f"[{strategy.name}] {symbol}: EMERGENCY EXIT triggered by strategy hook."
         )
-        owner = self._get_owner(position.symbol)
-        if owner is not None and owner != strategy.name:
-            logger.info(
-                f"[{strategy.name}] {symbol}: emergency exit ignored — "
-                f"position owned by '{owner}'"
-            )
-            return False
         if self._has_pending_close_order(position.symbol, snapshot):
             logger.info(
                 f"{symbol}: emergency exit but a close order is already pending — skipping"
@@ -11697,6 +11688,16 @@ class TradingEngine:
         alert_reason: str,
     ) -> bool:
         """Close a single-leg position and perform shared exit bookkeeping."""
+        owner = self._get_owner(position.symbol)
+        if owner != strategy.name:
+            owner_detail = (
+                f"owned by '{owner}'" if owner is not None else "has no active owner"
+            )
+            logger.info(
+                f"[{strategy.name}] {symbol}: close ignored — broker position "
+                f"{owner_detail}"
+            )
+            return False
         if self._has_pending_close_order(position.symbol, snapshot):
             logger.info(f"{symbol}: close requested but a close order is already pending — skipping")
             return False

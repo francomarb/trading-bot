@@ -257,6 +257,13 @@ ownership identity must select the correct slot, and unmanaged positions must
 remain explicitly unmanaged. De-duplicate shared data fetches without merging
 strategy decisions.
 
+The same rule applies throughout a cycle. A point-in-time broker snapshot can
+still contain a position that its owner closed earlier in that cycle; releasing
+runtime ownership must not make that stale row eligible for another strategy.
+Normal strategy exits therefore require exact current ownership both when the
+broker row is resolved and again at the final close boundary. Legacy ownership
+assignment belongs only to startup reconciliation.
+
 If telemetry shows flat work is delaying owned positions, initial service levels
 to evaluate would be:
 
