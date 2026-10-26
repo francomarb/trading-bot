@@ -521,7 +521,8 @@ DURABLE_WATCHLIST_MIN_AVG_DOLLAR_VOLUME_50 = 50_000_000.0
 # solvency, and preferred share class only. Current technical state, FCF,
 # revenue growth, ATR, and sector are diagnostics rather than membership gates.
 # The strategy and runtime filters decide whether a member is tradable now.
-# Symbols after the ranked 100 are temporary lifecycle-preservation members.
+# DOCN's temporary lifecycle-preservation membership ended 2026-10-26 after
+# its SMA position was confirmed flat and terminal; the list is exactly 100.
 # See docs/sma-watchlist-selection.md.
 SMA_WATCHLIST_RULE_VERSION = "sma_watchlist_v3_durable_liquid_pool"
 SMA_TARGET_POOL_SIZE = 100
@@ -536,8 +537,6 @@ SMA_WATCHLIST = [
     "BA", "MCD", "C", "ALAB", "TMO", "BKNG", "INTU", "PG", "ABBV", "ANET",
     "T", "WFC", "CRCL", "AMGN", "ISRG", "HPE", "AAOI", "VLO", "TER", "PEP",
     "NU", "NKE", "NET", "DDOG", "VZ", "TJX", "MS", "RDDT", "AAL", "ACN",
-    # Temporary lifecycle-preservation members from the pre-refresh universe.
-    "DOCN",
 ]
 # RSI Reversion — 50-name durable-company opportunity pool promoted from the
 # 2026-09-09 v3 SIP scan, corrected 2026-09-20 for the previously unresolved
@@ -604,8 +603,9 @@ BOLLINGER_WATCHLIST = [
 # promotion-grade candidates from the delayed-SIP report, ordered by
 # 50-day average dollar volume. Membership uses price, liquidity, company
 # size, and affirmative solvency only. Trend state and historical Donchian
-# outcomes do not include, exclude, or rank a company. The generated cohort is
-# followed by any temporary lifecycle-preservation names from the prior list.
+# outcomes do not include, exclude, or rank a company. SPCX's temporary
+# lifecycle-preservation membership ended 2026-10-26 after its Donchian
+# position was confirmed flat and terminal; the list is exactly 100.
 # See docs/donchian-watchlist-selection.md.
 DONCHIAN_WATCHLIST_RULE_VERSION = "donchian_watchlist_v1_durable_liquid_pool"
 DONCHIAN_TARGET_POOL_SIZE = 100
@@ -623,8 +623,6 @@ DONCHIAN_WATCHLIST = [
     "HD", "ALAB", "ABBV", "WFC", "T", "SHOP", "BA", "ANET", "TMO", "MCD",
     "NU", "BKNG", "ISRG", "CRCL", "AAL", "AAOI", "HPE", "TER", "MS", "AMGN",
     "PEP", "DDOG", "VZ", "ABT", "ACN", "RDDT", "PATH", "SOFI", "NET",
-    # Temporary lifecycle-preservation member from the pre-refresh universe.
-    "SPCX",
 ]
 # Full engine universe — union of all lists; preserves paper-run continuity.
 #

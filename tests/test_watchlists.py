@@ -109,6 +109,10 @@ class TestSMAWatchlistPromotion:
         assert "GOOG" in settings.SMA_WATCHLIST
         assert "GOOGL" not in settings.SMA_WATCHLIST
 
+    def test_closed_preservation_member_is_removed(self):
+        assert len(settings.SMA_WATCHLIST) == settings.SMA_TARGET_POOL_SIZE
+        assert "DOCN" not in settings.SMA_WATCHLIST
+
     def test_ranked_pool_matches_approved_liquidity_boundary(self):
         ranked_pool = settings.SMA_WATCHLIST[: settings.SMA_TARGET_POOL_SIZE]
 
@@ -144,6 +148,10 @@ class TestDonchianWatchlistPromotion:
         )
         assert "GOOG" in settings.DONCHIAN_WATCHLIST
         assert "GOOGL" not in settings.DONCHIAN_WATCHLIST
+
+    def test_closed_preservation_member_is_removed(self):
+        assert len(settings.DONCHIAN_WATCHLIST) == settings.DONCHIAN_TARGET_POOL_SIZE
+        assert "SPCX" not in settings.DONCHIAN_WATCHLIST
 
     def test_ranked_pool_contains_profitability_parser_correction(self):
         ranked_pool = settings.DONCHIAN_WATCHLIST[

@@ -96,9 +96,10 @@ There is no fixed take-profit target. The strategy lets winners run for as long 
 
 We intentionally do not add a trailing stop to SMA Crossover. The bearish crossunder already acts as the strategy's trend exit, and the 2x ATR stop already provides downside protection before the crossunder arrives. Adding a second trailing exit tends to reduce drawdown, but in testing it clipped winners more often than it improved overall risk-adjusted returns, so the strategy keeps the simpler crossunder-plus-ATR-stop design.
 
-**Watchlist:** The active `SMA_WATCHLIST` is the 100-name v3 durable-company
-opportunity pool promoted 2026-09-28, plus temporary lifecycle-preservation
-members. Membership uses price, SIP dollar liquidity, company size,
+**Watchlist:** The active `SMA_WATCHLIST` is exactly the 100-name v3
+durable-company opportunity pool promoted 2026-09-28. DOCN's temporary
+lifecycle-preservation membership ended 2026-10-26. Membership uses price,
+SIP dollar liquidity, company size,
 affirmative solvency, and preferred share class; technical state and historical
 SMA outcomes do not include, exclude, or rank a company. The retired v2
 technical scanner is historical opt-in only.
