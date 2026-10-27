@@ -4,7 +4,7 @@
 
 **Promoted:** 2026-09-28
 
-**Ranked pool:** 100 companies, followed only by temporary lifecycle-preservation members
+**Active pool:** exactly 100 ranked companies; no lifecycle-preservation member is active
 
 This document is the authoritative SMA watchlist specification. The historical
 `sma_watchlist_v2` technical snapshot method is retired and must not be used to
@@ -163,10 +163,9 @@ Every refresh must:
     market-data request volume, and errors.
 
 A promotion starts a new strategy configuration-hash evidence cohort. Do not
-pool its paper outcomes with the previous exact configuration. Removing an
-appended lifecycle-preservation member such as `DOCN` also changes the full
-watchlist hash; record that later boundary explicitly rather than treating it
-as the same exact cohort.
+pool its paper outcomes with the previous exact configuration. DOCN was removed
+on 2026-10-26 after its lifecycle became flat and terminal, moving the SMA
+configuration hash from `9d03f1d0d22d` to `5796582157ba`.
 
 ## Implementation And Evidence
 
@@ -186,7 +185,9 @@ selector.
 
 - `sma_watchlist_v3_durable_liquid_pool` — active from 2026-09-28. Separates
   durable company membership from time-sensitive trade gating and ranks by
-  dollar liquidity.
+  dollar liquidity. DOCN's lifecycle-preservation cleanup on 2026-10-26
+  returned the active list to the exact ranked 100 and created a configuration-
+  hash boundary without changing the selector rule.
 - `sma_watchlist_v2` — retired 2026-09-28. Mixed current trend, relative
   strength, ADX, ATR, fundamentals, and sector caps into membership; retained
   only for historical report reproduction.

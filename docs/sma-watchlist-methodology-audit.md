@@ -290,11 +290,10 @@ Refresh quarterly or after a material tradability, data-quality, corporate
 action, or persistent opportunity-starvation event. Do not rotate the pool for
 ordinary one-scan liquidity drift.
 
-`DOCN` remains appended only for lifecycle protection. Removing it after the
-position is flat and terminal changes SMA's full watchlist payload and thus its
-configuration hash. Record that boundary explicitly; until a reviewed
-cross-hash compatibility manifest exists, do not silently pool the pre- and
-post-removal cohorts.
+`DOCN` was removed on 2026-10-26 after its SMA position was flat and terminal.
+That housekeeping changed SMA's full watchlist payload and configuration hash
+without changing the ranked 100 or selection method. Do not silently pool the
+pre- and post-removal cohorts without a reviewed compatibility manifest.
 
 ## Limitations
 

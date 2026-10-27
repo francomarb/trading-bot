@@ -158,9 +158,9 @@ Composition is dynamic and lives in `config/settings.py::SMA_WATCHLIST`.
 Findings about *what* to put on the list and how often to refresh it are
 tracked in [`sma_crossover_optimizations.md`](sma_crossover_optimizations.md).
 
-**Current composition (2026-09-28):** 100 names ranked by 50-session SIP dollar
-liquidity after durable price, size, solvency, and share-class gates, plus any
-temporary lifecycle-preservation members. Technical state, historical
+**Current composition (2026-10-26):** exactly 100 names ranked by 50-session SIP
+dollar liquidity after durable price, size, solvency, and share-class gates.
+There is no active lifecycle-preservation member. Technical state, historical
 crossovers, FCF/revenue, ATR, and sector are diagnostics only. Promotion starts
 a new exact-configuration paper cohort. See
 [`sma-watchlist-selection.md`](sma-watchlist-selection.md) and

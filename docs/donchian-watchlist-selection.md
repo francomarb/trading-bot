@@ -5,15 +5,15 @@ corrected 2026-09-20.
 
 **Rule version:** `donchian_watchlist_v1_durable_liquid_pool`
 
-**Target:** 100 ranked opportunity candidates, plus any temporarily protected
-symbols with open Donchian positions.
+**Active pool:** exactly 100 ranked opportunity candidates; no protected symbol
+is currently appended.
 
 **Approved correction:**
 `docs/reports/donchian_watchlist_scan_11_72_candidate.md` reflects the shared
 fundamentals-parser correction. ISRG qualifies at rank 84 and replaces LIN,
 which moves to rank 101. The correction was approved after private position and
-open-order reconciliation; existing lifecycle-preservation membership remains
-unchanged.
+open-order reconciliation. SPCX's later lifecycle-preservation membership ended
+on 2026-10-26 after its position became flat and terminal.
 
 ## Purpose
 
@@ -172,6 +172,10 @@ not written to source control. Before promotion, run a private copy without
 that flag and reconcile its protected names against the proposed configuration.
 Remove each lifecycle-preservation member only after it is flat and terminal.
 
+SPCX was removed on 2026-10-26 after that condition was met, moving the
+Donchian configuration hash from `61b45d9939a5` to `168b30ef66c4`. The ranked
+100 and selector rule did not change.
+
 ## Refresh Procedure
 
 1. Run the focused scanner and watchlist tests.
@@ -193,6 +197,8 @@ because one refresh slightly reorders dollar liquidity.
 
 ## Evidence And Limitations
 
+- The 2026-10-26 SPCX cleanup is a configuration-hash boundary, not a new
+  selector cohort or trading-rule change.
 - Promotion starts a new strategy-configuration-hash paper cohort.
 - Pre- and post-refresh outcomes must not be pooled as one configuration.
 - The snapshot uses today's tradable universe and is not a
