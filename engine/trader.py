@@ -1486,7 +1486,7 @@ class TradingEngine:
                             )
                         replay_contract = dict(replay_contract)
                         entry_tif = getattr(
-                            self._broker, "entry_time_in_force", None
+                            self.broker, "entry_time_in_force", None
                         )
                         if not isinstance(entry_tif, str) or not entry_tif:
                             raise ValueError(
