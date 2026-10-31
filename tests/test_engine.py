@@ -795,6 +795,10 @@ class TestProcessSymbol:
         engine, broker = engine_factory(
             entries=[False] * 59 + [True], place_result=result
         )
+        broker.entry_time_in_force = "gtc"
+        engine.strategy.candidate_replay_contract = MagicMock(
+            return_value={"contract_version": 1}
+        )
         engine._candidate_cycle_uid = "candidate-cycle"
         snap = _snapshot()
 
@@ -820,6 +824,11 @@ class TestProcessSymbol:
         assert row["disposition"] == "filled"
         assert row["position_uid"] == "pos_candidate_1"
         assert row["requested_qty"] > 0
+        assert (
+            row["common_context"]["shadow_replay_contract"]["entry_time_in_force"]
+            == "gtc"
+        )
+        assert "shadow_replay_contract_error" not in row["common_context"]
         broker.place_order.assert_called_once()
 
     def test_candidate_feature_failure_does_not_block_entry(self, engine_factory):

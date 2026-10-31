@@ -147,6 +147,10 @@ settings from their immutable Git commit without executing historical Python.
 Modeled next-session-open exits use 09:30 New York time rather than the daily
 bar's midnight timestamp so reported holding periods retain the correct clock.
 
+New equity candidate rows store this replay contract directly, including the
+effective entry time-in-force. Historical Git reconstruction is a legacy
+fallback for older rows, not the primary contract for new evidence.
+
 The resolver command only updates `entry_candidate_shadow_outcomes` when
 `--apply` is passed. It never changes a decision, lifecycle, allocator state,
 or bot behavior. The report reads actual selected outcomes from durable
