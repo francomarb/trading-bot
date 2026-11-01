@@ -76,6 +76,7 @@ trading-bot/
 ├── requirements.txt           # Pinned dependencies
 ├── main.py                    # Entry point (delegates to forward_test.py)
 ├── forward_test.py            # Launches engine for multi-week paper runs
+├── dashboard.py               # Read-only, five-page Streamlit operator dashboard
 ├── start_bot.sh               # tmux + caffeinate launcher
 ├── stop_bot.sh                # Graceful shutdown
 ├── recycle_bot.sh             # stop + start (picks up code changes without restart)
@@ -705,6 +706,35 @@ Every row carries a `position_id` and `position_type`. Equity rows use the ticke
 `reporting/metrics.py` computes generic dashboard diagnostics such as Sharpe,
 drawdown, profit factor, win rate, and average win/loss from a supplied P&L
 series. These metrics do not issue a live-readiness verdict.
+
+**Dashboard information architecture (`dashboard.py`):**
+
+The Streamlit dashboard is a read-only operator surface divided by task rather
+than by data source:
+
+| Page | Responsibility |
+|---|---|
+| Overview | Bot/session status, attention items, exposure, compact account curve, largest positions, market summary, and latest activity |
+| Positions & Risk | Open holdings, exact lifecycle identity where available, sleeve usage, multi-leg economics, drawdown, pools, and sector exposure |
+| Strategies & Performance | Broker/account curve, realized performance, per-strategy statistics, Strategy Health & Edge, and configured watchlists |
+| Market Observatory | Market regime, sector conditions, leveraged-fund trend state, and explicitly labeled placeholders for pre-open and earnings-cluster observations |
+| Activity & Execution | Recent fills/events plus execution-quality and slippage provenance |
+
+Each page uses an independent Streamlit fragment cadence (30 seconds for the
+operator pages, 60 seconds for strategy evidence, and five minutes for market
+observation) instead of a process-wide sleep/rerun loop. Existing authoritative
+sources remain unchanged: broker reads provide current account/position truth,
+`engine_state.json` provides the last engine snapshot, SQLite provides durable
+trade/lifecycle evidence, and generated health reports provide advisory verdicts.
+The dashboard does not write to those sources and exposes no order, position,
+pause, or resume controls.
+
+Market Observatory is an ownership boundary, not a strategy-input boundary.
+Future pre-open or earnings-cluster collectors must fetch through `data/`,
+persist through `reporting/`, and expose immutable observation-time provenance.
+They must first operate prospectively and read-only. Wiring any observation into
+signal, risk, sizing, timing, or execution logic requires its own evidence and
+reviewed design. See `docs/dashboard_information_architecture.md`.
 
 The April-era portfolio-wide `scripts/gonogo.py` checker was removed in 2026-09.
 It paired raw buys and sells with a FIFO long-only model, mixed all strategies,

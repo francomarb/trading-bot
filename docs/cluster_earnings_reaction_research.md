@@ -360,12 +360,16 @@ The initial goal is data integrity and operational feasibility, not a return
 claim. At least one full earnings cycle is likely needed to expose timestamp,
 coverage, and classification problems.
 
-### Open action item — draft a dashboard observation section
+### Dashboard destination registered; observation contract remains open
 
-Draft, but do not yet implement, a read-only dashboard section for this
-phenomenon. Use the Q3 2026 earnings round in progress as of 2026-10-31 as the
-first bounded observation cohort, starting with the earliest recoverable core
-source event and continuing prospectively through the end of the round.
+The five-page dashboard now reserves an **Earnings Clusters** area within
+Market Observatory. It is deliberately a non-calculating placeholder: no event
+ledger, backfill, classification, candidate generation, or broker connectivity
+was added with the navigation redesign. The next deliverable remains the
+read-only observation contract below. Use the Q3 2026 earnings round in progress
+as of 2026-10-31 as the first bounded observation cohort, starting with the
+earliest recoverable core source event and continuing prospectively through the
+end of the round.
 
 The draft should specify:
 
