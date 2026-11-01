@@ -271,6 +271,7 @@ These are intentionally not active roadmap items unless promoted with fresh evid
 
 | Idea | Current Disposition |
 |---|---|
+| Cluster earnings reaction strategy | Research design captured in [`docs/cluster_earnings_reaction_research.md`](docs/cluster_earnings_reaction_research.md). Start, if prioritized, with a point-in-time chronological ledger and read-only scorecard for Mag 7 and registered AI-stalwart events. No engine integration, paper orders, or strategy activation is authorized. |
 | Bollinger Squeeze strategy | Implemented but parked; low backtest Sharpe and better suited to options/multi-timeframe overlays |
 | Blanket sector caps | Rejected for now; would paralyze tech/semis-heavy strategy universes |
 | VIX as primary regime detector | Superseded by ATR% floor audit; VIX remains useful for options context |
