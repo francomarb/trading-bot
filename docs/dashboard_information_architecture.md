@@ -55,8 +55,8 @@ contract.
 
 ### Pre-Open Pulse
 
-The intended initial universe is SPY, QQQ, XLK, and SOXX. Before collection is
-implemented, define:
+The initial universe is SPY, QQQ, XLK, and SOXX. The proposed versioned contract
+is documented in `docs/preopen_observation_contract.md`. It defines:
 
 - the exact observation timestamp and exchange calendar;
 - reference price (normally the prior regular-session close);
@@ -69,6 +69,9 @@ implemented, define:
 The paper-stage design may use free real-time IEX for the available-now view and
 delayed SIP for later consolidated enrichment. The UI must label those views and
 must never present IEX as consolidated SIP/NBBO truth.
+
+No collector or persistence implementation is authorized until that contract is
+reviewed and frozen.
 
 ### Earnings Clusters
 
@@ -84,9 +87,12 @@ When an observation contract is approved:
 1. acquire external market data through a focused module under `data/`;
 2. persist versioned, append-only observations through `reporting/` into a
    store separate from the trade ledger;
-3. add a composite wrapper around the engine's existing single `post_cycle_hook`
-   before scheduling another lightweight collector there, rather than replacing
-   `HealthReviewScheduler` or adding a second daemon; and
+3. use scheduling that can meet the contract's checkpoint deadlines without
+   blocking or depending on the duration of a full strategy scan. The engine's
+   existing `post_cycle_hook` is a single callback, not an assumed scheduler for
+   this work; if it is used, add a composite wrapper rather than replacing
+   `HealthReviewScheduler`. A separate lightweight process remains acceptable
+   if deadline tests show the cycle hook is insufficient; and
 4. have the dashboard read the persisted observation model, not call strategy
    code or infer historical state from current quotes.
 
