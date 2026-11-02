@@ -1,19 +1,21 @@
 """
-Read-only analytics dashboard (Phase 11.14).
+Read-only operator and analytics dashboard.
 
 Connects to trades.db and the engine state snapshot to visualize:
-  - Equity curve + rolling Sharpe
-  - Per-strategy performance (win rate, P&L, slippage)
-  - Active positions and sleeve allocation
-  - Recent trades table
+  - A concise operational overview
+  - Positions, sleeve allocation, and concentration risk
+  - Per-strategy performance and health evidence
+  - Read-only market observations
+  - Trade and execution-quality history
 
 Run with:
     bash start_dashboard.sh
     # or directly:
     streamlit run dashboard.py
 
-The dashboard is read-only — it never touches the engine or broker.
-It auto-refreshes every 30 seconds while the page is open.
+The dashboard is read-only: it never places orders or mutates engine state.
+Operational pages refresh independently so slow research panels do not force
+the whole application to rerun.
 """
 
 from __future__ import annotations
@@ -21,8 +23,8 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-import time
 from datetime import datetime, timezone, tzinfo
+from dataclasses import dataclass
 from pathlib import Path
 from collections import deque
 from typing import Any
@@ -38,6 +40,7 @@ from reporting.logger import (
     STOP_GAP_KINDS,
     is_execution_quality_measurement,
 )
+from strategies.health.edge import NEGATIVE_PERSISTENCE_WEEKS_REQUIRED
 from monitors.leveraged_trend import (
     Phase,
     TrendMonitorState,
@@ -674,6 +677,7 @@ def multi_leg_display_rows(
             "Distance %": (
                 distance_pct * 100.0 if distance_pct is not None else None
             ),
+            "Close State": "Closing" if pos.get("pending_close") else "Open",
             "Status": pos.get("status", ""),
         })
     return rows
@@ -1623,7 +1627,7 @@ def _render_health_and_edge_panel() -> None:
       3. data/health_state.json — the 3-week persistence file
 
     Per design §13: the silent-killer alarm gets a prominent banner
-    when any strategy has `negative_persistence_weeks >= 3` in the
+    when any strategy reaches the shared negative-persistence threshold in the
     state file. The full report content is rendered in an expander
     below so the operator can drill in without scroll-burying the
     summary.
@@ -1643,7 +1647,8 @@ def _render_health_and_edge_panel() -> None:
         (strategy_name, state)
         for strategy_name, state in (health_state or {}).items()
         if isinstance(state, dict)
-        and state.get("negative_weeks", 0) >= 3
+        and state.get("negative_weeks", 0)
+        >= NEGATIVE_PERSISTENCE_WEEKS_REQUIRED
     ]
     if killers:
         st.error(
@@ -1836,42 +1841,43 @@ def _render_report_card(
         st.markdown(body)
 
 
-def render_dashboard() -> None:
-    st.set_page_config(
-        page_title="Trading Bot Dashboard",
-        page_icon="📈",
-        layout="wide",
-    )
-    inject_styles()
-    st.markdown(
-        """
-        <div class="dashboard-title">Trading Bot Dashboard</div>
-        <div class="dashboard-subtitle">
-            Live operational view of the paper/live engine, strategy sleeves,
-            and realized trade history.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+@dataclass(frozen=True)
+class DashboardContext:
+    """Normalized, read-only inputs shared by dashboard pages."""
 
-    # ── Load data ────────────────────────────────────────────────────────
+    state: dict[str, Any]
+    display_state: dict[str, Any]
+    trades_df: pd.DataFrame
+    live_trading: bool
+    db_path: str
+    account_metrics: dict[str, Any]
+    account_warning: str | None
+    trades_load_error: str | None
+
+    @property
+    def equity(self) -> float:
+        return float(self.account_metrics["equity"])
+
+    @property
+    def regime(self) -> str | None:
+        return self.state.get("regime")
+
+    @property
+    def is_running(self) -> bool:
+        return bool(self.state.get("running", False))
+
+
+def _load_dashboard_context() -> DashboardContext:
+    """Load the current snapshot and enrich it with read-only broker state."""
     state = load_engine_state(settings.STATE_SNAPSHOT_PATH)
-    live_trading = state.get("live_trading", settings.LIVE_TRADING)
-    db_path = settings.TRADE_LOG_DB_LIVE if live_trading else settings.TRADE_LOG_DB_PAPER
+    live_trading = bool(state.get("live_trading", settings.LIVE_TRADING))
+    db_path = (
+        settings.TRADE_LOG_DB_LIVE
+        if live_trading
+        else settings.TRADE_LOG_DB_PAPER
+    )
     trades_df = load_trades(db_path)
     lifecycle_identities = load_open_lifecycle_identities(db_path)
-    trades_load_error = trades_df.attrs.get("load_error")
-
-    if trades_load_error:
-        st.error(trades_load_error)
-
-    # ── Header row ───────────────────────────────────────────────────────
-    env_label = "🔴 LIVE" if live_trading else "📄 PAPER"
-    is_running = state.get("running", False)
-    status_label = "🟢 Running" if is_running else "⚫ Offline"
-    regime = state.get("regime")
-    cycle_count = state.get("cycle_count", 0)
-    ts = state.get("timestamp", "—")
     broker_metrics = load_broker_account_metrics(
         live_trading=live_trading,
         session_start_equity=state.get("session_start_equity"),
@@ -1880,6 +1886,7 @@ def render_dashboard() -> None:
         state,
         broker_metrics=broker_metrics,
     )
+
     display_state = dict(state)
     broker_positions_detail = (
         broker_metrics.get("positions_detail")
@@ -1900,351 +1907,452 @@ def render_dashboard() -> None:
         state,
         broker_positions_detail=broker_positions_detail,
     )
-    equity = account_metrics["equity"]
-    daily_pnl = account_metrics["daily_pnl"]
-    session_pnl = account_metrics["session_pnl"]
-    previous_close = account_metrics["previous_close_equity"]
-
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
-    col1.metric("Status", status_label)
-    col2.metric("Mode", env_label)
-    col3.metric("Equity", f"${equity:,.2f}",
-                delta=format_delta_currency(account_metrics["equity_delta"]))
-    col4.metric("Daily P&L", f"${daily_pnl:+,.2f}",
-                delta=format_delta_currency(daily_pnl) if daily_pnl != 0 else None,
-                delta_color="normal")
-    col5.metric("Regime", f"{_regime_color(regime)} {regime or '—'}")
-    col6.metric("Cycles", cycle_count)
-
-    if ts != "—":
-        try:
-            last_update = datetime.fromisoformat(ts)
-            age_s = (datetime.now(timezone.utc) - last_update).total_seconds()
-            st.caption(
-                f"Last engine cycle: {format_local_timestamp(ts)} ({age_s:.0f}s ago)"
-            )
-        except Exception:
-            st.caption(f"Last engine cycle: {format_local_timestamp(ts)}")
-    elif not is_running:
-        st.info("Engine is offline. Showing historical data from trade database.")
-    st.caption(
-        "Account metrics source: "
-        + (
-            "live broker refresh"
-            if account_metrics["source"] == "broker"
-            else "engine snapshot fallback"
-        )
+    return DashboardContext(
+        state=state,
+        display_state=display_state,
+        trades_df=trades_df,
+        live_trading=live_trading,
+        db_path=str(db_path),
+        account_metrics=account_metrics,
+        account_warning=account_warning,
+        trades_load_error=trades_df.attrs.get("load_error"),
     )
-    if previous_close is None:
-        st.caption("Daily P&L fallback: previous close unavailable, showing session-based change.")
-    if account_warning:
-        st.caption(account_warning)
 
-    st.divider()
 
-    # ── Broker account curve ─────────────────────────────────────────────
-    broker_curve_period = st.segmented_control(
+def _render_page_title(title: str, subtitle: str) -> None:
+    st.markdown(
+        f"""
+        <div class="dashboard-title">{title}</div>
+        <div class="dashboard-subtitle">{subtitle}</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _snapshot_age_seconds(state: dict[str, Any]) -> float | None:
+    value = state.get("timestamp")
+    if not value:
+        return None
+    try:
+        observed = datetime.fromisoformat(str(value))
+        if observed.tzinfo is None:
+            observed = observed.replace(tzinfo=timezone.utc)
+        return max(
+            0.0,
+            (datetime.now(timezone.utc) - observed.astimezone(timezone.utc)).total_seconds(),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _render_status_strip(ctx: DashboardContext) -> None:
+    env_label = "🔴 LIVE" if ctx.live_trading else "📄 PAPER"
+    status_label = "🟢 Running" if ctx.is_running else "⚫ Offline"
+    metrics = ctx.account_metrics
+    daily_pnl = float(metrics["daily_pnl"])
+    columns = st.columns(6)
+    columns[0].metric("Status", status_label)
+    columns[1].metric("Mode", env_label)
+    columns[2].metric(
+        "Equity",
+        f"${ctx.equity:,.2f}",
+        delta=format_delta_currency(metrics["equity_delta"]),
+    )
+    columns[3].metric(
+        "Daily P&L",
+        f"${daily_pnl:+,.2f}",
+        delta=format_delta_currency(daily_pnl) if daily_pnl else None,
+        delta_color="normal",
+    )
+    columns[4].metric(
+        "Regime",
+        f"{_regime_color(ctx.regime)} {ctx.regime or '—'}",
+    )
+    columns[5].metric("Cycles", int(ctx.state.get("cycle_count", 0)))
+
+    timestamp = ctx.state.get("timestamp")
+    age = _snapshot_age_seconds(ctx.state)
+    if timestamp:
+        age_text = f" ({age:.0f}s ago)" if age is not None else ""
+        st.caption(
+            f"Last engine cycle: {format_local_timestamp(timestamp)}{age_text} · "
+            "Account source: "
+            + (
+                "broker refresh"
+                if metrics.get("source") == "broker"
+                else "engine snapshot fallback"
+            )
+        )
+    elif not ctx.is_running:
+        st.info("Engine is offline. Historical trade data remains available.")
+
+    if metrics.get("previous_close_equity") is None:
+        st.caption(
+            "Daily P&L fallback: previous close unavailable; showing session change."
+        )
+    if ctx.account_warning:
+        st.caption(ctx.account_warning)
+
+
+def _open_position_rows(ctx: DashboardContext) -> list[dict[str, Any]]:
+    positions_detail = ctx.display_state.get("positions_detail") or {}
+    open_positions = ctx.display_state.get("open_positions") or {}
+    rows: list[dict[str, Any]] = []
+    for symbol, strategy in open_positions.items():
+        if strategy == "credit_spread":
+            continue
+        detail = positions_detail.get(symbol, {})
+        entry = detail.get("avg_entry_price")
+        qty = detail.get("qty")
+        cost_basis = detail.get("cost_basis")
+        if cost_basis is None and qty is not None and entry is not None:
+            cost_basis = float(qty) * float(entry)
+        unrealized_pnl = detail.get("unrealized_pnl")
+        unrealized_pct = (
+            float(unrealized_pnl) / float(cost_basis) * 100.0
+            if unrealized_pnl is not None and cost_basis not in (None, 0)
+            else None
+        )
+        rows.append({
+            "Symbol": symbol_url(symbol),
+            "Strategy": strategy,
+            "Lifecycle ID": detail.get("position_uid") or "—",
+            "Qty": qty,
+            "Entry": entry,
+            "Cost Basis": cost_basis,
+            "Unrealized P&L": unrealized_pnl,
+            "Unrealized %": unrealized_pct,
+        })
+    return rows
+
+
+def _render_position_table(rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        st.info("No equity or single-leg positions open.")
+        return
+    st.dataframe(
+        pd.DataFrame(rows),
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Symbol": st.column_config.LinkColumn(
+                "Symbol",
+                display_text=r"https://finance\.yahoo\.com/quote/([^/]+)/",
+            ),
+            "Lifecycle ID": st.column_config.TextColumn(
+                help="Durable read-only position identity used by operator tooling."
+            ),
+            "Qty": st.column_config.NumberColumn(format="%.2f"),
+            "Entry": st.column_config.NumberColumn(format="$%.2f"),
+            "Cost Basis": st.column_config.NumberColumn(format="$%.2f"),
+            "Unrealized P&L": st.column_config.NumberColumn(format="$%.2f"),
+            "Unrealized %": st.column_config.NumberColumn(format="%.2f%%"),
+        },
+    )
+
+
+def _render_broker_curve(ctx: DashboardContext, *, compact: bool = False) -> None:
+    period = st.segmented_control(
         "Broker curve window",
         options=["1W", "1M", "3M"],
         default="1M",
-        key="broker_account_curve_period",
+        key="overview_broker_curve_period" if compact else "broker_curve_period",
     )
-    broker_curve = load_broker_account_curve(
-        live_trading,
-        broker_curve_period or "1M",
-    )
-    broker_curve_error = broker_curve.attrs.get("load_error")
-    render_section_header(
-        "Broker Account Curve",
-        "Broker-reported account equity, including unrealized P&L.",
-        kicker="Performance",
-    )
-    if broker_curve.empty:
+    curve = load_broker_account_curve(ctx.live_trading, period or "1M")
+    error = curve.attrs.get("load_error")
+    if curve.empty:
         st.info("Broker account curve unavailable right now.")
-        if broker_curve_error:
-            st.caption(broker_curve_error)
-    else:
-        start_equity = float(broker_curve["equity"].iloc[0])
-        end_equity = float(broker_curve["equity"].iloc[-1])
-        line_color = "#00b09b" if end_equity >= start_equity else "#ff4b4b"
-        fill_color = (
-            "rgba(0,176,155,0.15)"
-            if end_equity >= start_equity else "rgba(255,75,75,0.15)"
-        )
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=broker_curve["timestamp"],
-            y=broker_curve["equity"],
-            mode="lines",
-            name="Account Equity",
-            line=dict(color=line_color, width=2),
-            fill="tozeroy",
-            fillcolor=fill_color,
-            hovertemplate="<b>%{x|%Y-%m-%d}</b><br>Equity: $%{y:,.2f}<extra></extra>",
-        ))
-        fig.update_layout(
-            xaxis_title=None,
-            yaxis_title="Equity ($)",
-            height=300,
-            margin=dict(l=0, r=0, t=10, b=0),
-            showlegend=False,
-            plot_bgcolor="rgba(0,0,0,0)",
-            paper_bgcolor="rgba(0,0,0,0)",
-            xaxis=dict(gridcolor="rgba(255,255,255,0.05)"),
-            yaxis=dict(gridcolor="rgba(255,255,255,0.05)"),
-        )
-        st.plotly_chart(fig, width="stretch")
-        if broker_curve_error:
-            st.caption(broker_curve_error)
-
-    st.divider()
-
-    # ── Equity curve + rolling Sharpe ────────────────────────────────────
-    equity_curve = compute_equity_curve(trades_df)
-    realized_curve_period = st.segmented_control(
-        "Realized curve window",
-        options=["1W", "1M", "All"],
-        default="All",
-        key="realized_curve_period",
+        if error:
+            st.caption(error)
+        return
+    start_equity = float(curve["equity"].iloc[0])
+    end_equity = float(curve["equity"].iloc[-1])
+    positive = end_equity >= start_equity
+    line_color = "#00b09b" if positive else "#ff4b4b"
+    fill_color = "rgba(0,176,155,0.15)" if positive else "rgba(255,75,75,0.15)"
+    figure = go.Figure()
+    figure.add_trace(go.Scatter(
+        x=curve["timestamp"],
+        y=curve["equity"],
+        mode="lines",
+        line=dict(color=line_color, width=2),
+        fill="tozeroy",
+        fillcolor=fill_color,
+        hovertemplate="<b>%{x|%Y-%m-%d}</b><br>Equity: $%{y:,.2f}<extra></extra>",
+    ))
+    figure.update_layout(
+        height=230 if compact else 300,
+        margin=dict(l=0, r=0, t=10, b=0),
+        showlegend=False,
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        xaxis=dict(gridcolor="rgba(255,255,255,0.05)"),
+        yaxis=dict(title="Equity ($)", gridcolor="rgba(255,255,255,0.05)"),
     )
-    displayed_equity_curve = filter_realized_curve_window(
-        equity_curve,
-        realized_curve_period or "All",
-    )
+    st.plotly_chart(figure, width="stretch")
+    if error:
+        st.caption(error)
 
-    left, right = st.columns([2, 1])
 
-    with left:
-        render_section_header(
-            "Equity Curve (Realized)",
-            "Realized cumulative P&L from closed trades only.",
-            kicker="Performance",
-        )
-        if displayed_equity_curve.empty:
-            st.info("No closed trades yet.")
-        else:
-            final_pnl = displayed_equity_curve["cumulative_pnl"].iloc[-1]
-            line_color = "#00b09b" if final_pnl >= 0 else "#ff4b4b"
-            fill_color = "rgba(0,176,155,0.15)" if final_pnl >= 0 else "rgba(255,75,75,0.15)"
-            fig = go.Figure()
-            # Zero reference line
-            fig.add_hline(y=0, line_color="rgba(255,255,255,0.2)", line_width=1)
-            fig.add_trace(go.Scatter(
-                x=displayed_equity_curve["timestamp"],
-                y=displayed_equity_curve["cumulative_pnl"],
-                mode="lines",
-                name="Cumulative P&L",
-                line=dict(color=line_color, width=2),
-                fill="tozeroy",
-                fillcolor=fill_color,
-                hovertemplate="<b>%{x|%Y-%m-%d}</b><br>P&L: $%{y:,.2f}<extra></extra>",
+def _attention_items(ctx: DashboardContext) -> list[tuple[str, str]]:
+    items: list[tuple[str, str]] = []
+    if not ctx.is_running:
+        items.append(("warning", "Engine is offline."))
+    age = _snapshot_age_seconds(ctx.state)
+    stale_after = max(60.0, float(settings.ENGINE_CYCLE_INTERVAL_SECONDS) * 3.0)
+    if age is None:
+        items.append(("warning", "No valid engine snapshot timestamp is available."))
+    elif age > stale_after:
+        items.append(("error", f"Engine snapshot is stale ({age / 60:.1f} minutes old)."))
+    if ctx.trades_load_error:
+        items.append(("error", ctx.trades_load_error))
+    if ctx.account_warning:
+        items.append(("warning", ctx.account_warning))
+    health_state = _load_health_state() or {}
+    for strategy, state in sorted(health_state.items()):
+        if (
+            isinstance(state, dict)
+            and int(state.get("negative_weeks", 0))
+            >= NEGATIVE_PERSISTENCE_WEEKS_REQUIRED
+        ):
+            items.append((
+                "error",
+                f"{strategy}: {state.get('negative_weeks')} consecutive negative-signal weeks.",
             ))
-            fig.update_layout(
-                xaxis_title=None,
-                yaxis_title="P&L ($)",
-                height=300,
-                margin=dict(l=0, r=0, t=10, b=0),
-                showlegend=False,
-                plot_bgcolor="rgba(0,0,0,0)",
-                paper_bgcolor="rgba(0,0,0,0)",
-                xaxis=dict(gridcolor="rgba(255,255,255,0.05)"),
-                yaxis=dict(gridcolor="rgba(255,255,255,0.05)"),
-            )
-            st.plotly_chart(fig, width="stretch")
+    return items
 
+
+def _render_attention(ctx: DashboardContext) -> None:
+    render_section_header(
+        "Needs Attention",
+        "Operational and evidence conditions that may require operator review.",
+        kicker="Now",
+    )
+    items = _attention_items(ctx)
+    if not items:
+        st.success("No dashboard-visible critical conditions.")
+        return
+    for level, message in items:
+        if level == "error":
+            st.error(message)
+        else:
+            st.warning(message)
+
+
+def _render_recent_trades(ctx: DashboardContext, *, limit: int = 20) -> None:
+    if ctx.trades_df.empty:
+        st.info("No trades in the selected database yet.")
+        return
+    recent_rows = ctx.trades_df.tail(limit).copy()
+    recent_rows["Measurement Note"] = recent_rows.apply(
+        slippage_measurement_note,
+        axis=1,
+    )
+    recent_rows["P&L"] = recent_rows.apply(recent_trade_realized_pnl, axis=1)
+    columns = [
+        "timestamp", "symbol", "side", "qty", "avg_fill_price", "P&L",
+        "strategy", "reason", "slippage_signed_bps",
+        "slippage_benchmark_kind", "slippage_measurement_quality",
+        "Measurement Note",
+    ]
+    recent = recent_rows[[c for c in columns if c in recent_rows.columns]].copy()
+    if "timestamp" in recent:
+        recent["timestamp"] = recent["timestamp"].map(format_local_timestamp)
+    if "avg_fill_price" in recent:
+        recent["avg_fill_price"] = recent["avg_fill_price"].map(
+            lambda value: f"${value:,.2f}" if pd.notna(value) else "—"
+        )
+    if "P&L" in recent:
+        recent["P&L"] = recent["P&L"].map(
+            lambda value: f"${value:+,.2f}" if pd.notna(value) else "—"
+        )
+    if "slippage_signed_bps" in recent:
+        recent["slippage_signed_bps"] = recent["slippage_signed_bps"].map(
+            lambda value: f"{value:,.1f}" if pd.notna(value) else "—"
+        )
+    for column in ("slippage_benchmark_kind", "slippage_measurement_quality"):
+        if column in recent:
+            recent[column] = recent[column].map(
+                lambda value: value if value is not None and pd.notna(value) else "—"
+            )
+    recent = recent.rename(columns={
+        "timestamp": "Timestamp",
+        "symbol": "Symbol",
+        "side": "Side",
+        "qty": "Qty",
+        "avg_fill_price": "Avg Fill Price",
+        "strategy": "Strategy",
+        "reason": "Reason",
+        "slippage_signed_bps": "Slippage Bps",
+        "slippage_benchmark_kind": "Benchmark Kind",
+        "slippage_measurement_quality": "Quality",
+    })
+    if "Symbol" in recent:
+        recent["Symbol"] = recent["Symbol"].map(symbol_url)
+    st.dataframe(
+        recent[::-1],
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Symbol": st.column_config.LinkColumn(
+                "Symbol",
+                display_text=r"https://finance\.yahoo\.com/quote/([^/]+)/",
+            ),
+        },
+    )
+
+
+def _summarize_unrealized_pnl(
+    single_leg_rows: list[dict[str, Any]],
+    multi_leg_rows: list[dict[str, Any]],
+) -> tuple[float | None, int]:
+    """Return the known unrealized total and count of unavailable marks."""
+    values = [row.get("Unrealized P&L") for row in single_leg_rows]
+    values.extend(row.get("Net Spread P&L") for row in multi_leg_rows)
+    known = [float(value) for value in values if value is not None and pd.notna(value)]
+    missing = len(values) - len(known)
+    if not values:
+        return 0.0, 0
+    return (sum(known) if known else None), missing
+
+
+@st.fragment(run_every="30s")
+def _render_overview_page() -> None:
+    ctx = _load_dashboard_context()
+    _render_page_title(
+        "Trading Bot Overview",
+        "Immediate operational state, exposure, market context, and items requiring attention.",
+    )
+    _render_status_strip(ctx)
+    st.divider()
+    left, right = st.columns([1, 1])
+    with left:
+        _render_attention(ctx)
     with right:
         render_section_header(
-            "Performance Metrics",
-            "Computed from realized trade outcomes in the trade log.",
+            "Current Exposure",
+            "Open-position count and current unrealized result.",
+            kicker="Now",
+        )
+        position_rows = _open_position_rows(ctx)
+        multi_leg_rows = multi_leg_display_rows(
+            ctx.display_state.get("multi_leg_positions") or []
+        )
+        unrealized, missing_marks = _summarize_unrealized_pnl(
+            position_rows,
+            multi_leg_rows,
+        )
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Single-leg", len(position_rows))
+        c2.metric("Multi-leg", len(multi_leg_rows))
+        c3.metric(
+            "Unrealized P&L",
+            "—" if unrealized is None else f"${unrealized:+,.2f}",
+        )
+        if missing_marks:
+            st.caption(
+                f"Unrealized total is partial: {missing_marks} open position "
+                f"mark{'s are' if missing_marks != 1 else ' is'} unavailable."
+            )
+        sector_counts = {
+            key: len(value) if isinstance(value, list) else int(value)
+            for key, value in (ctx.state.get("sector_exposure") or {}).items()
+        }
+        if sector_counts:
+            largest_sector, count = max(sector_counts.items(), key=lambda item: item[1])
+            st.caption(
+                f"Largest held sector: {largest_sector.replace('_', ' ').title()} "
+                f"({count} position{'s' if count != 1 else ''})."
+            )
+
+    st.divider()
+    curve_col, positions_col = st.columns([3, 2])
+    with curve_col:
+        render_section_header(
+            "Account Equity",
+            "Broker-reported equity including unrealized P&L.",
             kicker="Performance",
         )
-        pnl_events = realized_trade_events(trades_df)
-        pnl_list = [event["pnl"] for event in pnl_events]
-        sample_size = len(pnl_list)
-        if not pnl_list:
-            st.info("No realized close events yet.")
-        elif sample_size < 5:
-            st.warning(
-                f"Insufficient realized sample for meaningful metrics "
-                f"({sample_size} event{'s' if sample_size != 1 else ''})."
-            )
+        _render_broker_curve(ctx, compact=True)
+    with positions_col:
+        render_section_header(
+            "Largest Open Positions",
+            "Highest absolute unrealized P&L among current single-leg positions.",
+            kicker="Exposure",
+        )
+        rows = sorted(
+            _open_position_rows(ctx),
+            key=lambda row: abs(float(row["Unrealized P&L"] or 0.0)),
+            reverse=True,
+        )[:5]
+        _render_position_table(rows)
+
+    st.divider()
+    market_col, activity_col = st.columns(2)
+    with market_col:
+        render_section_header(
+            "Market Context",
+            "Existing observational state; detailed tools live in Market Observatory.",
+            kicker="Observe",
+        )
+        sector_heat = ctx.state.get("sector_heat") or {}
+        if not sector_heat:
+            st.info("Sector-heat snapshot unavailable.")
         else:
-            from reporting.metrics import compute_metrics
-            m = compute_metrics(pnl_list)
-            st.metric("Sharpe (annualized)", f"{m.sharpe_ratio:.2f}")
-            st.metric("Max Drawdown", f"{m.max_drawdown_pct:.1%}")
-            st.metric("Profit Factor", f"{m.profit_factor:.2f}")
-            st.metric("Win Rate", f"{m.win_rate:.1%}")
-            st.metric("Avg W/L Ratio", f"{m.avg_win_loss_ratio:.2f}")
-
-    st.divider()
-
-    # ── Strategy health ───────────────────────────────────────────────────
-    render_section_header(
-        "Strategy Realized P&L",
-        "Closed-trade summary by strategy using realized P&L and slippage.",
-        kicker="Strategy Realized P&L",
-    )
-    strategy_stats = compute_strategy_stats(trades_df)
-    if strategy_stats.empty:
-        st.info("No trades recorded yet.")
-    else:
-        display = strategy_stats.copy()
-        display = display.rename(columns={
-            "strategy": "Strategy",
-            "trades": "Trades",
-            "wins": "Wins",
-            "win_rate": "Win Rate",
-            "total_pnl": "Total P&L",
-            "avg_adverse_slippage_bps": "Avg Adverse Slippage Bps",
-            "stop_gap_dollars": "Stop-Gap $",
-        })
-        display["Win Rate"] = display["Win Rate"] * 100.0
-        st.dataframe(
-            display,
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "Trades": st.column_config.NumberColumn(format="%d"),
-                "Wins": st.column_config.NumberColumn(format="%d"),
-                "Win Rate": st.column_config.NumberColumn(format="%.1f%%"),
-                "Total P&L": st.column_config.NumberColumn(format="$%.2f"),
-                # NaN renders as an empty cell rather than "0.0 bps" —
-                # a strategy with no execution-quality measurement must
-                # not look like it has flawless execution. See
-                # `compute_strategy_stats`.
-                "Avg Adverse Slippage Bps": st.column_config.NumberColumn(
-                    format="%.1f bps",
-                ),
-                "Stop-Gap $": st.column_config.NumberColumn(format="$%.0f"),
-            },
-        )
-        # The `help=` tooltip on the column above does NOT render: Streamlit
-        # draws stDataFrame to a canvas, and the help text never reaches the
-        # DOM (verified on a fresh process — absent from innerHTML, from
-        # every element attribute, and after hovering the header). A blank
-        # cell on its own is ambiguous — it reads as easily as "the
-        # dashboard is broken" as it does "no measurement exists" — so the
-        # explanation has to go somewhere that always renders.
-        if display["Avg Adverse Slippage Bps"].isna().any():
-            blank = display.loc[
-                display["Avg Adverse Slippage Bps"].isna(), "Strategy"
-            ].tolist()
-            st.caption(
-                "Blank slippage — no execution-quality measurement exists "
-                f"for: {', '.join(blank)}. This is **not** zero slippage. "
-                "The column averages arrival-midpoint and combo-limit "
-                "benchmarks only; stop-gap erosion (`active_stop_price`) "
-                "and prior-close (`fallback_latest_close`) rows measure "
-                "something else and are excluded by design. Per-fill "
-                "values with their benchmark and quality tags are in "
-                "Recent Trades below."
-            )
+            counts = sector_heat.get("counts") or {}
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Hot", int(counts.get("hot", 0)))
+            c2.metric("Neutral", int(counts.get("neutral", 0)))
+            c3.metric("Cold", int(counts.get("cold", 0)))
         st.caption(
-            "**Stop-Gap $** — how far past its trigger a protective stop "
-            "actually filled, in dollars: loss taken *beyond* the planned "
-            "risk. A large value means the market gapped through the "
-            "level, **not** that execution was poor, so it is reported "
-            "and never alarmed. Blank means the strategy places no stops "
-            "at all — credit spreads are defined-risk. Deliberately "
-            "separate from the slippage column: different question, "
-            "different family. See PLAN 11.49."
+            "Pre-open SPY/QQQ/XLK/SOXX observation is intentionally not active yet; "
+            "the evidence contract will be implemented separately."
         )
+    with activity_col:
+        render_section_header(
+            "Latest Activity",
+            "Five most recent trade-log records.",
+            kicker="Audit Trail",
+        )
+        _render_recent_trades(ctx, limit=5)
 
+
+@st.fragment(run_every="30s")
+def _render_positions_page() -> None:
+    ctx = _load_dashboard_context()
+    _render_page_title(
+        "Positions & Risk",
+        "Current economic exposure, sleeve capacity, capital pools, and concentration.",
+    )
+    _render_status_strip(ctx)
+    if ctx.trades_load_error:
+        st.error(ctx.trades_load_error)
     st.divider()
-
-    # ── Strategy Health & Edge Monitor (PLAN 11.10g) ─────────────────────
-    _render_health_and_edge_panel()
-
-    st.divider()
-
-    # ── Active positions + sleeve allocation ────────────────────────────
     pos_col, sleeve_col = st.columns(2)
-
     with pos_col:
         render_section_header(
             "Open Positions",
-            "Current owned positions from the latest engine snapshot.",
+            "Current equity and single-leg positions from the latest snapshot.",
             kicker="Exposure",
         )
-        positions_detail = display_state.get("positions_detail") or {}
-        open_positions = display_state.get("open_positions") or {}
-        if not open_positions:
-            st.info("No open positions." if is_running else "Engine offline.")
-        else:
-            pos_data = []
-            for sym, strat in open_positions.items():
-                # Credit spreads are keyed by UUID, not a tradable symbol —
-                # they render in their own "Open Credit Spreads" section.
-                if strat == "credit_spread":
-                    continue
-                detail = positions_detail.get(sym, {})
-                entry = detail.get("avg_entry_price")
-                upnl = detail.get("unrealized_pnl")
-                qty = detail.get("qty")
-                cost_basis = detail.get("cost_basis")
-                if cost_basis is None and qty is not None and entry is not None:
-                    cost_basis = qty * entry
-                unrealized_pct = (
-                    (upnl / cost_basis) if (upnl is not None and cost_basis not in (None, 0))
-                    else None
-                )
-                pos_data.append({
-                    "Symbol": symbol_url(sym),
-                    "Strategy": strat,
-                    "Lifecycle ID": detail.get("position_uid") or "—",
-                    "Qty": qty,
-                    "Entry": entry,
-                    "Cost Basis": cost_basis,
-                    "Unrealized P&L": upnl,
-                    "Unrealized %": (
-                        unrealized_pct * 100.0
-                        if unrealized_pct is not None else None
-                    ),
-                })
-            if not pos_data:
-                # Every open position is a credit spread — shown below.
-                st.info("No equity / single-leg positions open.")
-            else:
-                st.dataframe(
-                    pd.DataFrame(pos_data),
-                    width="stretch",
-                    hide_index=True,
-                    column_config={
-                        "Symbol": st.column_config.LinkColumn(
-                            "Symbol",
-                            display_text=r"https://finance\.yahoo\.com/quote/([^/]+)/",
-                        ),
-                        "Lifecycle ID": st.column_config.TextColumn(
-                            "Lifecycle ID",
-                            help=(
-                                "Durable read-only position identity used by "
-                                "the operator CLI."
-                            ),
-                        ),
-                        "Qty": st.column_config.NumberColumn(format="%.2f"),
-                        "Entry": st.column_config.NumberColumn(format="$%.2f"),
-                        "Cost Basis": st.column_config.NumberColumn(format="$%.2f"),
-                        "Unrealized P&L": st.column_config.NumberColumn(format="$%.2f"),
-                        "Unrealized %": st.column_config.NumberColumn(format="%.2f%%"),
-                    },
-                )
-
+        _render_position_table(_open_position_rows(ctx))
     with sleeve_col:
         render_section_header(
             "Sleeve Usage",
-            "Configured sleeve budgets against current open-position notional.",
-            kicker="Exposure",
+            "Configured budgets against current and pending notional.",
+            kicker="Risk",
         )
         sleeve_df = compute_sleeve_usage(
-            display_state,
-            equity=equity,
+            ctx.display_state,
+            equity=ctx.equity,
             allocations=settings.STRATEGY_ALLOCATIONS,
             total_gross_pct=settings.MAX_GROSS_EXPOSURE_PCT,
         )
-        if not sleeve_df.empty:
+        if sleeve_df.empty:
+            st.info("Sleeve allocation snapshot unavailable.")
+        else:
             display = sleeve_df.copy()
-            display["Utilization"] = display["Utilization"] * 100.0
+            display["Utilization"] *= 100.0
             display["Open Positions"] = display.apply(
                 lambda row: f"{row['Open Positions']}/{row['Hard Max Positions']}",
                 axis=1,
@@ -2257,91 +2365,26 @@ def render_dashboard() -> None:
                 column_config={
                     "Target Budget": st.column_config.NumberColumn(format="$%.2f"),
                     "Effective Budget": st.column_config.NumberColumn(format="$%.2f"),
-                    "Stretch Headroom": st.column_config.NumberColumn(
-                        format="$%.2f",
-                        help="Extra sleeve capacity temporarily granted by stretch logic.",
-                    ),
+                    "Stretch Headroom": st.column_config.NumberColumn(format="$%.2f"),
                     "Used Notional": st.column_config.NumberColumn(format="$%.2f"),
                     "Remaining": st.column_config.NumberColumn(format="$%.2f"),
                     "Max Position Notional": st.column_config.NumberColumn(format="$%.2f"),
                     "Utilization": st.column_config.ProgressColumn(
-                        "Utilization",
-                        help="Current sleeve notional usage vs configured budget.",
-                        format="%.0f%%",
-                        min_value=0.0,
-                        max_value=100.0,
-                    ),
-                },
-            )
-            st.caption(
-                "Uses allocator snapshot data when available, including stretched "
-                "budget and pending-order-aware usage."
-            )
-
-        drawdown_df = compute_sleeve_drawdown_state(state)
-        if not drawdown_df.empty:
-            render_section_header(
-                "Observed Sleeve Drawdown",
-                "Normal HWM-threshold breaches are shown even when paper mode does not block entries.",
-                kicker="Paper Watch",
-            )
-            st.dataframe(
-                drawdown_df,
-                width="stretch",
-                hide_index=True,
-                column_config={
-                    "Drawdown": st.column_config.NumberColumn(format="$%.2f"),
-                    "Threshold": st.column_config.NumberColumn(format="%.1f%%"),
-                },
-            )
-
-        pool_df = pd.DataFrame.from_dict(
-            display_state.get("capital_pools") or {}, orient="index"
-        )
-        if not pool_df.empty:
-            pool_df = pool_df.reset_index().rename(columns={"index": "Pool"})
-            pool_df["Utilization"] = pool_df["utilization"] * 100.0
-            pool_df = pool_df.rename(columns={
-                "target_budget": "Target Budget",
-                "used": "Used",
-                "available": "Available",
-                "pending_entry_notional": "Pending Entry Notional",
-            })
-            st.caption("Capital Pools")
-            st.dataframe(
-                pool_df[[
-                    "Pool", "Target Budget", "Used", "Available",
-                    "Pending Entry Notional", "Utilization",
-                ]],
-                width="stretch",
-                hide_index=True,
-                column_config={
-                    "Target Budget": st.column_config.NumberColumn(format="$%.2f"),
-                    "Used": st.column_config.NumberColumn(format="$%.2f"),
-                    "Available": st.column_config.NumberColumn(format="$%.2f"),
-                    "Pending Entry Notional": st.column_config.NumberColumn(format="$%.2f"),
-                    "Utilization": st.column_config.ProgressColumn(
-                        "Utilization",
-                        format="%.0f%%",
-                        min_value=0.0,
-                        max_value=100.0,
+                        format="%.0f%%", min_value=0.0, max_value=100.0
                     ),
                 },
             )
 
-    st.divider()
-
-    # ── Open Multi-Leg Positions (11.39) ────────────────────────────────
-    multi_leg_positions = display_state.get("multi_leg_positions") or []
+    multi_leg_positions = ctx.display_state.get("multi_leg_positions") or []
     if multi_leg_positions:
+        st.divider()
         render_section_header(
             "Open Multi-Leg Positions",
-            "Reusable live P/L and risk view for option structures.",
+            "Primary economic view for option structures, keyed by durable position identity.",
             kicker="Options",
         )
-        rows = multi_leg_display_rows(multi_leg_positions)
         st.dataframe(
-            pd.DataFrame(rows),
+            pd.DataFrame(multi_leg_display_rows(multi_leg_positions)),
             width="stretch",
             hide_index=True,
             column_config={
@@ -2358,351 +2401,489 @@ def render_dashboard() -> None:
                 "Distance %": st.column_config.NumberColumn(format="%.2f%%"),
             },
         )
-        st.caption(
-            "Uses dashboard broker refresh when available; otherwise falls back "
-            "to the engine's latest multi-leg snapshot."
-        )
-        st.divider()
 
-    # ── Open Credit Spreads (11.29) ─────────────────────────────────────
-    # Multi-leg positions are keyed by position_id, not a tradable symbol,
-    # so they get their own table sourced from the engine's `credit_spreads`
-    # snapshot field rather than the equity Open Positions table above.
-    credit_spreads = state.get("credit_spreads") or []
-    if credit_spreads:
+    st.divider()
+    drawdown_col, pool_col = st.columns(2)
+    with drawdown_col:
         render_section_header(
-            "Open Credit Spreads",
-            "Bull put credit spreads currently open, from the latest engine snapshot.",
-            kicker="Options",
+            "Observed Sleeve Drawdown",
+            "HWM-threshold observations, including non-blocking paper breaches.",
+            kicker="Risk",
         )
-        spread_rows = []
-        for sp in credit_spreads:
-            net_credit = sp.get("net_credit") or 0.0
-            width = sp.get("width") or 0.0
-            qty = sp.get("qty") or 1
-            max_loss = max(0.0, (width - net_credit) * 100.0 * qty)
-            spread_rows.append({
-                "Underlying": sp.get("underlying", ""),
-                "Strikes": f"{sp.get('short_strike', 0):.0f} / {sp.get('long_strike', 0):.0f}",
-                "Expiration": sp.get("expiration", ""),
-                "Width": width,
-                "Qty": qty,
-                "Net Credit": net_credit * 100.0 * qty,
-                "Max Loss": max_loss,
-                "Status": "Closing" if sp.get("pending_close") else "Open",
+        drawdown_df = compute_sleeve_drawdown_state(ctx.state)
+        if drawdown_df.empty:
+            st.info("No sleeve drawdown observations available.")
+        else:
+            st.dataframe(
+                drawdown_df,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Drawdown": st.column_config.NumberColumn(format="$%.2f"),
+                    "Threshold": st.column_config.NumberColumn(format="%.1f%%"),
+                },
+            )
+    with pool_col:
+        render_section_header(
+            "Capital Pools",
+            "Pool-level target, use, availability, and pending exposure.",
+            kicker="Risk",
+        )
+        pool_df = pd.DataFrame.from_dict(
+            ctx.display_state.get("capital_pools") or {},
+            orient="index",
+        )
+        if pool_df.empty:
+            st.info("Capital-pool snapshot unavailable.")
+        else:
+            pool_df = pool_df.reset_index().rename(columns={"index": "Pool"})
+            pool_df["Utilization"] = pool_df["utilization"] * 100.0
+            pool_df = pool_df.rename(columns={
+                "target_budget": "Target Budget",
+                "used": "Used",
+                "available": "Available",
+                "pending_entry_notional": "Pending Entry Notional",
             })
-        st.dataframe(
-            pd.DataFrame(spread_rows),
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "Width": st.column_config.NumberColumn(format="$%.0f"),
-                "Qty": st.column_config.NumberColumn(format="%d"),
-                "Net Credit": st.column_config.NumberColumn(
-                    format="$%.2f", help="Total credit collected at open."
-                ),
-                "Max Loss": st.column_config.NumberColumn(
-                    format="$%.2f", help="Defined-risk max loss = (width − credit) × 100 × qty."
-                ),
-            },
-        )
-        st.divider()
+            st.dataframe(
+                pool_df[[
+                    "Pool", "Target Budget", "Used", "Available",
+                    "Pending Entry Notional", "Utilization",
+                ]],
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Target Budget": st.column_config.NumberColumn(format="$%.2f"),
+                    "Used": st.column_config.NumberColumn(format="$%.2f"),
+                    "Available": st.column_config.NumberColumn(format="$%.2f"),
+                    "Pending Entry Notional": st.column_config.NumberColumn(format="$%.2f"),
+                    "Utilization": st.column_config.ProgressColumn(
+                        format="%.0f%%", min_value=0.0, max_value=100.0
+                    ),
+                },
+            )
 
-    # ── Open Position Sector Exposure (11.7 Part B) ─────────────────────
-    # Live observability — open positions per resolved GICS sector with
-    # symbol + owning-strategy detail. No auto-block; operator-facing only.
-    sector_exposure = state.get("sector_exposure") or {}
+    sector_exposure = ctx.state.get("sector_exposure") or {}
     if sector_exposure:
+        st.divider()
         render_section_header(
             "Open Position Sector Exposure",
-            "Live held positions grouped by resolved sector — symbols and owning strategies. Observability only.",
+            "Held positions grouped by resolved sector; observability only.",
             kicker="Concentration",
         )
-        exposure_rows = []
+        rows = []
         for sector, items in sorted(
-            sector_exposure.items(), key=lambda kv: (-len(kv[1]), kv[0])
+            sector_exposure.items(),
+            key=lambda item: (-(len(item[1]) if isinstance(item[1], list) else int(item[1])), item[0]),
         ):
-            # items may be a list[dict{symbol, strategy}] (current shape) or
-            # an int (legacy). Defend against both so a stale snapshot does
-            # not break the dashboard during a rolling deploy.
             if isinstance(items, int):
-                exposure_rows.append({
-                    "Sector": sector.replace("_", " ").title(),
-                    "Positions": int(items),
-                    "Symbols": "",
-                    "Strategies": "",
-                })
+                rows.append({"Sector": sector.replace("_", " ").title(), "Positions": items, "Symbols": "", "Strategies": ""})
                 continue
-            symbols = sorted({i["symbol"] for i in items})
-            strategies = sorted({i["strategy"] for i in items})
-            exposure_rows.append({
+            rows.append({
                 "Sector": sector.replace("_", " ").title(),
                 "Positions": len(items),
-                "Symbols": ", ".join(symbols),
-                "Strategies": ", ".join(strategies),
+                "Symbols": ", ".join(sorted({item["symbol"] for item in items})),
+                "Strategies": ", ".join(sorted({item["strategy"] for item in items})),
             })
-        st.dataframe(
-            pd.DataFrame(exposure_rows),
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "Positions": st.column_config.NumberColumn(format="%d"),
-            },
-        )
-        st.divider()
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
-    # ── Leveraged fund trend monitor ────────────────────────────────────
-    _render_leveraged_trend_panel()
-    st.divider()
 
-    # ── Sector heat ─────────────────────────────────────────────────────
-    sector_heat = state.get("sector_heat") or {}
-    if sector_heat:
-        left_col, right_col = st.columns([2, 1])
-        with left_col:
-            render_section_header(
-                "Sector Heat",
-                "Session-level sector momentum snapshot from the bot. Not recomputed on dashboard refresh.",
-                kicker="Context",
-            )
-            counts = sector_heat.get("counts") or {}
-            c1, c2, c3 = st.columns(3)
-            c1.metric("HOT Sectors", int(counts.get("hot", 0)))
-            c2.metric("Neutral Sectors", int(counts.get("neutral", 0)))
-            c3.metric("Cold Sectors", int(counts.get("cold", 0)))
-
-            sectors = sector_heat.get("sectors") or {}
-            if sectors:
-                sector_rows = []
-                for sector, detail in sectors.items():
-                    sector_rows.append({
-                        "Sector": sector.replace("_", " ").title(),
-                        "ETF": detail.get("etf_ticker"),
-                        "Score": detail.get("score"),
-                        "Status": _sector_class_badge(detail.get("classification")),
-                        "Last Close": detail.get("last_close"),
-                        "> SMA200": detail.get("above_sma200"),
-                        "> SMA50": detail.get("above_sma50"),
-                        "Golden Cross": detail.get("golden_cross"),
-                        "Dist SMA50": (
-                            float(detail["dist_sma50_pct"]) * 100.0
-                            if detail.get("dist_sma50_pct") is not None else None
-                        ),
-                        "Vol Confirm": detail.get("vol_confirm"),
-                    })
-                st.dataframe(
-                    pd.DataFrame(sector_rows).sort_values(["Score", "Sector"], ascending=[False, True]),
-                    width="stretch",
-                    hide_index=True,
-                    column_config={
-                        "Score": st.column_config.NumberColumn(format="%.1f"),
-                        "Last Close": st.column_config.NumberColumn(format="$%.2f"),
-                        "> SMA200": st.column_config.CheckboxColumn(),
-                        "> SMA50": st.column_config.CheckboxColumn(),
-                        "Golden Cross": st.column_config.CheckboxColumn(),
-                        "Dist SMA50": st.column_config.NumberColumn(format="%.1f%%"),
-                        "Vol Confirm": st.column_config.CheckboxColumn(),
-                    },
-                )
-            generated_at = sector_heat.get("generated_at")
-            if generated_at:
-                st.caption(f"Sector heat snapshot generated: {generated_at}")
-
-        with right_col:
-            render_section_header(
-                "Sector Exposure",
-                "Watched symbols grouped by resolved sector. Useful for spotting cold-cluster exposure.",
-                kicker="Context",
-            )
-            symbol_map = sector_heat.get("symbol_map") or {}
-            if symbol_map:
-                exposure_rows = []
-                for sector, items in sorted(symbol_map.items()):
-                    detail = (sector_heat.get("sectors") or {}).get(sector, {})
-                    by_symbol: dict[str, set[str]] = {}
-                    for item in items:
-                        by_symbol.setdefault(str(item["symbol"]), set()).add(str(item["strategy"]))
-                    symbols = ", ".join(sorted(by_symbol))
-                    strategies = ", ".join(
-                        sorted({strategy for strategy_set in by_symbol.values() for strategy in strategy_set})
-                    )
-                    exposure_rows.append({
-                        "Sector": sector.replace("_", " ").title(),
-                        "Status": _sector_class_badge(detail.get("classification")),
-                        "Symbols": symbols,
-                        "Strategies": strategies,
-                    })
-                st.dataframe(
-                    pd.DataFrame(exposure_rows),
-                    width="stretch",
-                    hide_index=True,
-                )
-            unmapped = sector_heat.get("unmapped") or []
-            if unmapped:
-                st.caption(
-                    "Unmapped symbols: "
-                    + ", ".join(sorted({item["symbol"] for item in unmapped}))
-                )
-
-        st.divider()
-
-    # ── Watchlists ───────────────────────────────────────────────────────
-    render_section_header(
-        "Active Watchlists",
-        "Per-strategy universes with live regime gating and last-trade context.",
-        kicker="Universe",
+def _render_strategy_stats(ctx: DashboardContext) -> None:
+    stats = compute_strategy_stats(ctx.trades_df)
+    if stats.empty:
+        st.info("No trades recorded yet.")
+        return
+    display = stats.rename(columns={
+        "strategy": "Strategy",
+        "trades": "Trades",
+        "wins": "Wins",
+        "win_rate": "Win Rate",
+        "total_pnl": "Total P&L",
+        "avg_adverse_slippage_bps": "Avg Adverse Slippage Bps",
+        "stop_gap_dollars": "Stop-Gap $",
+    }).copy()
+    display["Win Rate"] *= 100.0
+    st.dataframe(
+        display,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Trades": st.column_config.NumberColumn(format="%d"),
+            "Wins": st.column_config.NumberColumn(format="%d"),
+            "Win Rate": st.column_config.NumberColumn(format="%.1f%%"),
+            "Total P&L": st.column_config.NumberColumn(format="$%.2f"),
+            "Avg Adverse Slippage Bps": st.column_config.NumberColumn(format="%.1f bps"),
+            "Stop-Gap $": st.column_config.NumberColumn(format="$%.0f"),
+        },
     )
-    strategy_watchlists = settings.STRATEGY_WATCHLISTS
-    strategy_allowed_regimes = settings.STRATEGY_ALLOWED_REGIMES
-    open_positions = state.get("open_positions") or {}
-    watchlist_statuses = state.get("watchlist_statuses") or {}
-    watchlist_reasons = state.get("watchlist_reasons") or {}
+    if display["Avg Adverse Slippage Bps"].isna().any():
+        missing = display.loc[
+            display["Avg Adverse Slippage Bps"].isna(), "Strategy"
+        ].tolist()
+        st.caption(
+            "Blank slippage means no compatible execution-quality measurement, "
+            f"not zero slippage: {', '.join(missing)}."
+        )
+    st.caption(
+        "**Stop-Gap $** is loss beyond the planned protective-stop level when "
+        "the market gaps through it; a large value is not automatically poor "
+        "execution. Blank means the strategy does not place protective stops, "
+        "as with defined-risk credit spreads. It is intentionally separate "
+        "from execution-quality slippage."
+    )
 
+
+def _render_realized_performance(ctx: DashboardContext) -> None:
+    curve = compute_equity_curve(ctx.trades_df)
+    period = st.segmented_control(
+        "Realized curve window",
+        options=["1W", "1M", "All"],
+        default="All",
+        key="strategy_realized_curve_period",
+    )
+    displayed = filter_realized_curve_window(curve, period or "All")
+    left, right = st.columns([2, 1])
+    with left:
+        render_section_header(
+            "Equity Curve (Realized)",
+            "Cumulative realized P&L from closed economic outcomes.",
+            kicker="Performance",
+        )
+        if displayed.empty:
+            st.info("No closed trades yet.")
+        else:
+            final_pnl = float(displayed["cumulative_pnl"].iloc[-1])
+            positive = final_pnl >= 0
+            figure = go.Figure()
+            figure.add_hline(y=0, line_color="rgba(255,255,255,0.2)", line_width=1)
+            figure.add_trace(go.Scatter(
+                x=displayed["timestamp"],
+                y=displayed["cumulative_pnl"],
+                mode="lines",
+                line=dict(color="#00b09b" if positive else "#ff4b4b", width=2),
+                fill="tozeroy",
+                fillcolor="rgba(0,176,155,0.15)" if positive else "rgba(255,75,75,0.15)",
+                hovertemplate="<b>%{x|%Y-%m-%d}</b><br>P&L: $%{y:,.2f}<extra></extra>",
+            ))
+            figure.update_layout(
+                height=300,
+                margin=dict(l=0, r=0, t=10, b=0),
+                showlegend=False,
+                plot_bgcolor="rgba(0,0,0,0)",
+                paper_bgcolor="rgba(0,0,0,0)",
+                xaxis=dict(gridcolor="rgba(255,255,255,0.05)"),
+                yaxis=dict(title="P&L ($)", gridcolor="rgba(255,255,255,0.05)"),
+            )
+            st.plotly_chart(figure, width="stretch")
+    with right:
+        render_section_header(
+            "Realized Diagnostics",
+            "Generic diagnostics; not a strategy-graduation verdict.",
+            kicker="Performance",
+        )
+        pnl = [event["pnl"] for event in realized_trade_events(ctx.trades_df)]
+        if len(pnl) < 5:
+            st.warning(f"Insufficient realized sample ({len(pnl)} outcomes).")
+        else:
+            from reporting.metrics import compute_metrics
+            metrics = compute_metrics(pnl)
+            st.metric("Sharpe (annualized)", f"{metrics.sharpe_ratio:.2f}")
+            st.metric("Max Drawdown", f"{metrics.max_drawdown_pct:.1%}")
+            st.metric("Profit Factor", f"{metrics.profit_factor:.2f}")
+            st.metric("Win Rate", f"{metrics.win_rate:.1%}")
+            st.metric("Avg W/L Ratio", f"{metrics.avg_win_loss_ratio:.2f}")
+
+
+def _render_watchlists(ctx: DashboardContext) -> None:
+    strategy_watchlists = settings.STRATEGY_WATCHLISTS
     if not strategy_watchlists:
         st.info("No strategy watchlists configured.")
-    else:
-        tabs = st.tabs([s.replace("_", " ").title() for s in strategy_watchlists])
-        for tab, (strat_name, symbols) in zip(tabs, strategy_watchlists.items()):
-            with tab:
-                allowed = strategy_allowed_regimes.get(strat_name)
-                regime_ok = regime_gate_allows(regime, allowed)
-                gate_label = (
-                    "✅ Entries allowed" if regime_ok
-                    else ("🚫 Entries blocked" if regime_ok is False else "⚪ Market closed")
-                )
-                st.caption(
-                    f"Regime: {_regime_color(regime)} {regime or '—'}  |  Gate: {gate_label}  |  "
-                    f"{len(symbols)} symbols"
-                )
+        return
+    tabs = st.tabs([name.replace("_", " ").title() for name in strategy_watchlists])
+    open_positions = ctx.state.get("open_positions") or {}
+    statuses = ctx.state.get("watchlist_statuses") or {}
+    reasons_map = ctx.state.get("watchlist_reasons") or {}
+    for tab, (strategy, symbols) in zip(tabs, strategy_watchlists.items()):
+        with tab:
+            allowed = settings.STRATEGY_ALLOWED_REGIMES.get(strategy)
+            regime_ok = regime_gate_allows(ctx.regime, allowed)
+            gate = "✅ Entries allowed" if regime_ok else (
+                "🚫 Entries blocked" if regime_ok is False else "⚪ Regime unavailable"
+            )
+            st.caption(
+                f"Regime: {_regime_color(ctx.regime)} {ctx.regime or '—'} · "
+                f"Gate: {gate} · {len(symbols)} symbols"
+            )
+            strategy_trades = (
+                ctx.trades_df[ctx.trades_df["strategy"] == strategy]
+                if not ctx.trades_df.empty and "strategy" in ctx.trades_df
+                else pd.DataFrame()
+            )
+            last_trade: dict[str, dict[str, Any]] = {}
+            if not strategy_trades.empty:
+                for symbol, group in strategy_trades.groupby("symbol"):
+                    last = group.sort_values("timestamp").iloc[-1]
+                    last_trade[str(symbol)] = {
+                        "date": last["timestamp"].strftime("%Y-%m-%d") if pd.notna(last["timestamp"]) else "—",
+                        "side": last.get("side", ""),
+                        "price": last.get("avg_fill_price"),
+                    }
+            rows = []
+            for symbol in symbols:
+                status = watchlist_symbol_state(statuses, strategy, symbol)
+                if status is None:
+                    status = "Long" if open_positions.get(symbol) == strategy else "No Signal"
+                reasons = watchlist_symbol_state(reasons_map, strategy, symbol) or []
+                latest = last_trade.get(symbol, {})
+                price = latest.get("price")
+                rows.append({
+                    "Symbol": symbol_url(symbol),
+                    "Status": status,
+                    "Reason": "; ".join(reasons) if reasons else "—",
+                    "Last Trade": latest.get("date", "—"),
+                    "Last Side": str(latest.get("side") or "—").upper(),
+                    "Last Price": f"${float(price):,.2f}" if price else "—",
+                })
+            st.dataframe(
+                pd.DataFrame(rows),
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Symbol": st.column_config.LinkColumn(
+                        display_text=r"https://finance\.yahoo\.com/quote/([^/]+)/"
+                    )
+                },
+            )
 
-                # Last trade per symbol from the DB
-                strat_trades = (
-                    trades_df[trades_df["strategy"] == strat_name]
-                    if not trades_df.empty and "strategy" in trades_df.columns
-                    else pd.DataFrame()
-                )
-                last_trade: dict[str, dict] = {}
-                if not strat_trades.empty:
-                    for sym, grp in strat_trades.groupby("symbol"):
-                        last = grp.sort_values("timestamp").iloc[-1]
-                        last_trade[sym] = {
-                            "date": last["timestamp"].strftime("%Y-%m-%d") if pd.notna(last["timestamp"]) else "—",
-                            "side": last.get("side", ""),
-                            "price": last.get("avg_fill_price"),
-                        }
 
-                rows = []
-                for sym in symbols:
-                    status = watchlist_symbol_state(watchlist_statuses, strat_name, sym)
-                    if status is None:
-                        is_open = sym in open_positions and open_positions[sym] == strat_name
-                        status = "Long" if is_open else "No Signal"
-                    reasons = watchlist_symbol_state(watchlist_reasons, strat_name, sym) or []
-                    lt = last_trade.get(sym, {})
-                    price = lt.get("price")
-                    rows.append({
-                        "Symbol": symbol_url(sym),
-                        "Status": status,
-                        "Reason": "; ".join(reasons) if reasons else "—",
-                        "Last Trade": lt.get("date", "—"),
-                        "Last Side": lt.get("side", "—").upper() if lt.get("side") else "—",
-                        "Last Price": f"${float(price):,.2f}" if price else "—",
-                    })
-
-                st.dataframe(
-                    pd.DataFrame(rows),
-                    width="stretch",
-                    hide_index=True,
-                    column_config={
-                        "Symbol": st.column_config.LinkColumn(
-                            "Symbol",
-                            display_text=r"https://finance\.yahoo\.com/quote/([^/]+)/",
-                        ),
-                    },
-                )
-
-    st.divider()
-
-    # ── Recent trades ────────────────────────────────────────────────────
-    render_section_header(
-        "Recent Trades",
-        "Most recent fills from the selected trade database.",
-        kicker="Audit Trail",
+@st.fragment(run_every="60s")
+def _render_strategies_page() -> None:
+    ctx = _load_dashboard_context()
+    _render_page_title(
+        "Strategies & Performance",
+        "Performance diagnostics, strategy evidence, health reports, and active universes.",
     )
-    if trades_df.empty:
-        st.info("No trades in the database yet.")
-    else:
-        # Phase 2 slippage unification: surface the benchmark + quality
-        # tags alongside the bps value so the operator can audit which
-        # measurement context each slippage number came from
-        # (arrival_midpoint vs active_stop_price vs limit_price vs
-        # unavailable; primary vs fallback vs recovered).
-        recent_rows = trades_df.tail(20).copy()
-        recent_rows["Measurement Note"] = recent_rows.apply(
-            slippage_measurement_note, axis=1
-        )
-        recent_rows["P&L"] = recent_rows.apply(
-            recent_trade_realized_pnl, axis=1
-        )
-        display_cols = [
-            "timestamp", "symbol", "side", "qty", "avg_fill_price",
-            "P&L", "strategy", "reason",
-            "slippage_signed_bps",
-            "slippage_benchmark_kind",
-            "slippage_measurement_quality",
-            "Measurement Note",
-        ]
-        available = [c for c in display_cols if c in recent_rows.columns]
-        recent = recent_rows[available].copy()
-        if "timestamp" in recent.columns:
-            recent["timestamp"] = recent["timestamp"].map(format_local_timestamp)
-        if "avg_fill_price" in recent.columns:
-            recent["avg_fill_price"] = recent["avg_fill_price"].map(
-                lambda x: f"${x:,.2f}" if pd.notna(x) else "—"
-            )
-        if "P&L" in recent.columns:
-            recent["P&L"] = recent["P&L"].map(
-                lambda x: f"${x:+,.2f}" if pd.notna(x) else "—"
-            )
-        if "slippage_signed_bps" in recent.columns:
-            recent["slippage_signed_bps"] = recent["slippage_signed_bps"].map(
-                lambda x: f"{x:,.1f}" if pd.notna(x) else "—"
-            )
-        for col in ("slippage_benchmark_kind", "slippage_measurement_quality"):
-            if col in recent.columns:
-                recent[col] = recent[col].map(
-                    lambda x: x if (x is not None and pd.notna(x)) else "—"
-                )
-        recent = recent.rename(columns={
-            "timestamp": "Timestamp",
-            "symbol": "Symbol",
-            "side": "Side",
-            "qty": "Qty",
-            "avg_fill_price": "Avg Fill Price",
-            "strategy": "Strategy",
-            "reason": "Reason",
-            "slippage_signed_bps": "Slippage Bps",
-            "slippage_benchmark_kind": "Benchmark Kind",
-            "slippage_measurement_quality": "Quality",
+    _render_status_strip(ctx)
+    if ctx.trades_load_error:
+        st.error(ctx.trades_load_error)
+    st.divider()
+    render_section_header(
+        "Broker Account Curve",
+        "Account equity including unrealized P&L.",
+        kicker="Performance",
+    )
+    _render_broker_curve(ctx)
+    st.divider()
+    _render_realized_performance(ctx)
+    st.divider()
+    render_section_header(
+        "Strategy Realized P&L",
+        "Closed-outcome summary with execution-quality and stop-gap diagnostics.",
+        kicker="Strategies",
+    )
+    _render_strategy_stats(ctx)
+    st.divider()
+    _render_health_and_edge_panel()
+    st.divider()
+    render_section_header(
+        "Active Watchlists",
+        "Per-strategy universes with regime gating and latest-trade context.",
+        kicker="Universe",
+    )
+    _render_watchlists(ctx)
+
+
+def _render_sector_heat(ctx: DashboardContext) -> None:
+    sector_heat = ctx.state.get("sector_heat") or {}
+    if not sector_heat:
+        st.info("Sector-heat snapshot unavailable.")
+        return
+    counts = sector_heat.get("counts") or {}
+    c1, c2, c3 = st.columns(3)
+    c1.metric("HOT Sectors", int(counts.get("hot", 0)))
+    c2.metric("Neutral Sectors", int(counts.get("neutral", 0)))
+    c3.metric("COLD Sectors", int(counts.get("cold", 0)))
+    sectors = sector_heat.get("sectors") or {}
+    rows = []
+    for sector, detail in sectors.items():
+        rows.append({
+            "Sector": sector.replace("_", " ").title(),
+            "ETF": detail.get("etf_ticker"),
+            "Score": detail.get("score"),
+            "Status": _sector_class_badge(detail.get("classification")),
+            "Last Close": detail.get("last_close"),
+            "> SMA200": detail.get("above_sma200"),
+            "> SMA50": detail.get("above_sma50"),
+            "Golden Cross": detail.get("golden_cross"),
+            "Dist SMA50": (
+                float(detail["dist_sma50_pct"]) * 100.0
+                if detail.get("dist_sma50_pct") is not None
+                else None
+            ),
+            "Vol Confirm": detail.get("vol_confirm"),
         })
-        if "Symbol" in recent.columns:
-            recent["Symbol"] = recent["Symbol"].map(symbol_url)
+    if rows:
         st.dataframe(
-            recent[::-1],
+            pd.DataFrame(rows).sort_values(["Score", "Sector"], ascending=[False, True]),
             width="stretch",
             hide_index=True,
             column_config={
-                "Symbol": st.column_config.LinkColumn(
-                    "Symbol",
-                    display_text=r"https://finance\.yahoo\.com/quote/([^/]+)/",
-                ),
+                "Score": st.column_config.NumberColumn(format="%.1f"),
+                "Last Close": st.column_config.NumberColumn(format="$%.2f"),
+                "> SMA200": st.column_config.CheckboxColumn(),
+                "> SMA50": st.column_config.CheckboxColumn(),
+                "Golden Cross": st.column_config.CheckboxColumn(),
+                "Dist SMA50": st.column_config.NumberColumn(format="%.1f%%"),
+                "Vol Confirm": st.column_config.CheckboxColumn(),
             },
         )
+    if sector_heat.get("generated_at"):
+        st.caption(
+            "Session-stable snapshot generated: "
+            f"{format_local_timestamp(sector_heat['generated_at'])}"
+        )
 
-    # ── Auto-refresh ──────────────────────────────────────────────────────
-    st.caption("Dashboard auto-refreshes every 30 seconds.")
-    time.sleep(30)
-    st.rerun()
+    symbol_map = sector_heat.get("symbol_map") or {}
+    unmapped = sector_heat.get("unmapped") or []
+    if symbol_map or unmapped:
+        render_section_header(
+            "Watched Symbols by Sector",
+            "Configured universes grouped by resolved sector and current heat state.",
+            kicker="Coverage",
+        )
+    if symbol_map:
+        exposure_rows = []
+        for sector, items in sorted(symbol_map.items()):
+            detail = (sector_heat.get("sectors") or {}).get(sector, {})
+            by_symbol: dict[str, set[str]] = {}
+            for item in items:
+                by_symbol.setdefault(str(item["symbol"]), set()).add(
+                    str(item["strategy"])
+                )
+            exposure_rows.append({
+                "Sector": sector.replace("_", " ").title(),
+                "Status": _sector_class_badge(detail.get("classification")),
+                "Symbols": ", ".join(sorted(by_symbol)),
+                "Strategies": ", ".join(sorted({
+                    strategy
+                    for strategy_set in by_symbol.values()
+                    for strategy in strategy_set
+                })),
+            })
+        st.dataframe(pd.DataFrame(exposure_rows), width="stretch", hide_index=True)
+    if unmapped:
+        st.caption(
+            "Unmapped symbols: "
+            + ", ".join(sorted({str(item["symbol"]) for item in unmapped}))
+        )
+
+
+@st.fragment(run_every="30s")
+def _render_market_page() -> None:
+    ctx = _load_dashboard_context()
+    _render_page_title(
+        "Market Observatory",
+        "Read-only market context. Observations are not strategy permissions or order controls.",
+    )
+    _render_status_strip(ctx)
+    st.divider()
+    render_section_header(
+        "Pre-Open Pulse",
+        "Planned observation set: SPY, QQQ, XLK, and SOXX.",
+        kicker="Research Foundation",
+    )
+    st.info(
+        "The pre-open evidence contract and append-only observation ledger are "
+        "the next workstream. No provisional value is displayed as a signal."
+    )
+    st.divider()
+    _render_leveraged_trend_panel()
+    st.divider()
+    render_section_header(
+        "Sector Heat",
+        "Session-level sector momentum context from the engine snapshot.",
+        kicker="Market Context",
+    )
+    _render_sector_heat(ctx)
+    st.divider()
+    render_section_header(
+        "Earnings Clusters",
+        "Parked observation-first research; no score or candidate ranking is active.",
+        kicker="Research Foundation",
+    )
+    st.info(
+        "The chronological event-ledger contract will be reviewed separately "
+        "before any dashboard calculation or backfill is implemented."
+    )
+
+
+@st.fragment(run_every="30s")
+def _render_activity_page() -> None:
+    ctx = _load_dashboard_context()
+    _render_page_title(
+        "Activity & Execution",
+        "Recent fills, realized outcomes, slippage provenance, and execution-quality context.",
+    )
+    _render_status_strip(ctx)
+    if ctx.trades_load_error:
+        st.error(ctx.trades_load_error)
+    st.divider()
+    render_section_header(
+        "Recent Trades",
+        "Most recent records from the selected paper or live trade database.",
+        kicker="Audit Trail",
+    )
+    _render_recent_trades(ctx, limit=50)
+    st.caption(
+        "Slippage values retain their benchmark kind and measurement quality; "
+        "blank values are unavailable rather than zero."
+    )
+
+
+def render_dashboard() -> None:
+    """Render the multipage, read-only operator dashboard."""
+    st.set_page_config(
+        page_title="Trading Bot Dashboard",
+        page_icon="📈",
+        layout="wide",
+    )
+    inject_styles()
+    page = st.navigation(
+        [
+            st.Page(
+                _render_overview_page,
+                title="Overview",
+                icon="🏠",
+                url_path="overview",
+                default=True,
+            ),
+            st.Page(
+                _render_positions_page,
+                title="Positions & Risk",
+                icon="🛡️",
+                url_path="positions-risk",
+            ),
+            st.Page(
+                _render_strategies_page,
+                title="Strategies & Performance",
+                icon="📈",
+                url_path="strategies-performance",
+            ),
+            st.Page(
+                _render_market_page,
+                title="Market Observatory",
+                icon="🔭",
+                url_path="market-observatory",
+            ),
+            st.Page(
+                _render_activity_page,
+                title="Activity & Execution",
+                icon="🧾",
+                url_path="activity-execution",
+            ),
+        ],
+        position="top",
+    )
+    page.run()
 
 
 if __name__ == "__main__":

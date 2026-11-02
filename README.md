@@ -14,7 +14,7 @@ A modular, strategy-agnostic algorithmic trading bot built in Python. Six strate
 | Backtesting | vectorbt |
 | Options Pricing | blackscholes (Black-Scholes Delta + price) |
 | Sector Data | yfinance (sector resolver, VIX) |
-| Dashboard | streamlit + plotly |
+| Dashboard | Streamlit + Plotly (five-page, read-only operator UI) |
 | Trade Log | SQLite (`data/trades.db` paper / `data/trades_live.db` live) |
 | Logging | loguru |
 
@@ -40,6 +40,11 @@ Engine (live loop) → Data Layer → Indicators + Strategies → Risk Manager �
 The engine runs multiple strategy slots, each with its own symbol universe. Risk and execution are shared across all slots, with an allocator that splits deployable capital into an 85% equity pool and a 15% isolated-options pool. Trades and operational evidence are recorded for later per-strategy graduation review.
 
 See [docs/architecture.md](docs/architecture.md) for the full architecture guide.
+
+The dashboard separates Overview, Positions & Risk, Strategies & Performance,
+Market Observatory, and Activity & Execution so operational status stays short
+while observational tools can grow without lengthening the first page. Market
+observations are informational only; they do not feed strategy decisions.
 
 ## Setup
 
