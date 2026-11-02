@@ -55,8 +55,9 @@ contract.
 
 ### Pre-Open Pulse
 
-The initial universe is SPY, QQQ, XLK, and SOXX. The proposed versioned contract
-is documented in `docs/preopen_observation_contract.md`. It defines:
+The initial configured universe is SPY, QQQ, XLK, and SOXX. The proposed
+versioned contract is documented in `docs/preopen_observation_contract.md` and
+keeps the collector reusable for additional US stocks and ETFs. It defines:
 
 - the exact observation timestamp and exchange calendar;
 - reference price (normally the prior regular-session close);
@@ -64,7 +65,9 @@ is documented in `docs/preopen_observation_contract.md`. It defines:
 - quote or trade timestamp, bid/ask/last semantics, and staleness;
 - missing/degraded states; and
 - an append-only observation identity that distinguishes an as-observed record
-  from any later delayed-SIP enrichment.
+  from any later delayed-SIP enrichment; and
+- a prospective `universe_version` so adding or removing monitored instruments
+  never rewrites historical coverage.
 
 The paper-stage design may use free real-time IEX for the available-now view and
 delayed SIP for later consolidated enrichment. The UI must label those views and

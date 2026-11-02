@@ -6,7 +6,7 @@ collection, persistence, or dashboard calculations.
 ## 1. Purpose and boundary
 
 Record a small, trustworthy description of the US equity market before the
-regular open for:
+regular open. The initial configured cohort is:
 
 - SPY — broad US large-cap market;
 - QQQ — Nasdaq-100 / growth-heavy market;
@@ -17,6 +17,39 @@ The first use is the read-only Market Observatory. This contract does not
 authorize a strategy filter, trade-timing rule, position hold, order delay,
 allocation change, or execution control. Promotion from observation to action
 requires a separate evidence review and design.
+
+### 1.1 Reusable universe contract
+
+The collector, calculations, persistence, and dashboard read model are
+symbol-agnostic for US-listed stocks and ETFs supported by Alpaca's stock-data
+API. SPY, QQQ, XLK, and SOXX are configuration, not branches in collection or
+calculation code.
+
+Each configured instrument has:
+
+| Field | Contract |
+|---|---|
+| `symbol` | Uppercase provider symbol; unique within the universe version |
+| `asset_type` | `stock` or `etf`; descriptive, not a calculation switch |
+| `observation_role` | Human-readable context such as `broad_market`, `technology`, `semiconductors`, or `single_name`; never a strategy permission |
+| `effective_from_session` | First exchange session for prospective collection |
+| `effective_through_session` | Optional final session; historical records remain readable |
+| `enabled` | Operational collection flag; changes take effect only at a session boundary |
+
+The ordered set of instrument specifications is identified by
+`universe_version`. Adding, removing, relabeling, or changing the effective
+dates of an instrument creates a new universe version. It does not require a
+new `contract_version` unless capture or calculation semantics change.
+
+Universe changes are prospective. Newly added symbols are not backfilled into
+the as-observed cohort, and removed symbols are never deleted from history.
+Coverage denominators use the universe version effective for that session.
+
+Symbol-specific freshness, gap, or quality thresholds are not allowed in the
+initial implementation. If a less-liquid stock produces stale, wide, or
+one-sided pre-market data, those are valid observations. Any later per-symbol
+policy requires evidence and a contract version change rather than a hidden
+exception.
 
 ## 2. Provider and feed contract
 
@@ -48,10 +81,10 @@ provenance.
 
 The preferred live acquisition is one multi-symbol stock snapshot request with
 `feed=iex`, providing independently timestamped latest quotes and trades for all
-four symbols. Missing symbols may receive one bounded same-feed retry within the
-checkpoint deadline; each row retains its actual receipt time and endpoint kind.
-There is no alternate-feed fallback that could silently change provenance
-inside one checkpoint.
+instruments in the active universe version. Missing symbols may receive one
+bounded same-feed retry within the checkpoint deadline; each row retains its
+actual receipt time and endpoint kind. There is no alternate-feed fallback that
+could silently change provenance inside one checkpoint.
 
 ## 3. Session and checkpoint contract
 
@@ -170,7 +203,7 @@ trading evidence.
 The logical key is:
 
 ```text
-contract_version | session_date | checkpoint | symbol | layer
+contract_version | universe_version | session_date | checkpoint | symbol | layer
 ```
 
 where `layer` is `as_observed`, `sip_enrichment`, or `late_research`. Each
@@ -183,9 +216,9 @@ Required fields:
 
 | Group | Fields |
 |---|---|
-| Identity | `observation_id`, `logical_key`, `contract_version`, `revision`, `supersedes_id`, `layer` |
+| Identity | `observation_id`, `logical_key`, `contract_version`, `universe_version`, `revision`, `supersedes_id`, `layer` |
 | Schedule | `session_date`, `checkpoint`, `scheduled_at`, `deadline_at`, `observed_at`, `received_at` |
-| Instrument | `symbol`, `currency` |
+| Instrument | `symbol`, `asset_type`, `observation_role`, `currency` |
 | Provenance | `provider`, `feed`, `endpoint_kind`, `is_consolidated`, `parent_observation_id` |
 | Quote | `quote_timestamp`, `bid_price`, `bid_size`, `bid_exchange`, `ask_price`, `ask_size`, `ask_exchange`, `quote_conditions`, `quote_tape` |
 | Trade | `trade_timestamp`, `trade_price`, `trade_size`, `trade_exchange`, `trade_conditions`, `trade_tape` |
@@ -228,9 +261,11 @@ own row. It is not retried indefinitely and cannot affect the trading cycle.
 
 ## 8. Complete-cohort and failure behavior
 
-Each valid session expects 12 base rows: four symbols × three checkpoints.
-Coverage is reported as completed base rows over 12, with complete, partial,
-missed, and unavailable counts. Enrichment coverage is reported separately.
+Each valid session expects three base rows per instrument active in that
+session's universe version. The initial four-instrument cohort therefore expects
+12 rows. Coverage is reported against the recorded session denominator, with
+complete, partial, missed, and unavailable counts. Enrichment coverage is
+reported separately.
 
 Missing records are first-class. A reconciliation pass may append a `missed`
 row after a deadline, but may not backfill the price and call it as-observed.
@@ -250,16 +285,17 @@ All collection and persistence failures are isolated from `TradingEngine`:
 Market Observatory initially shows:
 
 - session and checkpoint time;
-- SPY, QQQ, XLK, and SOXX mark and gap percentage;
+- every instrument in the session's configured universe, initially SPY, QQQ,
+  XLK, and SOXX, with mark and gap percentage;
 - mark kind, feed, quote/trade timestamp, age, and freshness;
 - bid/ask spread where valid;
 - IEX as-observed and SIP enrichment as distinct columns or views;
 - cohort coverage and explicit missed/unavailable reasons.
 
 The dashboard does not show recommendations, confidence in future returns,
-strategy permissions, or suggested actions. SPY/QQQ are broad-market context;
-XLK/SOXX are technology/semiconductor context. They are not combined into a
-single score in the observation phase.
+strategy permissions, or suggested actions. Interpretive labels come from
+`observation_role`, not symbol-specific UI branches. Instruments are not
+combined into a single score in the observation phase.
 
 ## 10. Implementation acceptance gates
 
@@ -269,6 +305,10 @@ collector PR must provide offline deterministic tests for:
 - session-relative checkpoint calculation, including DST and non-session days;
 - a scheduling path that demonstrably meets checkpoint deadlines without
   depending on the duration of a full strategy scan;
+- arbitrary stock and ETF symbols (for example AAPL and IWM), proving the core
+  has no SPY/QQQ/XLK/SOXX-specific branches;
+- universe-version validation, session-boundary changes, and historical
+  coverage denominators that do not change when the current universe changes;
 - checkpoint deadlines and explicit missed rows;
 - quote validity, midpoint/trade fallback, gap, spread, and age calculations;
 - split-adjusted reference semantics and missing references;
@@ -279,8 +319,9 @@ collector PR must provide offline deterministic tests for:
 - dashboard reads that never mutate the observation store.
 
 A manual paper check should then verify one complete market session, including
-the expected 12 base records and delayed enrichment coverage. No strategy
-integration is part of that check.
+the expected records for that session's frozen universe version (12 for the
+initial cohort) and delayed enrichment coverage. No strategy integration is
+part of that check.
 
 ### Existing-code boundaries
 
@@ -305,7 +346,9 @@ integration is part of that check.
 
 - streaming collection;
 - overnight/BOATS data;
-- more symbols or indexes;
+- activating additional US stocks or ETFs before reviewing initial-cohort data
+  quality (the collector remains designed to support them);
+- index values, options, crypto, non-US instruments, and non-equity sessions;
 - earnings-cluster observations;
 - alerts based on gap magnitude;
 - composite scores;
