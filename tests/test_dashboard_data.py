@@ -629,8 +629,19 @@ class TestRefreshMultiLegPositions:
             "Max Loss": 773.0,
             "Underlying Price": 740.67,
             "Distance": 36.67,
+            "Close State": "Open",
             "Status": "healthy",
         }]
+
+    def test_display_rows_surface_pending_close_separately_from_health(self):
+        rows = multi_leg_display_rows([{
+            "structure": "put_credit_spread",
+            "pending_close": True,
+            "status": "healthy",
+        }])
+
+        assert rows[0]["Close State"] == "Closing"
+        assert rows[0]["Status"] == "healthy"
 
 
 # ── compute_equity_curve ─────────────────────────────────────────────────────

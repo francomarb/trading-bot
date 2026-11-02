@@ -40,6 +40,7 @@ from reporting.logger import (
     STOP_GAP_KINDS,
     is_execution_quality_measurement,
 )
+from strategies.health.edge import NEGATIVE_PERSISTENCE_WEEKS_REQUIRED
 from monitors.leveraged_trend import (
     Phase,
     TrendMonitorState,
@@ -676,6 +677,7 @@ def multi_leg_display_rows(
             "Distance %": (
                 distance_pct * 100.0 if distance_pct is not None else None
             ),
+            "Close State": "Closing" if pos.get("pending_close") else "Open",
             "Status": pos.get("status", ""),
         })
     return rows
@@ -1625,7 +1627,7 @@ def _render_health_and_edge_panel() -> None:
       3. data/health_state.json — the 3-week persistence file
 
     Per design §13: the silent-killer alarm gets a prominent banner
-    when any strategy has `negative_persistence_weeks >= 3` in the
+    when any strategy reaches the shared negative-persistence threshold in the
     state file. The full report content is rendered in an expander
     below so the operator can drill in without scroll-burying the
     summary.
@@ -1645,7 +1647,8 @@ def _render_health_and_edge_panel() -> None:
         (strategy_name, state)
         for strategy_name, state in (health_state or {}).items()
         if isinstance(state, dict)
-        and state.get("negative_weeks", 0) >= 3
+        and state.get("negative_weeks", 0)
+        >= NEGATIVE_PERSISTENCE_WEEKS_REQUIRED
     ]
     if killers:
         st.error(
@@ -2107,7 +2110,11 @@ def _attention_items(ctx: DashboardContext) -> list[tuple[str, str]]:
         items.append(("warning", ctx.account_warning))
     health_state = _load_health_state() or {}
     for strategy, state in sorted(health_state.items()):
-        if isinstance(state, dict) and int(state.get("negative_weeks", 0)) >= 3:
+        if (
+            isinstance(state, dict)
+            and int(state.get("negative_weeks", 0))
+            >= NEGATIVE_PERSISTENCE_WEEKS_REQUIRED
+        ):
             items.append((
                 "error",
                 f"{strategy}: {state.get('negative_weeks')} consecutive negative-signal weeks.",
@@ -2195,6 +2202,20 @@ def _render_recent_trades(ctx: DashboardContext, *, limit: int = 20) -> None:
     )
 
 
+def _summarize_unrealized_pnl(
+    single_leg_rows: list[dict[str, Any]],
+    multi_leg_rows: list[dict[str, Any]],
+) -> tuple[float | None, int]:
+    """Return the known unrealized total and count of unavailable marks."""
+    values = [row.get("Unrealized P&L") for row in single_leg_rows]
+    values.extend(row.get("Net Spread P&L") for row in multi_leg_rows)
+    known = [float(value) for value in values if value is not None and pd.notna(value)]
+    missing = len(values) - len(known)
+    if not values:
+        return 0.0, 0
+    return (sum(known) if known else None), missing
+
+
 @st.fragment(run_every="30s")
 def _render_overview_page() -> None:
     ctx = _load_dashboard_context()
@@ -2217,17 +2238,22 @@ def _render_overview_page() -> None:
         multi_leg_rows = multi_leg_display_rows(
             ctx.display_state.get("multi_leg_positions") or []
         )
-        unrealized = sum(
-            float(row["Unrealized P&L"] or 0.0)
-            for row in position_rows
-        ) + sum(
-            float(row.get("Net Spread P&L") or 0.0)
-            for row in multi_leg_rows
+        unrealized, missing_marks = _summarize_unrealized_pnl(
+            position_rows,
+            multi_leg_rows,
         )
         c1, c2, c3 = st.columns(3)
         c1.metric("Single-leg", len(position_rows))
         c2.metric("Multi-leg", len(multi_leg_rows))
-        c3.metric("Unrealized P&L", f"${unrealized:+,.2f}")
+        c3.metric(
+            "Unrealized P&L",
+            "—" if unrealized is None else f"${unrealized:+,.2f}",
+        )
+        if missing_marks:
+            st.caption(
+                f"Unrealized total is partial: {missing_marks} open position "
+                f"mark{'s are' if missing_marks != 1 else ' is'} unavailable."
+            )
         sector_counts = {
             key: len(value) if isinstance(value, list) else int(value)
             for key, value in (ctx.state.get("sector_exposure") or {}).items()
@@ -2270,11 +2296,14 @@ def _render_overview_page() -> None:
             kicker="Observe",
         )
         sector_heat = ctx.state.get("sector_heat") or {}
-        counts = sector_heat.get("counts") or {}
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Hot", int(counts.get("hot", 0)))
-        c2.metric("Neutral", int(counts.get("neutral", 0)))
-        c3.metric("Cold", int(counts.get("cold", 0)))
+        if not sector_heat:
+            st.info("Sector-heat snapshot unavailable.")
+        else:
+            counts = sector_heat.get("counts") or {}
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Hot", int(counts.get("hot", 0)))
+            c2.metric("Neutral", int(counts.get("neutral", 0)))
+            c3.metric("Cold", int(counts.get("cold", 0)))
         st.caption(
             "Pre-open SPY/QQQ/XLK/SOXX observation is intentionally not active yet; "
             "the evidence contract will be implemented separately."
@@ -2494,6 +2523,13 @@ def _render_strategy_stats(ctx: DashboardContext) -> None:
             "Blank slippage means no compatible execution-quality measurement, "
             f"not zero slippage: {', '.join(missing)}."
         )
+    st.caption(
+        "**Stop-Gap $** is loss beyond the planned protective-stop level when "
+        "the market gaps through it; a large value is not automatically poor "
+        "execution. Blank means the strategy does not place protective stops, "
+        "as with defined-risk credit spreads. It is intentionally separate "
+        "from execution-quality slippage."
+    )
 
 
 def _render_realized_performance(ctx: DashboardContext) -> None:
@@ -2706,8 +2742,42 @@ def _render_sector_heat(ctx: DashboardContext) -> None:
             f"{format_local_timestamp(sector_heat['generated_at'])}"
         )
 
+    symbol_map = sector_heat.get("symbol_map") or {}
+    unmapped = sector_heat.get("unmapped") or []
+    if symbol_map or unmapped:
+        render_section_header(
+            "Watched Symbols by Sector",
+            "Configured universes grouped by resolved sector and current heat state.",
+            kicker="Coverage",
+        )
+    if symbol_map:
+        exposure_rows = []
+        for sector, items in sorted(symbol_map.items()):
+            detail = (sector_heat.get("sectors") or {}).get(sector, {})
+            by_symbol: dict[str, set[str]] = {}
+            for item in items:
+                by_symbol.setdefault(str(item["symbol"]), set()).add(
+                    str(item["strategy"])
+                )
+            exposure_rows.append({
+                "Sector": sector.replace("_", " ").title(),
+                "Status": _sector_class_badge(detail.get("classification")),
+                "Symbols": ", ".join(sorted(by_symbol)),
+                "Strategies": ", ".join(sorted({
+                    strategy
+                    for strategy_set in by_symbol.values()
+                    for strategy in strategy_set
+                })),
+            })
+        st.dataframe(pd.DataFrame(exposure_rows), width="stretch", hide_index=True)
+    if unmapped:
+        st.caption(
+            "Unmapped symbols: "
+            + ", ".join(sorted({str(item["symbol"]) for item in unmapped}))
+        )
 
-@st.fragment(run_every="5m")
+
+@st.fragment(run_every="30s")
 def _render_market_page() -> None:
     ctx = _load_dashboard_context()
     _render_page_title(
@@ -2779,14 +2849,39 @@ def render_dashboard() -> None:
     inject_styles()
     page = st.navigation(
         [
-            st.Page(_render_overview_page, title="Overview", icon="🏠", default=True),
-            st.Page(_render_positions_page, title="Positions & Risk", icon="🛡️"),
-            st.Page(_render_strategies_page, title="Strategies & Performance", icon="📈"),
-            st.Page(_render_market_page, title="Market Observatory", icon="🔭"),
-            st.Page(_render_activity_page, title="Activity & Execution", icon="🧾"),
+            st.Page(
+                _render_overview_page,
+                title="Overview",
+                icon="🏠",
+                url_path="overview",
+                default=True,
+            ),
+            st.Page(
+                _render_positions_page,
+                title="Positions & Risk",
+                icon="🛡️",
+                url_path="positions-risk",
+            ),
+            st.Page(
+                _render_strategies_page,
+                title="Strategies & Performance",
+                icon="📈",
+                url_path="strategies-performance",
+            ),
+            st.Page(
+                _render_market_page,
+                title="Market Observatory",
+                icon="🔭",
+                url_path="market-observatory",
+            ),
+            st.Page(
+                _render_activity_page,
+                title="Activity & Execution",
+                icon="🧾",
+                url_path="activity-execution",
+            ),
         ],
-        position="sidebar",
-        expanded=True,
+        position="top",
     )
     page.run()
 

@@ -11,6 +11,7 @@ from dashboard import (
     DashboardContext,
     _attention_items,
     _open_position_rows,
+    _summarize_unrealized_pnl,
     render_dashboard,
 )
 
@@ -71,12 +72,28 @@ class TestDashboardNavigation:
             "Activity & Execution",
         ]
         assert pages[0]["default"] is True
+        assert [page["url_path"] for page in pages] == [
+            "overview",
+            "positions-risk",
+            "strategies-performance",
+            "market-observatory",
+            "activity-execution",
+        ]
         nav.assert_called_once()
-        assert nav.call_args.kwargs == {"position": "sidebar", "expanded": True}
+        assert nav.call_args.kwargs == {"position": "top"}
         navigation.run.assert_called_once_with()
 
 
 class TestDashboardReadModels:
+    def test_unrealized_summary_discloses_missing_marks(self) -> None:
+        total, missing = _summarize_unrealized_pnl(
+            [{"Unrealized P&L": 12.5}, {"Unrealized P&L": None}],
+            [{"Net Spread P&L": -2.5}, {"Net Spread P&L": None}],
+        )
+
+        assert total == 10.0
+        assert missing == 2
+
     def test_open_position_rows_preserve_exact_lifecycle_identity(self) -> None:
         ctx = _context(display_state={
             "open_positions": {

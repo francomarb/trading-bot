@@ -721,8 +721,8 @@ than by data source:
 | Activity & Execution | Recent fills/events plus execution-quality and slippage provenance |
 
 Each page uses an independent Streamlit fragment cadence (30 seconds for the
-operator pages, 60 seconds for strategy evidence, and five minutes for market
-observation) instead of a process-wide sleep/rerun loop. Existing authoritative
+operator and market-observation pages and 60 seconds for strategy evidence)
+instead of a process-wide sleep/rerun loop. Existing authoritative
 sources remain unchanged: broker reads provide current account/position truth,
 `engine_state.json` provides the last engine snapshot, SQLite provides durable
 trade/lifecycle evidence, and generated health reports provide advisory verdicts.

@@ -33,10 +33,10 @@ of positions, P&L, or strategy state.
 | Paper/live SQLite trade log | Durable trade, lifecycle, and execution evidence | Position identity, realized performance, activity, slippage |
 | `data/health_reports/` | Generated advisory assessment | Strategy Health & Edge panel |
 
-Operator pages refresh every 30 seconds, strategy evidence every 60 seconds,
-and Market Observatory every five minutes. Existing function-level caches remain
-the guard against unnecessary broker or file reads. There is no global sleep and
-no whole-dashboard timed rerun.
+Operator and Market Observatory pages refresh every 30 seconds, while strategy
+evidence refreshes every 60 seconds. Existing function-level caches remain the
+guard against unnecessary broker or file reads, including slower market research
+loads. There is no global sleep and no whole-dashboard timed rerun.
 
 ## Market Observatory: current scope
 
@@ -84,8 +84,9 @@ When an observation contract is approved:
 1. acquire external market data through a focused module under `data/`;
 2. persist versioned, append-only observations through `reporting/` into a
    store separate from the trade ledger;
-3. schedule lightweight collection through the engine's existing composite
-   post-cycle hook initially, rather than adding a second daemon; and
+3. add a composite wrapper around the engine's existing single `post_cycle_hook`
+   before scheduling another lightweight collector there, rather than replacing
+   `HealthReviewScheduler` or adding a second daemon; and
 4. have the dashboard read the persisted observation model, not call strategy
    code or infer historical state from current quotes.
 
