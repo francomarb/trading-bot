@@ -231,19 +231,44 @@ deletes the original row.
 
 Collection attempts are not observation revisions. Store them in a separate
 append-only attempt relation keyed by the primary logical key and
-`attempt_number`. The scheduler makes at most one provider attempt per hook
-invocation and at most three attempts per logical key. A sleep or offline
-period consumes no attempt. A successful response or exhausted third attempt
-creates exactly one final revision-1 observation with `attempt_count`; a retry
-cannot be blocked by an earlier error observation. Corrections remain the only
-reason to create revision 2 or higher.
+`attempt_number`.
+
+One **collection round** is the counting unit. A round may use one multi-symbol
+quote request plus the batched or cached reference-close request needed to
+resolve all currently due keys. Every logical key included in that round gains
+one attempt, even though the provider calls are shared. The scheduler runs at
+most one collection round per hook invocation; it does not spend one invocation
+per symbol.
+
+Attempt outcomes are classified as follows:
+
+- transport/DNS/connection failures, connect or read timeouts, HTTP 408, HTTP
+  429, and HTTP 5xx are `transient_failure`;
+- authentication, authorization, or entitlement failures (normally HTTP
+  401/403) are non-retryable `entitlement_error`;
+- other provider HTTP 4xx request failures are non-retryable `provider_error`;
+- a successful response with no quote in the eligible window is the final data
+  outcome `unavailable`, not a provider failure; and
+- a local persistence lock/failure is not a provider attempt outcome. It is
+  logged, leaves the key pending, and is retried by a later hook.
+
+A transient failure leaves the observation pending. Retry delays after
+successive transient rounds are 5 minutes, 15 minutes, 1 hour, and then 6 hours
+between later rounds. `retry_deadline_at` is seven calendar days after the
+first actual provider attempt. The first hook on or after that deadline gets
+one final recovery round; only a transient failure in that round finalizes the
+revision-1 `provider_error`. A process that is not running makes no attempt, and
+if it resumes after the deadline it still receives that final recovery round.
+A success or non-retryable outcome finalizes exactly one revision-1 observation
+with `attempt_count`; an earlier attempt cannot block it. Corrections remain the
+only reason to create revision 2 or higher.
 
 Required finalized-observation fields:
 
 | Group | Fields |
 |---|---|
 | Identity | `observation_id`, `logical_key`, `contract_version`, `universe_version`, `revision`, `supersedes_id`, `layer` |
-| Schedule | `session_date`, `checkpoint`, `checkpoint_at`, `available_at`, `collected_at`, `collection_state` |
+| Schedule | `session_date`, `checkpoint`, `checkpoint_at`, `available_at`, `first_attempt_at`, `retry_deadline_at`, `collected_at`, `collection_state` |
 | Instrument | `symbol`, `asset_type`, `observation_role`, `currency` |
 | Provenance | `provider`, `feed`, `endpoint_kind`, `is_consolidated`, `attempt_count` |
 | Quote | `quote_timestamp`, `bid_price`, `bid_size`, `bid_exchange`, `ask_price`, `ask_size`, `ask_exchange`, `quote_conditions`, `quote_tape` |
@@ -252,11 +277,12 @@ Required finalized-observation fields:
 | Derived | `mark_kind`, `mark_price`, `spread_bps`, `gap_dollars`, `gap_pct`, `quote_age_seconds`, `freshness_state` |
 | Outcome | `observation_status`, `reason_code`, `diagnostic`, `created_at` |
 
-Each attempt records the logical key, attempt number, start/end time, provider,
-feed, endpoint, outcome, and a sanitized diagnostic. Prices and sizes use
-SQLite `REAL`; timestamps use UTC ISO-8601 text; conditions use canonical JSON
-arrays. Diagnostics are length-limited and must not contain credentials,
-request headers, or raw authenticated responses.
+Each attempt records the logical key, attempt number, round ID, start/end time,
+provider, feed, endpoint set, outcome classification, next eligible retry time,
+and a sanitized diagnostic. Prices and sizes use SQLite `REAL`; timestamps use
+UTC ISO-8601 text; conditions use canonical JSON arrays. Diagnostics are
+length-limited and must not contain credentials, request headers, or raw
+authenticated responses.
 
 Provider and market-value fields are nullable for `provider_error` and
 `entitlement_error` outcomes. Their absence is preserved as `NULL`, never a
@@ -269,20 +295,22 @@ non-negative sizes, monotonic attempt numbers, and `revision >= 1`.
 For every due checkpoint and instrument:
 
 1. wait until at least `available_at`;
-2. query historical SIP quotes over a five-minute lookback ending exactly at
-   `checkpoint_at`;
+2. query historical SIP quotes from 04:00 `America/New_York` on the session
+   date through exactly `checkpoint_at`;
 3. select the latest quote whose source timestamp is not later than
    `checkpoint_at`;
 4. calculate freshness against `checkpoint_at` and derive a midpoint only when
    the quote is valid;
 5. obtain the exact split-adjusted SIP reference close; and
-6. finalize one `sip_checkpoint` observation after success or attempt
-   exhaustion.
+6. finalize one `sip_checkpoint` observation after a data success,
+   non-retryable failure, or failed final recovery round.
 
 The query must not reach forward in time. A stale selected quote remains
-`partial` with `reason_code=stale_mark` and no gap. No quote in the lookback is
-`unavailable`. Entitlement and provider failures are finalized only after the
-capped attempt policy and cannot affect the trading cycle.
+`partial` with `reason_code=stale_mark` and no gap. No quote during that
+session's pre-market window is `unavailable`. The pre-market-session window
+makes stale observations reachable without carrying a previous evening's quote
+into the new session. Provider retries follow the classified recovery policy in
+section 6 and cannot affect the trading cycle.
 
 ## 8. Complete-cohort and failure behavior
 
@@ -311,8 +339,8 @@ The initial implementation should add the SIP collector to a composite
 `post_cycle_hook` that invokes the existing `HealthReviewScheduler` and then the
 observation scheduler. It must not replace or alter health-review scheduling.
 The observation scheduler performs only currently due work, makes at most one
-provider attempt per logical key per invocation, never sleeps in the hook, and
-returns normally on failure.
+multi-symbol collection round covering all eligible keys per invocation, never
+sleeps in the hook, and returns normally on failure.
 
 Historical SIP remains queryable after its entitlement delay, so this design
 does not depend on a scan completing inside a narrow live checkpoint window.
@@ -367,11 +395,14 @@ collector PR must provide offline deterministic tests for:
   changes, and historical denominators that do not change with current config;
 - eligibility delay and historical collection after a missed local runtime;
 - latest-at-or-before quote selection that never reaches past the checkpoint;
+- pre-market-session selection that can retain a stale same-session quote but
+  cannot carry a previous evening's quote forward;
 - quote validity, midpoint, spread, gap, and freshness calculations, including
   stale rows with no gap and no trade fallback;
 - split-adjusted reference semantics and missing references;
-- append-only attempts, capped retry, one final revision 1, correction
-  revisions, and idempotent restart behavior;
+- append-only per-key attempts from shared collection rounds, transient versus
+  non-retryable classification, backoff and final recovery deadline, one final
+  revision 1, correction revisions, and idempotent restart behavior;
 - complete, partial, unavailable, provider-error, and entitlement-error states;
 - composite-hook preservation of `HealthReviewScheduler`, bounded/no-sleep
   collector behavior, and failures that cannot raise into the engine; and
@@ -383,14 +414,17 @@ primary coverage, collection-timeliness labels, and zero strategy effects.
 
 ## 12. Evidence behind the feed decision
 
-A reviewer compared three recent sessions across SPY, QQQ, XLK, and SOXX at all
-three checkpoints. Historical SIP supplied a fresh eligible quote for all 36
-symbol/checkpoint cases, with the oldest 18 seconds at the checkpoint. IEX
-supplied 0 of 12 fresh quotes at 08:00, 4 of 12 at 09:00, and 3 of 12 at 09:25.
-Some IEX values were from the previous evening or roughly 64 hours old; gap
+A reviewer compared the 2026-10-29, 2026-10-30, and 2026-11-02 sessions across
+SPY, QQQ, XLK, and SOXX at all three checkpoints. Historical SIP supplied a
+fresh eligible quote for all 36 symbol/checkpoint cases, with the oldest 18
+seconds at the checkpoint. IEX supplied 0 of 12 fresh quotes at 08:00, 4 of 12
+at 09:00, and 3 of 12 at 09:25. At the 08:00 `open_minus_90m` checkpoint, some
+IEX values were from the previous evening or roughly 64 hours old; gap
 differences versus SIP had a median absolute difference around 0.9 percentage
-points, a maximum around 6.1 points, and disagreed in sign in 3 of 12 compared
-cases.
+points, a maximum around 6.1 points, and disagreed in sign in 3 of 12 cases.
+Later-checkpoint gap differences were materially smaller when IEX had usable
+data; freshness coverage, rather than a claim of uniformly large gap error,
+remains the reason SIP is primary.
 
 This is decision evidence, not a universal provider benchmark. Limitations:
 
