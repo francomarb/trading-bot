@@ -1,7 +1,7 @@
 # Dashboard Information Architecture
 
-**Status:** Phase 1 navigation and page ownership implemented. Market-observation
-collection contracts are deliberately deferred.
+**Status:** Phase 1 navigation and page ownership implemented. The pre-open
+observation contract is under review; collection remains deferred.
 
 ## Goal
 
@@ -63,15 +63,18 @@ keeps the collector reusable for additional US stocks and ETFs. It defines:
 - reference price (normally the prior regular-session close);
 - source/feed and entitlement provenance;
 - quote or trade timestamp, bid/ask/last semantics, and staleness;
-- missing/degraded states; and
-- an append-only observation identity that distinguishes an as-observed record
-  from any later delayed-SIP enrichment; and
+- missing/degraded states;
+- a delayed historical-SIP checkpoint record with separate checkpoint,
+  availability, and collection times;
 - a prospective `universe_version` so adding or removing monitored instruments
   never rewrites historical coverage.
 
-The paper-stage design may use free real-time IEX for the available-now view and
-delayed SIP for later consolidated enrichment. The UI must label those views and
-must never present IEX as consolidated SIP/NBBO truth.
+The paper-stage proposal uses delayed historical SIP as the sole primary source.
+It reconstructs a consolidated point-in-time checkpoint after the free-feed
+delay; it is not an available-at-checkpoint live snapshot. IEX may later be
+stored as separate diagnostic evidence, but cannot substitute for SIP or affect
+primary coverage. The UI must disclose checkpoint, availability, collection,
+feed, and freshness independently.
 
 No collector or persistence implementation is authorized until that contract is
 reviewed and frozen.
@@ -90,12 +93,11 @@ When an observation contract is approved:
 1. acquire external market data through a focused module under `data/`;
 2. persist versioned, append-only observations through `reporting/` into a
    store separate from the trade ledger;
-3. use scheduling that can meet the contract's checkpoint deadlines without
-   blocking or depending on the duration of a full strategy scan. The engine's
-   existing `post_cycle_hook` is a single callback, not an assumed scheduler for
-   this work; if it is used, add a composite wrapper rather than replacing
-   `HealthReviewScheduler`. A separate lightweight process remains acceptable
-   if deadline tests show the cycle hook is insufficient; and
+3. use a composite `post_cycle_hook` that preserves `HealthReviewScheduler`,
+   performs only due delayed-SIP work, makes no in-hook sleeps, and bounds each
+   invocation. Historical point-in-time queries tolerate a late local runtime;
+   a separate lightweight process remains acceptable if measured cycle impact
+   exceeds the reviewed bound; and
 4. have the dashboard read the persisted observation model, not call strategy
    code or infer historical state from current quotes.
 
