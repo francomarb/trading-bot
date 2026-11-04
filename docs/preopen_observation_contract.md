@@ -80,8 +80,16 @@ Primary references:
 - <https://docs.alpaca.markets/us/reference/stockquotes-1>
 
 The feed is always passed explicitly. Provider defaults are not accepted as
-provenance. A multi-symbol historical SIP request is preferred, but each
-instrument retains its independent source timestamp and outcome.
+provenance. Quote selection uses one historical SIP request per due symbol with
+`sort=desc` and `limit=1`, bounded by that symbol's pre-market start and
+checkpoint. Alpaca applies `limit` across a multi-symbol response rather than
+per symbol, so a multi-symbol latest-quote request cannot prove absence or
+return every symbol's latest quote without paging the entire quote stream. The
+previous-close daily-bar request may remain batched because the expected one
+bar per symbol fits in one verified page for the initial cohort. The adapter
+must verify that every due symbol is represented and paginate or chunk a larger
+future universe before treating a reference as missing. Each instrument retains
+its independent source timestamp and outcome.
 
 IEX is not a fallback. If SIP is missing, stale, unavailable, or fails, the
 primary row records that condition. An optional IEX diagnostic layer may be
@@ -233,22 +241,26 @@ Collection attempts are not observation revisions. Store them in a separate
 append-only attempt relation keyed by the primary logical key and
 `attempt_number`.
 
-One **collection round** is the counting unit. A round may use one multi-symbol
-quote request plus the batched or cached reference-close request needed to
-resolve all currently due keys. Every logical key included in that round gains
-one attempt, even though the provider calls are shared. The scheduler runs at
-most one collection round per hook invocation; it does not spend one invocation
-per symbol.
+One **collection round** is the counting unit. A round issues one
+`sort=desc`, `limit=1` quote request per due symbol plus the batched or cached
+reference-close request needed to resolve the included keys. Every logical key
+included in that round gains one attempt, even though reference work and the
+round identity are shared. All per-symbol requests belong to the same hook
+invocation; the scheduler does not spend one invocation per symbol.
 
 Attempt outcomes are classified as follows:
 
 - transport/DNS/connection failures, connect or read timeouts, HTTP 408, HTTP
   429, and HTTP 5xx are `transient_failure`;
-- authentication, authorization, or entitlement failures (normally HTTP
+- an HTTP 403 whose normalized provider error says the query is inside the
+  recent-SIP entitlement delay is transient `not_yet_available`; it remains
+  pending and follows the same backoff rather than becoming a permanent gap;
+- other authentication, authorization, or entitlement failures (normally HTTP
   401/403) are non-retryable `entitlement_error`;
 - other provider HTTP 4xx request failures are non-retryable `provider_error`;
 - a successful response with no quote in the eligible window is the final data
-  outcome `unavailable`, not a provider failure; and
+  outcome `unavailable` for that request's single symbol, not a provider
+  failure; and
 - a local persistence lock/failure is not a provider attempt outcome. It is
   logged, leaves the key pending, and is retried by a later hook.
 
@@ -278,9 +290,10 @@ Required finalized-observation fields:
 | Outcome | `observation_status`, `reason_code`, `diagnostic`, `created_at` |
 
 Each attempt records the logical key, attempt number, round ID, start/end time,
-provider, feed, endpoint set, outcome classification, next eligible retry time,
-and a sanitized diagnostic. Prices and sizes use SQLite `REAL`; timestamps use
-UTC ISO-8601 text; conditions use canonical JSON arrays. Diagnostics are
+provider, feed, endpoint set, outcome classification (including
+`not_yet_available` where applicable), next eligible retry time, and a
+sanitized diagnostic. Prices and sizes use SQLite `REAL`; timestamps use UTC
+ISO-8601 text; conditions use canonical JSON arrays. Diagnostics are
 length-limited and must not contain credentials, request headers, or raw
 authenticated responses.
 
@@ -295,8 +308,9 @@ non-negative sizes, monotonic attempt numbers, and `revision >= 1`.
 For every due checkpoint and instrument:
 
 1. wait until at least `available_at`;
-2. query historical SIP quotes from 04:00 `America/New_York` on the session
-   date through exactly `checkpoint_at`;
+2. make that symbol's historical SIP quote request with `sort=desc`, `limit=1`,
+   a start of 04:00 `America/New_York` on the session date, and an end of
+   exactly `checkpoint_at`;
 3. select the latest quote whose source timestamp is not later than
    `checkpoint_at`;
 4. calculate freshness against `checkpoint_at` and derive a midpoint only when
@@ -339,8 +353,9 @@ The initial implementation should add the SIP collector to a composite
 `post_cycle_hook` that invokes the existing `HealthReviewScheduler` and then the
 observation scheduler. It must not replace or alter health-review scheduling.
 The observation scheduler performs only currently due work, makes at most one
-multi-symbol collection round covering all eligible keys per invocation, never
-sleeps in the hook, and returns normally on failure.
+shared collection round covering all eligible keys per invocation, uses one
+latest-quote request per included symbol, never sleeps in the hook, and returns
+normally on failure.
 
 Historical SIP remains queryable after its entitlement delay, so this design
 does not depend on a scan completing inside a narrow live checkpoint window.
@@ -395,6 +410,8 @@ collector PR must provide offline deterministic tests for:
   changes, and historical denominators that do not change with current config;
 - eligibility delay and historical collection after a missed local runtime;
 - latest-at-or-before quote selection that never reaches past the checkpoint;
+- one `sort=desc`, `limit=1` request per due symbol, proving a successful
+  response for one symbol cannot make another symbol `unavailable`;
 - pre-market-session selection that can retain a stale same-session quote but
   cannot carry a previous evening's quote forward;
 - quote validity, midpoint, spread, gap, and freshness calculations, including
@@ -403,6 +420,8 @@ collector PR must provide offline deterministic tests for:
 - append-only per-key attempts from shared collection rounds, transient versus
   non-retryable classification, backoff and final recovery deadline, one final
   revision 1, correction revisions, and idempotent restart behavior;
+- recent-SIP-delay HTTP 403 responses remaining pending as
+  `not_yet_available`, while genuine authentication/entitlement errors finalize;
 - complete, partial, unavailable, provider-error, and entitlement-error states;
 - composite-hook preservation of `HealthReviewScheduler`, bounded/no-sleep
   collector behavior, and failures that cannot raise into the engine; and
