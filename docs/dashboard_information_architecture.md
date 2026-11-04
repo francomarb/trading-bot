@@ -1,7 +1,7 @@
 # Dashboard Information Architecture
 
-**Status:** Phase 1 navigation and page ownership implemented. Market-observation
-collection contracts are deliberately deferred.
+**Status:** Phase 1 navigation and page ownership implemented. The pre-open
+observation contract is under review; collection remains deferred.
 
 ## Goal
 
@@ -55,20 +55,29 @@ contract.
 
 ### Pre-Open Pulse
 
-The intended initial universe is SPY, QQQ, XLK, and SOXX. Before collection is
-implemented, define:
+The initial configured universe is SPY, QQQ, XLK, and SOXX. The proposed
+versioned contract is documented in `docs/preopen_observation_contract.md` and
+keeps the collector reusable for additional US stocks and ETFs. It defines:
 
 - the exact observation timestamp and exchange calendar;
 - reference price (normally the prior regular-session close);
 - source/feed and entitlement provenance;
 - quote or trade timestamp, bid/ask/last semantics, and staleness;
-- missing/degraded states; and
-- an append-only observation identity that distinguishes an as-observed record
-  from any later delayed-SIP enrichment.
+- missing/degraded states;
+- a delayed historical-SIP checkpoint record with separate checkpoint,
+  availability, and collection times;
+- a prospective `universe_version` so adding or removing monitored instruments
+  never rewrites historical coverage.
 
-The paper-stage design may use free real-time IEX for the available-now view and
-delayed SIP for later consolidated enrichment. The UI must label those views and
-must never present IEX as consolidated SIP/NBBO truth.
+The paper-stage proposal uses delayed historical SIP as the sole primary source.
+It reconstructs a consolidated point-in-time checkpoint after the free-feed
+delay; it is not an available-at-checkpoint live snapshot. IEX may later be
+stored as separate diagnostic evidence, but cannot substitute for SIP or affect
+primary coverage. The UI must disclose checkpoint, availability, collection,
+feed, and freshness independently.
+
+No collector or persistence implementation is authorized until that contract is
+reviewed and frozen.
 
 ### Earnings Clusters
 
@@ -84,9 +93,11 @@ When an observation contract is approved:
 1. acquire external market data through a focused module under `data/`;
 2. persist versioned, append-only observations through `reporting/` into a
    store separate from the trade ledger;
-3. add a composite wrapper around the engine's existing single `post_cycle_hook`
-   before scheduling another lightweight collector there, rather than replacing
-   `HealthReviewScheduler` or adding a second daemon; and
+3. use a composite `post_cycle_hook` that preserves `HealthReviewScheduler`,
+   performs only due delayed-SIP work, makes no in-hook sleeps, and bounds each
+   invocation. Historical point-in-time queries tolerate a late local runtime;
+   a separate lightweight process remains acceptable if measured cycle impact
+   exceeds the reviewed bound; and
 4. have the dashboard read the persisted observation model, not call strategy
    code or infer historical state from current quotes.
 
