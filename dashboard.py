@@ -40,6 +40,10 @@ from reporting.logger import (
     STOP_GAP_KINDS,
     is_execution_quality_measurement,
 )
+from reporting.market_observation_reader import (
+    PreOpenDashboardSnapshot,
+    load_preopen_dashboard_snapshot,
+)
 from strategies.health.edge import NEGATIVE_PERSISTENCE_WEEKS_REQUIRED
 from monitors.leveraged_trend import (
     Phase,
@@ -1455,6 +1459,106 @@ def _next_signal_label(state: TrendMonitorState) -> str:
     return f"{target} in {remaining} session{'s' if remaining != 1 else ''}"
 
 
+@st.cache_data(ttl=15, show_spinner=False)
+def load_preopen_observations(db_path: str) -> PreOpenDashboardSnapshot:
+    """Load the latest persisted pre-open cohort through the read-only model."""
+    return load_preopen_dashboard_snapshot(db_path)
+
+
+def _checkpoint_label(checkpoint: str) -> str:
+    """Turn a contract checkpoint key into a compact operator label."""
+    prefix = "open_minus_"
+    if checkpoint.startswith(prefix):
+        return f"Open −{checkpoint.removeprefix(prefix)}"
+    return checkpoint.replace("_", " ").title()
+
+
+def _display_token(value: str | None) -> str:
+    """Format a persisted enum token without adding interpretation."""
+    return value.replace("_", " ").title() if value else "—"
+
+
+def _render_preopen_pulse() -> None:
+    """Render finalized delayed-SIP observations without provider access."""
+    snapshot = load_preopen_observations(settings.PREOPEN_OBSERVATION_DB_PATH)
+    if snapshot.load_error:
+        st.warning(snapshot.load_error)
+        return
+    if snapshot.session_date is None:
+        st.info(
+            "No finalized pre-open observations are available yet. Collection "
+            "runs outside the dashboard."
+        )
+        return
+
+    expected = snapshot.expected_count
+    finalized = snapshot.finalized_count
+    complete = snapshot.complete_count
+    fresh = snapshot.fresh_count
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Session", snapshot.session_date)
+    c2.metric("Primary SIP Coverage", f"{finalized}/{expected or finalized}")
+    c3.metric("Complete", f"{complete}/{expected or finalized}")
+    c4.metric("Fresh Quotes", f"{fresh}/{complete or finalized}")
+
+    if not snapshot.rows:
+        st.info(
+            "Expected checkpoints are registered, but none has finalized for "
+            "this session yet."
+        )
+        return
+
+    rows = []
+    for observation in snapshot.rows:
+        rows.append({
+            "Checkpoint": _checkpoint_label(observation.checkpoint),
+            "Symbol": observation.symbol,
+            "Role": _display_token(observation.observation_role),
+            "Gap %": (
+                observation.gap_pct * 100.0
+                if observation.gap_pct is not None
+                else None
+            ),
+            "Midpoint": observation.mark_price,
+            "Prior Close": observation.reference_price,
+            "Status": _display_token(observation.observation_status),
+            "Freshness": _display_token(observation.freshness_state),
+            "Quote Age": observation.quote_age_seconds,
+            "Spread": observation.spread_bps,
+            "Quote Time": format_local_timestamp(observation.quote_timestamp),
+            "Checkpoint Time": format_local_timestamp(observation.checkpoint_at),
+            "Available Time": format_local_timestamp(observation.available_at),
+            "Collected Time": format_local_timestamp(observation.collected_at),
+            "Collection": _display_token(observation.collection_state),
+            "Feed": (
+                f"{observation.feed.upper()} consolidated"
+                if observation.is_consolidated
+                else observation.feed.upper()
+            ),
+            "Reason": _display_token(observation.reason_code),
+        })
+
+    st.dataframe(
+        pd.DataFrame(rows),
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Gap %": st.column_config.NumberColumn(format="%+.2f%%"),
+            "Midpoint": st.column_config.NumberColumn(format="$%.2f"),
+            "Prior Close": st.column_config.NumberColumn(format="$%.2f"),
+            "Quote Age": st.column_config.NumberColumn(format="%.1f sec"),
+            "Spread": st.column_config.NumberColumn(format="%.1f bps"),
+        },
+    )
+    st.caption(
+        "Delayed consolidated checkpoint observations—not live pre-market "
+        "quotes, forecasts, recommendations, or strategy permissions. "
+        "Checkpoint, availability, and collection times are shown separately."
+    )
+    if snapshot.universe_version:
+        st.caption(f"Universe version: {snapshot.universe_version}")
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def load_leveraged_trend_states() -> list[TrendMonitorState]:
     """
@@ -2788,13 +2892,10 @@ def _render_market_page() -> None:
     st.divider()
     render_section_header(
         "Pre-Open Pulse",
-        "Planned observation set: SPY, QQQ, XLK, and SOXX.",
-        kicker="Research Foundation",
+        "Delayed consolidated checkpoints for the configured observational universe.",
+        kicker="Market Context",
     )
-    st.info(
-        "The pre-open evidence contract and append-only observation ledger are "
-        "the next workstream. No provisional value is displayed as a signal."
-    )
+    _render_preopen_pulse()
     st.divider()
     _render_leveraged_trend_panel()
     st.divider()

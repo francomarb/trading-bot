@@ -717,7 +717,7 @@ than by data source:
 | Overview | Bot/session status, attention items, exposure, compact account curve, largest positions, market summary, and latest activity |
 | Positions & Risk | Open holdings, exact lifecycle identity where available, sleeve usage, multi-leg economics, drawdown, pools, and sector exposure |
 | Strategies & Performance | Broker/account curve, realized performance, per-strategy statistics, Strategy Health & Edge, and configured watchlists |
-| Market Observatory | Market regime, sector conditions, leveraged-fund trend state, and explicitly labeled placeholders for pre-open and earnings-cluster observations |
+| Market Observatory | Market regime, sector conditions, leveraged-fund trend state, a read-only delayed-SIP pre-open projection, and an explicitly labeled earnings-cluster placeholder |
 | Activity & Execution | Recent fills/events plus execution-quality and slippage provenance |
 
 Each page uses an independent Streamlit fragment cadence (30 seconds for the
@@ -725,14 +725,17 @@ operator and market-observation pages and 60 seconds for strategy evidence)
 instead of a process-wide sleep/rerun loop. Existing authoritative
 sources remain unchanged: broker reads provide current account/position truth,
 `engine_state.json` provides the last engine snapshot, SQLite provides durable
-trade/lifecycle evidence, and generated health reports provide advisory verdicts.
-The dashboard does not write to those sources and exposes no order, position,
-pause, or resume controls.
+trade/lifecycle and market-observation evidence, and generated health reports
+provide advisory verdicts. The pre-open reader opens its dedicated SQLite store
+in read-only mode, selects only finalized latest revisions, and uses durable
+jobs only for coverage. The dashboard does not write to those sources and
+exposes no order, position, pause, or resume controls.
 
 Market Observatory is an ownership boundary, not a strategy-input boundary.
-Future pre-open or earnings-cluster collectors must fetch through `data/`,
-persist through `reporting/`, and expose immutable observation-time provenance.
-They must first operate prospectively and read-only. Wiring any observation into
+The pre-open collector fetches through `data/`, persists through `reporting/`,
+and exposes immutable observation-time provenance; future earnings-cluster
+collection must preserve the same boundary. Observations operate prospectively
+and read-only. Wiring any observation into
 signal, risk, sizing, timing, or execution logic requires its own evidence and
 reviewed design. See `docs/dashboard_information_architecture.md`.
 

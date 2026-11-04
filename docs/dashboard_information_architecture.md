@@ -1,8 +1,8 @@
 # Dashboard Information Architecture
 
 **Status:** Phase 1 navigation and page ownership implemented. The frozen
-pre-open v0.2 contract now has a collector/store implementation; its dashboard
-reader remains deferred.
+pre-open v0.2 collector/store and read-only Market Observatory projection are
+implemented.
 
 ## Goal
 
@@ -18,7 +18,7 @@ an order-control surface.
 | Overview | Does anything need attention now? | Session/status strip, attention items, exposure, compact account curve, largest positions, market summary, latest activity |
 | Positions & Risk | What do we own and how much risk is deployed? | Open positions, lifecycle identity, sleeve usage, multi-leg economics, drawdown, capital pools, sector exposure |
 | Strategies & Performance | How are the sleeves behaving? | Performance curve, realized statistics, per-strategy results, Health & Edge reports, watchlists |
-| Market Observatory | What is the surrounding market doing? | Regime, sector heat, leveraged-fund trend state, future pre-open pulse, future earnings clusters |
+| Market Observatory | What is the surrounding market doing? | Regime, sector heat, leveraged-fund trend state, delayed-SIP pre-open pulse, future earnings clusters |
 | Activity & Execution | What happened and how was it executed? | Recent trade/activity records and benchmarked slippage provenance |
 
 The same metric may be summarized on Overview and explored on its owning page,
@@ -32,7 +32,7 @@ of positions, P&L, or strategy state.
 | Alpaca broker reads | Current account, positions, and market clock | Status, exposure, marks, account curve |
 | `data/engine_state.json` | Last engine-cycle snapshot | Runtime freshness, regime, allocator and risk state |
 | Paper/live SQLite trade log | Durable trade, lifecycle, and execution evidence | Position identity, realized performance, activity, slippage |
-| `data/market_observations.db` | Versioned delayed-SIP observations, collection attempts, and coverage jobs | Future Pre-Open Pulse reader; never trading or order authority |
+| `data/market_observations.db` | Versioned delayed-SIP observations, collection attempts, and coverage jobs | Pre-Open Pulse coverage and finalized observation projection; never trading or order authority |
 | `data/health_reports/` | Generated advisory assessment | Strategy Health & Edge panel |
 
 Operator and Market Observatory pages refresh every 30 seconds, while strategy
@@ -46,13 +46,14 @@ Phase 1 moves existing market-context views into one owner:
 
 - market regime and sector conditions;
 - the Leveraged Fund Trend Monitor for SPY/SPXL, QQQ/TQQQ, XLK/TECL, and
-  SOXX/SOXL; and
-- labeled placeholders for Pre-Open Pulse and Earnings Clusters.
+  SOXX/SOXL;
+- the read-only delayed-SIP Pre-Open Pulse; and
+- a labeled placeholder for Earnings Clusters.
 
-The placeholders make no network calls. Pre-open collection now runs outside
-Streamlit and persists only the frozen delayed-SIP contract; the placeholder
-does not read it yet. Earnings Clusters still persists no history. This keeps
-the dashboard from becoming a collection or trading boundary.
+The Pre-Open Pulse opens the observation database in SQLite read-only mode and
+projects only finalized records; it makes no network calls and never invokes
+collector or strategy code. Earnings Clusters still persists no history. This
+keeps the dashboard from becoming a collection or trading boundary.
 
 ## Observation contracts
 
@@ -79,9 +80,10 @@ stored as separate diagnostic evidence, but cannot substitute for SIP or affect
 primary coverage. The UI must disclose checkpoint, availability, collection,
 feed, and freshness independently.
 
-The collector, separate store, and composite post-cycle scheduler implement the
-frozen contract. The dashboard reader is the next presentation step. It must
-remain read-only and must not recompute provider history.
+The collector, separate store, composite post-cycle scheduler, and dashboard
+reader implement the frozen contract. The reader uses durable jobs only for the
+coverage denominator, selects the latest finalized revision of each logical
+key, and never recomputes provider history.
 
 ### Earnings Clusters
 
