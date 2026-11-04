@@ -32,7 +32,8 @@ from __future__ import annotations
 
 import sys
 import subprocess
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import date, datetime, timezone
 from collections import defaultdict
 
 from loguru import logger
@@ -149,6 +150,51 @@ def _build_sector_heat_snapshot(
                        for sector, items in sorted(symbol_map.items())},
         "unmapped": sorted(unmapped, key=lambda x: (x["symbol"], x["strategy"])),
     }
+
+
+def _build_preopen_observation_scheduler() -> Callable[[], None] | None:
+    """Build the observational hook without making bot startup depend on it."""
+    if not settings.PREOPEN_OBSERVATIONS_ENABLED:
+        return None
+    try:
+        from data.preopen_observation import InstrumentSpec, UniverseSpec
+        from reporting.market_observations import MarketObservationStore
+        from reporting.preopen_scheduler import PreopenObservationScheduler
+
+        effective_from = date.fromisoformat(
+            settings.PREOPEN_OBSERVATION_EFFECTIVE_FROM_SESSION
+        )
+        observation_universe = UniverseSpec.build(
+            InstrumentSpec(
+                symbol=symbol,
+                asset_type=asset_type,
+                observation_role=role,
+                effective_from_session=effective_from,
+            )
+            for symbol, asset_type, role
+            in settings.PREOPEN_OBSERVATION_INSTRUMENTS
+        )
+        observation_store = MarketObservationStore(
+            settings.PREOPEN_OBSERVATION_DB_PATH
+        )
+        scheduler = PreopenObservationScheduler(
+            universe=observation_universe,
+            store=observation_store,
+            max_keys_per_round=settings.PREOPEN_OBSERVATION_MAX_KEYS_PER_ROUND,
+        )
+        logger.info(
+            "pre-open observations enabled: "
+            f"universe={observation_universe.universe_version}, "
+            "symbols="
+            f"{','.join(item.symbol for item in observation_universe.instruments)}"
+        )
+        return scheduler
+    except Exception as exc:  # noqa: BLE001 - observation-only boundary
+        logger.warning(
+            "pre-open observation setup failed; collector disabled for this "
+            f"process (trading unaffected): {type(exc).__name__}: {exc}"
+        )
+        return None
 
 
 def _allowed_regimes(strategy_name: str) -> frozenset:
@@ -514,10 +560,18 @@ def main() -> None:
         pnl_tracker=pnl_tracker,
     )
 
+    post_cycle_hooks = [health_scheduler]
+    preopen_scheduler = _build_preopen_observation_scheduler()
+    if preopen_scheduler is not None:
+        post_cycle_hooks.append(preopen_scheduler)
+
+    from utils.hooks import CompositePostCycleHook
+    post_cycle_hook = CompositePostCycleHook(*post_cycle_hooks)
+
     try:
         engine.start(
             post_safety_startup_hook=_refresh_sector_context,
-            post_cycle_hook=health_scheduler,
+            post_cycle_hook=post_cycle_hook,
         )
     finally:
         # Write a daily summary on shutdown.

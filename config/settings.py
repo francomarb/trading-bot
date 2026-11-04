@@ -1343,6 +1343,28 @@ TELEGRAM_COMMANDS_ENABLED: bool = (
 STATE_SNAPSHOT_PATH: str = "data/engine_state.json"
 DASHBOARD_PORT: int = int(os.getenv("DASHBOARD_PORT", "8501"))
 
+# ── Market Observatory: delayed-SIP pre-open collection ────────────────────
+# Observational only. These records are never read by strategies, risk, or
+# execution. The initial cohort is configuration for the reusable collector.
+PREOPEN_OBSERVATIONS_ENABLED: bool = os.getenv(
+    "PREOPEN_OBSERVATIONS_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+PREOPEN_OBSERVATION_DB_PATH: str = os.getenv(
+    "PREOPEN_OBSERVATION_DB_PATH", "data/market_observations.db"
+)
+PREOPEN_OBSERVATION_EFFECTIVE_FROM_SESSION: str = os.getenv(
+    "PREOPEN_OBSERVATION_EFFECTIVE_FROM_SESSION", "2026-11-04"
+)
+PREOPEN_OBSERVATION_MAX_KEYS_PER_ROUND: int = int(
+    os.getenv("PREOPEN_OBSERVATION_MAX_KEYS_PER_ROUND", "4")
+)
+PREOPEN_OBSERVATION_INSTRUMENTS: tuple[tuple[str, str, str], ...] = (
+    ("SPY", "etf", "broad_market"),
+    ("QQQ", "etf", "growth_market"),
+    ("XLK", "etf", "technology"),
+    ("SOXX", "etf", "semiconductors"),
+)
+
 # EQUITY_PATH_STATE_PATH: the day's account-equity high-water mark and max
 #   drawdown, for the daily P&L report's `Max intraday drawdown`. Read at
 #   engine startup and re-adopted when the stored UTC day is still today,
