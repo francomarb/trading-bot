@@ -1,7 +1,9 @@
 # Pre-Open Market Observation Contract
 
-**Status:** Proposed v0.2. Review and freeze this contract before implementing
-collection, persistence, or dashboard calculations.
+**Status:** Frozen v0.2. The pure model, calendar adapter, separate observation
+store, delayed-SIP provider, retry scheduler, and composite engine hook are
+implemented. Dashboard presentation and every observation-to-action consumer
+remain deferred.
 
 ## 1. Purpose and boundary
 
@@ -241,6 +243,14 @@ Collection attempts are not observation revisions. Store them in a separate
 append-only attempt relation keyed by the primary logical key and
 `attempt_number`.
 
+Expected keys are first registered in a durable `observation_jobs` relation
+containing the frozen universe/session/checkpoint identity, prior session, and
+schedule timestamps. The scheduler reconciles exchange sessions from the
+universe's prospective effective date through the current session, so a laptop
+that was not running can create and drain missed jobs later. Jobs are immutable
+coverage expectations, not market-value rows, and remain pending until a final
+observation exists.
+
 One **collection round** is the counting unit. A round issues one
 `sort=desc`, `limit=1` quote request per due symbol plus the batched or cached
 reference-close request needed to resolve the included keys. Every logical key
@@ -355,12 +365,23 @@ observation scheduler. It must not replace or alter health-review scheduling.
 The observation scheduler performs only currently due work, makes at most one
 shared collection round covering all eligible keys per invocation, uses one
 latest-quote request per included symbol, never sleeps in the hook, and returns
-normally on failure.
+normally on failure. The initial implementation caps each round at four keys;
+older recovery work remains durably queued for later cycles.
 
 Historical SIP remains queryable after its entitlement delay, so this design
 does not depend on a scan completing inside a narrow live checkpoint window.
 If measured cycle impact exceeds the reviewed bound, collection moves to a
 separate lightweight process without changing the observation contract.
+
+Runtime configuration is centralized in `config/settings.py`:
+
+- `PREOPEN_OBSERVATIONS_ENABLED` controls collection only, never dashboard or
+  strategy behavior;
+- `PREOPEN_OBSERVATION_DB_PATH` selects the separate observation store;
+- `PREOPEN_OBSERVATION_EFFECTIVE_FROM_SESSION` fixes the first prospective
+  session for the configured universe; and
+- `PREOPEN_OBSERVATION_MAX_KEYS_PER_ROUND` bounds provider work per engine
+  cycle (initially four).
 
 Other boundaries:
 
@@ -396,8 +417,7 @@ Instruments are not combined into a single score in the observation phase.
 
 ## 11. Implementation acceptance gates
 
-Implementation may begin after this contract is reviewed and frozen. The first
-collector PR must provide offline deterministic tests for:
+The collector implementation must provide offline deterministic tests for:
 
 - session-relative checkpoint calculation, including DST, special sessions,
   and non-session days;
@@ -430,6 +450,12 @@ collector PR must provide offline deterministic tests for:
 A manual paper check should then verify one complete market session, including
 the expected 12 primary records for the initial frozen universe version,
 primary coverage, collection-timeliness labels, and zero strategy effects.
+
+The implementation-branch provider/store smoke check reconstructed the
+2026-11-03 session into a temporary database: all 12 expected symbol/checkpoint
+records were present, `complete`, and explicitly tagged `sip`. Integrated
+long-running paper verification remains required after merge to exercise the
+production composite hook and normal collection timing.
 
 ## 12. Evidence behind the feed decision
 

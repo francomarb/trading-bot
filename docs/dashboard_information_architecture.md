@@ -1,7 +1,8 @@
 # Dashboard Information Architecture
 
-**Status:** Phase 1 navigation and page ownership implemented. The pre-open
-observation contract is under review; collection remains deferred.
+**Status:** Phase 1 navigation and page ownership implemented. The frozen
+pre-open v0.2 contract now has a collector/store implementation; its dashboard
+reader remains deferred.
 
 ## Goal
 
@@ -31,6 +32,7 @@ of positions, P&L, or strategy state.
 | Alpaca broker reads | Current account, positions, and market clock | Status, exposure, marks, account curve |
 | `data/engine_state.json` | Last engine-cycle snapshot | Runtime freshness, regime, allocator and risk state |
 | Paper/live SQLite trade log | Durable trade, lifecycle, and execution evidence | Position identity, realized performance, activity, slippage |
+| `data/market_observations.db` | Versioned delayed-SIP observations, collection attempts, and coverage jobs | Future Pre-Open Pulse reader; never trading or order authority |
 | `data/health_reports/` | Generated advisory assessment | Strategy Health & Edge panel |
 
 Operator and Market Observatory pages refresh every 30 seconds, while strategy
@@ -47,11 +49,12 @@ Phase 1 moves existing market-context views into one owner:
   SOXX/SOXL; and
 - labeled placeholders for Pre-Open Pulse and Earnings Clusters.
 
-The placeholders intentionally make no network calls and persist no synthetic
-history. They prevent the navigation redesign from silently defining a research
-contract.
+The placeholders make no network calls. Pre-open collection now runs outside
+Streamlit and persists only the frozen delayed-SIP contract; the placeholder
+does not read it yet. Earnings Clusters still persists no history. This keeps
+the dashboard from becoming a collection or trading boundary.
 
-## Deferred observation contracts
+## Observation contracts
 
 ### Pre-Open Pulse
 
@@ -76,8 +79,9 @@ stored as separate diagnostic evidence, but cannot substitute for SIP or affect
 primary coverage. The UI must disclose checkpoint, availability, collection,
 feed, and freshness independently.
 
-No collector or persistence implementation is authorized until that contract is
-reviewed and frozen.
+The collector, separate store, and composite post-cycle scheduler implement the
+frozen contract. The dashboard reader is the next presentation step. It must
+remain read-only and must not recompute provider history.
 
 ### Earnings Clusters
 
@@ -86,9 +90,10 @@ and contamination rules are specified as open work in
 `docs/cluster_earnings_reaction_research.md`. The dashboard placeholder does not
 authorize event backfills or automated classification.
 
-## Architecture for later collection
+## Collection architecture
 
-When an observation contract is approved:
+The pre-open implementation follows these boundaries; future observation
+contracts must do the same:
 
 1. acquire external market data through a focused module under `data/`;
 2. persist versioned, append-only observations through `reporting/` into a
