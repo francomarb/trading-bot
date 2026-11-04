@@ -415,6 +415,12 @@ future returns, strategy permissions, or suggested actions. Interpretive
 labels come from `observation_role`, not symbol-specific UI branches.
 Instruments are not combined into a single score in the observation phase.
 
+**Implemented:** Market Observatory now reads the latest session through a
+dedicated SQLite `mode=ro` projection. Durable jobs provide the primary coverage
+denominator; displayed market values come only from finalized observations, and
+the highest correction revision supersedes earlier revisions in the view. The
+dashboard performs no provider calls and does not create a missing database.
+
 ## 11. Implementation acceptance gates
 
 The collector implementation must provide offline deterministic tests for:
@@ -453,9 +459,13 @@ primary coverage, collection-timeliness labels, and zero strategy effects.
 
 The implementation-branch provider/store smoke check reconstructed the
 2026-11-03 session into a temporary database: all 12 expected symbol/checkpoint
-records were present, `complete`, and explicitly tagged `sip`. Integrated
-long-running paper verification remains required after merge to exercise the
-production composite hook and normal collection timing.
+records were present, `complete`, and explicitly tagged `sip`. The first
+integrated production session on 2026-11-04 then finalized all 12 expected
+SPY/QQQ/XLK/SOXX records as `complete`, `fresh`, consolidated `sip` observations
+with one attempt each. The first cohort was correctly labeled
+`delayed_collection` because the bot was recycled after its eligibility time;
+the other two were `on_schedule`. Active collection hooks took about 1.0–2.3
+seconds and did not feed or gate strategy behavior.
 
 ## 12. Evidence behind the feed decision
 
