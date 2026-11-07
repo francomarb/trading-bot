@@ -1,10 +1,11 @@
 # Cluster Earnings Reaction Strategy — Research Design
 
-**Status:** Parked research design. No production strategy, paper sleeve,
-engine integration, or trading authorization exists. The first possible phase
-is prospective, observation-only data collection.
+**Status:** Strategy hypothesis parked. Phase 0 observation protocol is frozen
+in [`earnings_cluster_observation_contract.md`](earnings_cluster_observation_contract.md),
+but no ledger, collector, dashboard calculation, paper sleeve, engine
+integration, or trading authorization exists.
 
-**Last updated:** 2026-10-31
+**Last updated:** 2026-11-07
 
 ---
 
@@ -299,7 +300,16 @@ timestamps, later consensus estimates, survivorship, and reconstructed implied
 moves. Prospective collection is therefore valuable even before a backtest is
 attempted.
 
-### Proposed event ledger
+### Long-horizon research ledger
+
+The table below describes the eventual research model, not the frozen v0.1
+implementation scope. The v0.1 subset is defined only by
+[`earnings_cluster_observation_contract.md`](earnings_cluster_observation_contract.md):
+registered schedules, cited dimension labels, regular-session delayed-SIP
+reporter/candidate reactions, contamination, coverage, and correction history.
+Consensus, options, aggregate evidence states, candidate prediction/ranking,
+and outcome simulation remain unavailable or deferred until later reviewed
+phases.
 
 For every source and candidate earnings event, retain:
 
@@ -346,45 +356,47 @@ Before collecting outcomes:
 2. define event timestamps and when each reaction becomes usable;
 3. define fundamental labels and benchmark selection;
 4. define reaction windows and contamination rules;
-5. define candidate snapshots and option-cost fields; and
-6. define a versioned schema so later improvements create explicit evidence
-   boundaries.
+5. define coverage, contamination, and correction semantics; and
+6. define a versioned observation schema so later improvements create explicit
+   evidence boundaries.
 
 ### Phase 1 — Prospective read-only ledger
 
-Collect events and render a chronological scorecard. It may report what the
-method would have ranked, but it must not connect to `TradingEngine`, allocate
-capital, request an order, or change any active sleeve.
+Collect events and render a chronological observation record. It may report
+what the registered sources reported, the cited dimension labels, numeric
+market reactions, candidate schedule availability, and missing/contaminated
+states. It must not calculate what the method would have ranked, connect to
+`TradingEngine`, allocate capital, request an order, or change any active
+sleeve.
 
 The initial goal is data integrity and operational feasibility, not a return
 claim. At least one full earnings cycle is likely needed to expose timestamp,
 coverage, and classification problems.
 
-### Dashboard destination registered; observation contract remains open
+### Dashboard destination registered; observation contract frozen
 
-The five-page dashboard now reserves an **Earnings Clusters** area within
-Market Observatory. It is deliberately a non-calculating placeholder: no event
-ledger, backfill, classification, candidate generation, or broker connectivity
-was added with the navigation redesign. The next deliverable remains the
-read-only observation contract below. Use the Q3 2026 earnings round in progress
-as of 2026-10-31 as the first bounded observation cohort, starting with the
-earliest recoverable core source event and continuing prospectively through the
-end of the round.
+The five-page dashboard reserves an independently routed **Earnings Clusters**
+area within Market Observatory. It remains a non-calculating placeholder: no
+event ledger, backfill, classification, candidate generation, or broker
+connectivity exists. The reviewed Phase 0 decisions now live in
+[`earnings_cluster_observation_contract.md`](earnings_cluster_observation_contract.md).
+That contract treats already-released Q3 2026 events as retrospective seed data,
+allows only genuinely preregistered remaining events to be prospective, and
+requires the next complete reporting round to be the first fully prospective
+cohort.
 
-The draft should specify:
+The frozen v0.1 contract specifies:
 
 - an exact chronological event timeline, including scheduled, release, call,
   reaction-usable, and candidate-decision timestamps;
 - the point-in-time fundamental classification and market reaction for each
   eligible Mag 7 or registered AI-stalwart event;
-- separate fundamental, market-reaction, and confidence states for each
-  cluster, with every contributing event and weight visible;
-- later reporters and sympathy candidates that remained available at each
-  snapshot, including hypothetical direction, rank, and the evidence then
-  available;
-- stock and option-implied movement where trustworthy point-in-time data are
-  available, with missing historical option data disclosed rather than
-  reconstructed from current chains;
+- cited dimension labels and signed numeric reactions without combining them
+  into an aggregate cluster direction or confidence score;
+- registered later reporters and sympathy candidates that remained unreported
+  at each snapshot, without hypothetical direction or rank;
+- explicit `unavailable` states for point-in-time consensus and historical
+  option data rather than reconstructed current estimates or chains;
 - benchmark-adjusted reaction windows and a clear indication of which windows
   were still incomplete at the observation cutoff;
 - provenance, coverage, contamination, disagreement, and correction flags;
@@ -393,12 +405,12 @@ The draft should specify:
 - prominent labeling that the section is observational research, not an
   active strategy, recommendation, allocation, or order control.
 
-The first deliverable is a dashboard/data-contract design tied back to the
-event-ledger schema above. Dashboard code, backfill jobs, automated
-classification, and broker connectivity require separate review. The current
-round must not be presented as a successful example selected after its outcome;
-include every registered source event and every candidate produced by the
-frozen protocol, including neutral, losing, missing, and contaminated cases.
+The first deliverable is complete as a design only. Ledger code, backfill jobs,
+classification workflow, market-data collection, and dashboard presentation
+require separate review. The current round must not be presented as a selected
+successful example; every registered source/context event and candidate
+schedule must remain visible, including neutral, missing, and contaminated
+cases.
 
 ### Phase 2 — Retrospective event study
 
@@ -474,8 +486,8 @@ coverage, contamination exclusions, and results with the best event removed.
 
 ## Current decision
 
-Preserve this as a parked research track. The next defensible action, when
-prioritized, is Phase 0 followed by a prospective observation-only ledger for
-the Mag 7 and registered AI-stalwart source set. Do not add a seventh active
-paper sleeve, alter the six current strategies, or infer trading authorization
-from this document.
+Preserve the strategy as parked. Phase 0 is specified; the next defensible
+action after contract review is the separate append-only ledger/operator and
+collector implementation described by the v0.1 contract. Do not add a seventh
+active paper sleeve, alter the six current strategies, or infer trading
+authorization from either document.

@@ -93,10 +93,11 @@ key, and never recomputes provider history.
 
 ### Earnings Clusters
 
-The event ledger, point-in-time classifications, correction policy, coverage,
-and contamination rules are specified as open work in
-`docs/cluster_earnings_reaction_research.md`. The dashboard placeholder does not
-authorize event backfills or automated classification.
+The frozen v0.1 event-ledger, point-in-time classification, reaction-window,
+correction, coverage, and contamination contract is specified in
+`docs/earnings_cluster_observation_contract.md`. The dashboard remains a
+placeholder. The contract does not authorize ledger implementation, event
+backfills, automated classification, scoring, ranking, or strategy use.
 
 ## Collection architecture
 
