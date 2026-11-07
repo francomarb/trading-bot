@@ -2881,6 +2881,60 @@ def _render_sector_heat(ctx: DashboardContext) -> None:
         )
 
 
+MARKET_OBSERVATORY_VIEWS: tuple[str, ...] = (
+    "Pre-Open",
+    "Trend & Regime",
+    "Sector Breadth",
+    "Earnings Clusters",
+)
+
+
+def _render_market_observatory_view(
+    view: str,
+    ctx: DashboardContext,
+) -> None:
+    """Render only the selected Market Observatory tool."""
+    if view == "Pre-Open":
+        render_section_header(
+            "Pre-Open Pulse",
+            "Delayed consolidated checkpoints for the configured observational universe.",
+            kicker="Market Context",
+        )
+        _render_preopen_pulse()
+        return
+
+    if view == "Trend & Regime":
+        st.caption(
+            "Current engine regime: "
+            f"{_regime_color(ctx.regime)} {ctx.regime or 'unavailable'}."
+        )
+        _render_leveraged_trend_panel()
+        return
+
+    if view == "Sector Breadth":
+        render_section_header(
+            "Sector Heat",
+            "Session-level sector momentum context from the engine snapshot.",
+            kicker="Market Context",
+        )
+        _render_sector_heat(ctx)
+        return
+
+    if view == "Earnings Clusters":
+        render_section_header(
+            "Earnings Clusters",
+            "Parked observation-first research; no score or candidate ranking is active.",
+            kicker="Research Foundation",
+        )
+        st.info(
+            "The chronological event-ledger contract will be reviewed separately "
+            "before any dashboard calculation or backfill is implemented."
+        )
+        return
+
+    raise ValueError(f"unsupported Market Observatory view: {view!r}")
+
+
 @st.fragment(run_every="30s")
 def _render_market_page() -> None:
     ctx = _load_dashboard_context()
@@ -2890,31 +2944,15 @@ def _render_market_page() -> None:
     )
     _render_status_strip(ctx)
     st.divider()
-    render_section_header(
-        "Pre-Open Pulse",
-        "Delayed consolidated checkpoints for the configured observational universe.",
-        kicker="Market Context",
+    selected_view = st.radio(
+        "Observatory view",
+        MARKET_OBSERVATORY_VIEWS,
+        horizontal=True,
+        label_visibility="collapsed",
+        key="market_observatory_view",
     )
-    _render_preopen_pulse()
     st.divider()
-    _render_leveraged_trend_panel()
-    st.divider()
-    render_section_header(
-        "Sector Heat",
-        "Session-level sector momentum context from the engine snapshot.",
-        kicker="Market Context",
-    )
-    _render_sector_heat(ctx)
-    st.divider()
-    render_section_header(
-        "Earnings Clusters",
-        "Parked observation-first research; no score or candidate ranking is active.",
-        kicker="Research Foundation",
-    )
-    st.info(
-        "The chronological event-ledger contract will be reviewed separately "
-        "before any dashboard calculation or backfill is implemented."
-    )
+    _render_market_observatory_view(selected_view, ctx)
 
 
 @st.fragment(run_every="30s")

@@ -40,9 +40,15 @@ evidence refreshes every 60 seconds. Existing function-level caches remain the
 guard against unnecessary broker or file reads, including slower market research
 loads. There is no global sleep and no whole-dashboard timed rerun.
 
+Market Observatory adds a second task-level selector for **Pre-Open**, **Trend
+& Regime**, **Sector Breadth**, and **Earnings Clusters**. It uses conditional
+routing rather than eagerly rendered tabs: only the selected tool executes.
+This keeps the page short and prevents unrelated observation readers or market
+research loads from running in the background.
+
 ## Market Observatory: current scope
 
-Phase 1 moves existing market-context views into one owner:
+Market Observatory owns these independently routed tools:
 
 - market regime and sector conditions;
 - the Leveraged Fund Trend Monitor for SPY/SPXL, QQQ/TQQQ, XLK/TECL, and

@@ -731,6 +731,12 @@ in read-only mode, selects only finalized latest revisions, and uses durable
 jobs only for coverage. The dashboard does not write to those sources and
 exposes no order, position, pause, or resume controls.
 
+Market Observatory has a secondary selector for Pre-Open, Trend & Regime,
+Sector Breadth, and Earnings Clusters. The implementation conditionally calls
+only the selected renderer rather than constructing every view as eager tabs,
+so adding observational tools does not lengthen the active page or trigger
+unrelated data loads.
+
 Market Observatory is an ownership boundary, not a strategy-input boundary.
 The pre-open collector fetches through `data/`, persists through `reporting/`,
 and exposes immutable observation-time provenance; future earnings-cluster

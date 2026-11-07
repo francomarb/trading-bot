@@ -6,10 +6,14 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
+import pytest
 
 from dashboard import (
     DashboardContext,
+    MARKET_OBSERVATORY_VIEWS,
     _attention_items,
+    _render_market_page,
+    _render_market_observatory_view,
     _open_position_rows,
     _summarize_unrealized_pnl,
     render_dashboard,
@@ -82,6 +86,74 @@ class TestDashboardNavigation:
         nav.assert_called_once()
         assert nav.call_args.kwargs == {"position": "top"}
         navigation.run.assert_called_once_with()
+
+    def test_market_observatory_views_are_task_focused(self) -> None:
+        assert MARKET_OBSERVATORY_VIEWS == (
+            "Pre-Open",
+            "Trend & Regime",
+            "Sector Breadth",
+            "Earnings Clusters",
+        )
+
+    @pytest.mark.parametrize(
+        ("view", "expected_renderer"),
+        [
+            ("Pre-Open", "preopen"),
+            ("Trend & Regime", "trend"),
+            ("Sector Breadth", "sector"),
+            ("Earnings Clusters", None),
+        ],
+    )
+    def test_market_observatory_renders_only_selected_tool(
+        self,
+        view: str,
+        expected_renderer: str | None,
+    ) -> None:
+        renderers = {
+            "preopen": MagicMock(),
+            "trend": MagicMock(),
+            "sector": MagicMock(),
+        }
+        with (
+            patch("dashboard._render_preopen_pulse", renderers["preopen"]),
+            patch("dashboard._render_leveraged_trend_panel", renderers["trend"]),
+            patch("dashboard._render_sector_heat", renderers["sector"]),
+            patch("dashboard.render_section_header"),
+            patch("dashboard.st.caption"),
+            patch("dashboard.st.info"),
+        ):
+            _render_market_observatory_view(view, _context())
+
+        for name, renderer in renderers.items():
+            assert renderer.call_count == (1 if name == expected_renderer else 0)
+
+    def test_market_observatory_rejects_unknown_view(self) -> None:
+        with pytest.raises(ValueError, match="unsupported Market Observatory view"):
+            _render_market_observatory_view("Unknown", _context())
+
+    def test_market_page_routes_radio_selection_to_one_view(self) -> None:
+        ctx = _context()
+        with (
+            patch("dashboard._load_dashboard_context", return_value=ctx),
+            patch("dashboard._render_page_title"),
+            patch("dashboard._render_status_strip"),
+            patch("dashboard.st.divider"),
+            patch(
+                "dashboard.st.radio",
+                return_value="Sector Breadth",
+            ) as radio,
+            patch("dashboard._render_market_observatory_view") as render_view,
+        ):
+            _render_market_page.__wrapped__()
+
+        radio.assert_called_once_with(
+            "Observatory view",
+            MARKET_OBSERVATORY_VIEWS,
+            horizontal=True,
+            label_visibility="collapsed",
+            key="market_observatory_view",
+        )
+        render_view.assert_called_once_with("Sector Breadth", ctx)
 
 
 class TestDashboardReadModels:
