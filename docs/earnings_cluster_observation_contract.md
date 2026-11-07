@@ -74,8 +74,16 @@ classification_rubric_version
 
 Changing an issuer, source edge, candidate edge, benchmark, required reaction
 window, label vocabulary, or timing rule creates a new version effective only
-for events not yet released. Historical event denominators and memberships
-remain attached to the versions registered for that event.
+for events not yet registered. Registration permanently binds an event to its
+protocol and registry versions, even when the release has not occurred.
+Historical event denominators and memberships remain attached to the versions
+registered for that event.
+
+A mid-cycle registry change therefore cannot re-register or duplicate an
+existing event under the new version. New events may use the new version; an
+incorrect existing registration remains auditable, receives a `data_quality`
+flag and cited correction note, and cannot silently change its denominator,
+membership, or frozen reaction jobs.
 
 ## 4. Frozen v0.1 registry
 
@@ -185,10 +193,10 @@ proxy and cannot silently become `issuer_exact`.
 The exchange calendar defines the first regular session eligible to measure a
 standard response:
 
-1. a release after the immediately preceding regular close and at or before
-   five minutes before the next open uses that next session;
-2. a release during the regular session or inside the five-minute open buffer
-   is `irregular_timing`; and
+1. a release strictly after the immediately preceding scheduled regular close
+   and at or before five minutes before the next open uses that next session;
+2. a release timestamped exactly at the scheduled close, during the regular
+   session, or inside the five-minute open buffer is `irregular_timing`; and
 3. an unknown release time has no inferred standard session.
 
 Irregular and unknown events remain in coverage. Their standard windows are
@@ -545,11 +553,14 @@ create or mutate the database.
 The later implementation must provide deterministic offline tests for:
 
 - registry versioning, aliases, Alphabet's one-event/two-share-class identity,
-  foreign ADR identity, and historical denominator stability;
+  foreign ADR identity, immutable event-version assignment, mid-cycle registry
+  changes without duplicate identities/jobs, and historical denominator
+  stability;
 - prospective vs retrospective registration at the exact release cutoff;
 - schedule revisions and point-in-time `known_at` queries;
-- DST, holidays, special sessions, BMO/AMC, same-close, five-minute buffer,
-  intraday release, and unknown-time behavior;
+- DST, holidays, special sessions, BMO/AMC, an exact-close release boundary,
+  same-close events, five-minute buffer, intraday release, and unknown-time
+  behavior;
 - source precedence, SEC-acceptance proxy labeling, disagreements, missing
   sources, and citation validation;
 - every classification dimension/enum, explicit unavailable states, label
