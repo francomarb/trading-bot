@@ -380,6 +380,83 @@ class TestRevisions:
 
 
 class TestCollector:
+    def test_first_revisions_have_no_correction_reason(self, ledger):
+        """Initial plans, attempts and observations do not invent corrections."""
+        l = ledger
+        l.clock[0] = dt("2026-11-05T15:16:00")
+        add_facts(l)
+        collect_once(l.store, l.calendar, FakeMarks())
+        event = read_earnings(l.store.path, cutoff=l.clock[0])["events"][0]
+        for group in ("plans", "attempts", "observations"):
+            assert event[group]
+            assert all(
+                row["revision"] == 1
+                and row["reason"] is None
+                and row["supersedes_id"] is None
+                for row in event[group]
+            )
+        l.clock[0] += timedelta(seconds=1)
+        l.store.recollect(l.event, reason="Provider corrected marks")
+        collect_once(l.store, l.calendar, FakeMarks())
+        event = read_earnings(l.store.path, cutoff=l.clock[0])["events"][0]
+        for group in ("plans", "observations"):
+            assert all(
+                row["revision"] == 2
+                and row["reason"] == "Provider corrected marks"
+                and row["supersedes_id"]
+                for row in event[group]
+            )
+
+    def test_note_revision_uses_facts_reason(self, ledger):
+        """Note-only changes keep conservative recollection without claiming timing changed."""
+        l = ledger
+        l.clock[0] = dt("2026-11-05T15:16:00")
+        add_facts(l)
+        collect_once(l.store, l.calendar, FakeMarks())
+        event = read_earnings(l.store.path, cutoff=l.clock[0])["events"][0]
+        facts = Facts.model_validate(event["facts"][0]["data"])
+        l.clock[0] += timedelta(seconds=1)
+        l.store.revise(
+            l.event,
+            facts.model_copy(update={"note": "Corrected note"}),
+            reason="Fix note typo",
+        )
+        collect_once(l.store, l.calendar, FakeMarks())
+        event = read_earnings(l.store.path, cutoff=l.clock[0])["events"][0]
+        for group in ("plans", "observations"):
+            assert all(
+                row["revision"] == 2 and row["reason"] == "release facts revised"
+                for row in event[group]
+            )
+
+    def test_remaining_due_after_cap_and_completion(self, ledger):
+        """A full 48-job event advertises the second pass and then reaches zero."""
+        l = ledger
+        l.clock[0] = dt("2026-11-10T12:00:00")
+        add_facts(l)
+        first = collect_once(l.store, l.calendar, FakeMarks())
+        assert first["attempted"] == 24 and first["remaining_due"] == 24
+        second = collect_once(l.store, l.calendar, FakeMarks())
+        assert second["attempted"] == 24 and second["remaining_due"] == 0
+
+    def test_remaining_due_excludes_waiting_retry_and_future_windows(self, ledger):
+        """Backlog means eligible now, not every unfinalized job."""
+        l = ledger
+        l.clock[0] = dt("2026-11-05T15:16:00")
+        add_facts(l)
+        provider = SimpleNamespace(mark=lambda *args, **kwargs: None)
+        first = collect_once(l.store, l.calendar, provider)
+        assert first["attempted"] == 16 and first["remaining_due"] == 0
+        assert l.store.due_job_count() == 0
+        l.clock[0] += timedelta(minutes=5)
+        assert l.store.due_job_count() == 16
+        collect_once(l.store, l.calendar, provider)
+        event = read_earnings(l.store.path, cutoff=l.clock[0])["events"][0]
+        assert all(
+            row["revision"] == 2 and row["reason"] == "collection retry"
+            for row in event["attempts"]
+        )
+
     def test_cache_shared_within_round_but_not_across_retries(self, ledger):
         """Missing marks are fetched again next pass using the same provider object."""
         l = ledger

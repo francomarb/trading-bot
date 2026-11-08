@@ -6,6 +6,7 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from itertools import islice
 from pathlib import Path
 from typing import Callable, Iterator
 
@@ -194,7 +195,7 @@ class EarningsStore:
                 now.isoformat(),
                 revision,
                 previous["id"] if previous else None,
-                reason,
+                reason if previous else None,
                 payload,
             ),
         )
@@ -490,7 +491,7 @@ class EarningsStore:
                 event_id,
                 body,
                 self.now(),
-                "release facts or authoritative calendar corrected",
+                "release facts revised",
             )
 
     def pending_events(self, limit: int) -> list[dict]:
@@ -541,53 +542,54 @@ class EarningsStore:
 
     def due_jobs(self, limit: int) -> list[dict]:
         """Select mature jobs using durable plans, attempts, and final outcomes."""
+        if limit < 1:
+            raise ValueError("job limit must be positive")
         now = self.now()
-        result = []
         with self.transaction() as conn:
-            rows = conn.execute(
-                "SELECT * FROM earnings_reaction_jobs ORDER BY event_id,window,symbol,benchmark"
+            return list(islice(self._iter_due_jobs(conn, now), limit))
+
+    def due_job_count(self) -> int:
+        """Count jobs eligible now, excluding future windows and waiting retries."""
+        now = self.now()
+        with self.transaction() as conn:
+            return sum(1 for _ in self._iter_due_jobs(conn, now))
+
+    def _iter_due_jobs(self, conn: sqlite3.Connection, now: datetime) -> Iterator[dict]:
+        """Share eligibility between bounded dispatch and the backlog count."""
+        rows = conn.execute(
+            "SELECT * FROM earnings_reaction_jobs ORDER BY event_id,window,symbol,benchmark"
+        )
+        for row in rows:
+            plan = self._latest(conn, "earnings_reaction_plans", row["event_id"])
+            facts = self._latest(conn, "earnings_event_fact_revisions", row["event_id"])
+            if not plan or not facts:
+                continue
+            p = json.loads(plan["body"])
+            if p["facts_id"] != facts["id"]:
+                continue
+            if p["state"] == "ready" and now < datetime.fromisoformat(
+                p["targets"][row["window"]]
+            ) + timedelta(minutes=settings.EARNINGS_SIP_DELAY_MINUTES):
+                continue
+            observation = self._latest(
+                conn, "earnings_reaction_observations", row["id"]
             )
-            for row in rows:
-                plan = self._latest(conn, "earnings_reaction_plans", row["event_id"])
-                facts = self._latest(
-                    conn, "earnings_event_fact_revisions", row["event_id"]
-                )
-                if not plan or not facts:
-                    continue
-                p = json.loads(plan["body"])
-                if p["facts_id"] != facts["id"]:
-                    continue
-                if p["state"] == "ready" and now < datetime.fromisoformat(
-                    p["targets"][row["window"]]
-                ) + timedelta(minutes=settings.EARNINGS_SIP_DELAY_MINUTES):
-                    continue
-                observation = self._latest(
-                    conn, "earnings_reaction_observations", row["id"]
-                )
-                if (
-                    observation
-                    and json.loads(observation["body"])["plan_id"] == plan["id"]
-                ):
-                    continue
-                attempt_key = identity(row["id"], plan["id"])
-                attempt = self._latest(conn, "earnings_reaction_attempts", attempt_key)
-                if (
-                    attempt
-                    and json.loads(attempt["body"]).get("next_retry_at", "")
-                    > now.isoformat()
-                ):
-                    continue
-                result.append(
-                    {
-                        **dict(row),
-                        "plan_id": plan["id"],
-                        "plan": p,
-                        "attempt_count": attempt["revision"] if attempt else 0,
-                    }
-                )
-                if len(result) >= limit:
-                    break
-        return result
+            if observation and json.loads(observation["body"])["plan_id"] == plan["id"]:
+                continue
+            attempt_key = identity(row["id"], plan["id"])
+            attempt = self._latest(conn, "earnings_reaction_attempts", attempt_key)
+            if (
+                attempt
+                and json.loads(attempt["body"]).get("next_retry_at", "")
+                > now.isoformat()
+            ):
+                continue
+            yield {
+                **dict(row),
+                "plan_id": plan["id"],
+                "plan": p,
+                "attempt_count": attempt["revision"] if attempt else 0,
+            }
 
     def record_attempt(self, job: dict, outcome: dict, *, final: bool) -> None:
         """Atomically commit an attempt and optional final revision; tolerate races."""
@@ -662,6 +664,6 @@ class EarningsStore:
                     now,
                     job["plan"].get(
                         "correction_reason",
-                        "recollected after release timing correction",
+                        "release facts revised",
                     ),
                 )

@@ -101,6 +101,12 @@ fact invalidates the previous timing plan for current completeness. Collection
 creates a new plan and observations under the same job identities; historical
 exports retain the original plans and marks.
 
+First revisions always have a null correction reason and no predecessor.
+Later revisions retain their reason and predecessor. Recollection following a
+facts revision is labeled `release facts revised`, including note-only edits;
+it does not imply that the release timestamp changed. Explicit `recollect`
+requests retain the operator's supplied reason.
+
 To request revised provider marks without changing release facts, run
 `recollect EVENT_ID --reason TEXT`, then `collect`. This creates a new plan
 revision explicitly tied to the prior plan. Until collection completes, the
@@ -116,12 +122,18 @@ work survives process exit. Attempt plus final observation writes are atomic.
 Recovery of terminal failures is an explicit `recollect` operation.
 
 Each pass considers at most 24 planning events and collects at most 24 jobs.
+Its `remaining_due` output counts jobs still eligible at the end of the pass,
+so a positive count means another pass can make progress immediately. Future
+windows, retries waiting for their next attempt, and events awaiting a current
+timing plan are excluded. A busy collector returns null for this count because
+it did not acquire the lock. Planning failures remain visible separately.
 It checks a 45-second admission budget before starting each event/job. A job
 already in flight can finish beyond the budget, bounded by the existing Alpaca
 transport timeouts and SDK retry policy. Per-run mark caching shares requests
 between benchmark views; there is no durable mark cache that could mix
 adjustment bases across different collection runs. A nonblocking file lock
 prevents overlapping collectors for the same database.
+The local `data/*.collector.lock` files are ignored by Git.
 
 The one-minute target uses the bar starting one minute before open + 30:
 09:59–10:00 ET for an ordinary 09:30 open. Earlier/later bars cannot substitute.

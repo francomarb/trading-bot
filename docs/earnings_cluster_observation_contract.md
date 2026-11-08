@@ -455,6 +455,9 @@ with `supersedes_id` and a required reason. Attempts and pending jobs are not
 observation revisions. No correction changes the registered denominator,
 registration mode, protocol version, or as-observed cutoff.
 
+All first records, including plans and attempts, have no correction reason or
+predecessor. Reasons apply only to subsequent revisions or retry attempts.
+
 ### 10.2 Required provenance and validation
 
 - Timestamps are aware UTC at the Python boundary.

@@ -10,6 +10,7 @@ data/trades_live.db
 data/**/*.db
 data/**/*.db-*
 data/**/*.db.*
+data/*.collector.lock
 data/engine_state.json
 data/engine_state.json.tmp
 data/engine_state.json.bak.*

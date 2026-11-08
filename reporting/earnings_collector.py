@@ -37,7 +37,7 @@ def collect_once(
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            return {**result, "busy": True}
+            return {**result, "busy": True, "remaining_due": None}
         for row in store.pending_events(max_jobs):
             if time.monotonic() >= deadline:
                 break
@@ -89,6 +89,7 @@ def collect_once(
             store.record_attempt(job, outcome, final=final)
             result["attempted"] += 1
             result["finalized"] += int(final)
+        result["remaining_due"] = store.due_job_count()
     return result
 
 
