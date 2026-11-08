@@ -1,0 +1,34 @@
+{
+  "version": "earnings-registry-v1",
+  "contract_version": "earnings-cluster-observation-v0.1",
+  "reaction_window_version": "regular-sip-v1",
+  "classification_rubric_version": "manual-dimensions-v1",
+  "issuers": [
+    {"issuer_id":"microsoft", "symbol":"MSFT", "role":"source"},
+    {"issuer_id":"meta", "symbol":"META", "role":"source"},
+    {"issuer_id":"alphabet", "symbol":"GOOGL", "aliases":["GOOG"], "role":"source"},
+    {"issuer_id":"amazon", "symbol":"AMZN", "role":"source"},
+    {"issuer_id":"nvidia", "symbol":"NVDA", "role":"source"},
+    {"issuer_id":"amd", "symbol":"AMD", "role":"source"},
+    {"issuer_id":"broadcom", "symbol":"AVGO", "role":"source"},
+    {"issuer_id":"tsmc", "symbol":"TSM", "role":"source", "listing_kind":"us_adr"},
+    {"issuer_id":"asml", "symbol":"ASML", "role":"source", "listing_kind":"us_adr"},
+    {"issuer_id":"micron", "symbol":"MU", "role":"source"},
+    {"issuer_id":"apple", "symbol":"AAPL", "role":"context"},
+    {"issuer_id":"tesla", "symbol":"TSLA", "role":"context"},
+    {"issuer_id":"arista", "symbol":"ANET", "role":"candidate_schedule_only"},
+    {"issuer_id":"marvell", "symbol":"MRVL", "role":"candidate_schedule_only"},
+    {"issuer_id":"vertiv", "symbol":"VRT", "role":"candidate_schedule_only"},
+    {"issuer_id":"eaton", "symbol":"ETN", "role":"candidate_schedule_only"},
+    {"issuer_id":"applied_materials", "symbol":"AMAT", "role":"candidate_schedule_only"},
+    {"issuer_id":"lam_research", "symbol":"LRCX", "role":"candidate_schedule_only"}
+  ],
+  "clusters": [
+    {"cluster_id":"hyperscaler_ai_capex", "sources":["MSFT","META","GOOGL","AMZN"], "candidates":["NVDA","AMD","AVGO","ANET","MRVL","VRT","ETN"], "benchmark":"QQQ"},
+    {"cluster_id":"accelerated_compute", "sources":["NVDA","AMD","AVGO"], "candidates":["NVDA","AMD","AVGO","MU","ANET","MRVL","VRT"], "benchmark":"SOXX"},
+    {"cluster_id":"semiconductor_manufacturing", "sources":["TSM","ASML"], "candidates":["TSM","ASML","NVDA","AMD","AVGO","AMAT","LRCX"], "benchmark":"SOXX"},
+    {"cluster_id":"memory", "sources":["MU"], "candidates":["MU","NVDA","AMD","AVGO"], "benchmark":"SOXX"},
+    {"cluster_id":"mega_cap_context", "sources":["AAPL","TSLA"], "candidates":[], "benchmark":"QQQ"}
+  ],
+  "diagnostic_benchmark": "SPY"
+}

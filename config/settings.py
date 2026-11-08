@@ -1365,6 +1365,30 @@ PREOPEN_OBSERVATION_INSTRUMENTS: tuple[tuple[str, str, str], ...] = (
     ("SOXX", "etf", "semiconductors"),
 )
 
+# Earnings research runs only through scripts/earnings_observations.py.
+EARNINGS_OBSERVATIONS_ENABLED: bool = os.getenv(
+    "EARNINGS_OBSERVATIONS_ENABLED", "false"
+).lower() in ("true", "1", "yes")
+EARNINGS_OBSERVATION_DB_PATH: str = os.getenv(
+    "EARNINGS_OBSERVATION_DB_PATH", "data/earnings_observations.db"
+)
+EARNINGS_PROTOCOL_VERSION: str = "earnings-cluster-observation-v0.1"
+EARNINGS_REGISTRY_PATH: str = os.getenv(
+    "EARNINGS_REGISTRY_PATH", "config/earnings_registry_v1.json"
+)
+EARNINGS_MAX_JOBS: int = 24
+EARNINGS_MAX_ROUND_SECONDS: float = 45.0
+EARNINGS_MAX_ATTEMPTS: int = 3
+EARNINGS_RETRY_SECONDS: int = 300
+EARNINGS_SIP_DELAY_MINUTES: int = 16
+EARNINGS_OPEN_BUFFER_MINUTES: int = 5
+EARNINGS_OPEN_MARK_MINUTES: int = 30
+EARNINGS_CALENDAR_PAD_DAYS: int = 21
+EARNINGS_DB_TIMEOUT_SECONDS: float = 1.0
+EARNINGS_SEC_USER_AGENT: str = os.getenv("EARNINGS_SEC_USER_AGENT", "")
+EARNINGS_SEC_MIN_INTERVAL_SECONDS: float = 1.0
+EARNINGS_SEC_MAX_BYTES: int = 5_000_000
+
 # EQUITY_PATH_STATE_PATH: the day's account-equity high-water mark and max
 #   drawdown, for the daily P&L report's `Max intraday drawdown`. Read at
 #   engine startup and re-adopted when the stored UTC day is still today,

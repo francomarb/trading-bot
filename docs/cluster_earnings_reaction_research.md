@@ -2,10 +2,12 @@
 
 **Status:** Strategy hypothesis parked. Phase 0 observation protocol is frozen
 in [`earnings_cluster_observation_contract.md`](earnings_cluster_observation_contract.md),
-but no ledger, collector, dashboard calculation, paper sleeve, engine
-integration, or trading authorization exists.
+and its ledger, standalone collector, operator workflow, and read-only export
+are implemented. Operational setup and prospective evidence remain pending;
+no dashboard rendering, paper sleeve, engine integration, or trading
+authorization exists. See [`earnings_observation_operations.md`](earnings_observation_operations.md).
 
-**Last updated:** 2026-11-07
+**Last updated:** 2026-11-08
 
 ---
 
@@ -376,9 +378,9 @@ coverage, and classification problems.
 ### Dashboard destination registered; observation contract frozen
 
 The five-page dashboard reserves an independently routed **Earnings Clusters**
-area within Market Observatory. It remains a non-calculating placeholder: no
-event ledger, backfill, classification, candidate generation, or broker
-connectivity exists. The reviewed Phase 0 decisions now live in
+area within Market Observatory. It remains a non-calculating placeholder. A
+separate append-only ledger, manually cited classifications, delayed-SIP
+collector, and read-only export now implement the reviewed Phase 0 decisions in
 [`earnings_cluster_observation_contract.md`](earnings_cluster_observation_contract.md).
 That contract treats already-released Q3 2026 events as retrospective seed data,
 allows only genuinely preregistered remaining events to be prospective, and
@@ -405,9 +407,9 @@ The frozen v0.1 contract specifies:
 - prominent labeling that the section is observational research, not an
   active strategy, recommendation, allocation, or order control.
 
-The first deliverable is complete as a design only. Ledger code, backfill jobs,
-classification workflow, market-data collection, and dashboard presentation
-require separate review. The current round must not be presented as a selected
+The contract and ledger/collector implementation are complete; operational
+setup, real prospective evidence, and dashboard presentation remain pending.
+The current round must not be presented as a selected
 successful example; every registered source/context event and candidate
 schedule must remain visible, including neutral, missing, and contaminated
 cases.
@@ -486,8 +488,9 @@ coverage, contamination exclusions, and results with the best event removed.
 
 ## Current decision
 
-Preserve the strategy as parked. Phase 0 is specified; the next defensible
-action after contract review is the separate append-only ledger/operator and
-collector implementation described by the v0.1 contract. Do not add a seventh
+Preserve the strategy as parked. The contract and standalone ledger/operator
+and collector implementation are available. Next configure the workflow,
+register events, collect prospective evidence, and add the separately reviewed
+read-only dashboard presentation. Do not add a seventh
 active paper sleeve, alter the six current strategies, or infer trading
 authorization from either document.

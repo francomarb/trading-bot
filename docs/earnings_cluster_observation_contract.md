@@ -1,8 +1,10 @@
 # Earnings Clusters Observation Contract v0.1
 
-**Status:** Frozen design contract. Design only; no collector, event backfill,
-dashboard calculation, strategy input, paper order, or trading authorization is
-implemented by this document.
+**Status:** Frozen v0.1 contract with ledger, operator CLI, standalone collectors,
+and read-only export implemented. Collection defaults off; operational setup,
+prospective evidence, and dashboard presentation remain pending. No strategy
+input, paper order, or trading authorization exists. See
+[`earnings_observation_operations.md`](earnings_observation_operations.md).
 
 **Contract version:** `earnings-cluster-observation-v0.1`
 
@@ -433,6 +435,8 @@ or strategy consumer.
 | `earnings_reaction_jobs` | Frozen expected event/window/symbol/benchmark work. |
 | `earnings_reaction_observations` | Final observed-symbol and benchmark marks, returns, provenance, and revisions. |
 | `earnings_contamination_revisions` | Window-specific cited contamination flags. |
+| `earnings_reaction_plans` | Append-only calendar timing derived from a release-fact revision; explicit recollection requests. |
+| `earnings_reaction_attempts` | Durable per-job/per-plan retry outcomes, atomically committed with final observations. |
 
 The stable event key is:
 
@@ -450,6 +454,9 @@ Revision 1 is the first final record. A correction appends revision 2 or higher
 with `supersedes_id` and a required reason. Attempts and pending jobs are not
 observation revisions. No correction changes the registered denominator,
 registration mode, protocol version, or as-observed cutoff.
+
+All first records, including plans and attempts, have no correction reason or
+predecessor. Reasons apply only to subsequent revisions or retry attempts.
 
 ### 10.2 Required provenance and validation
 
@@ -614,3 +621,22 @@ round is the minimum operational evidence before proposing scoring or ranking.
    timing, label repeatability, contamination, and operational failures.
 5. **Later research proposal:** only then decide whether scoring, candidate
    ranking, retrospective study, or shadow observation deserves a new contract.
+
+### Ledger implementation notes
+
+The ledger implementation supplies phase 2 plus a reusable read-only export;
+phase 3 dashboard rendering remains separate. The operator workflow and exact
+retry/collection bounds are in `earnings_observation_operations.md`.
+
+Knowledge clocks are assigned when records are written. BMO/AMC registration
+without an exact timestamp conservatively requires registration before the
+scheduled New York date begins. If later facts reveal late registration, the
+original mode remains immutable but a separate timing-conflict flag prevents
+it from qualifying as verified prospective timing. An operator-bounded actual
+release cannot determine a standard reaction window and finalizes unavailable.
+
+Release-fact corrections and explicit provider recollection append timing-plan
+revisions while preserving frozen job identities and denominators. Current
+completeness requires observations for the current plan. Previous observations
+remain available in historical projections and as explicitly prior records.
+No corrected result inherits an earlier knowledge clock.
