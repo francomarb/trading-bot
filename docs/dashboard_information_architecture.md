@@ -58,8 +58,9 @@ Market Observatory owns these independently routed tools:
 
 The Pre-Open Pulse opens the observation database in SQLite read-only mode and
 projects only finalized records; it makes no network calls and never invokes
-collector or strategy code. Earnings Clusters still persists no history. This
-keeps the dashboard from becoming a collection or trading boundary.
+collector or strategy code. Earnings Clusters has a separate standalone ledger
+and collector; its dashboard destination remains a placeholder. This keeps the
+dashboard from becoming a collection or trading boundary.
 
 ## Observation contracts
 
@@ -95,14 +96,18 @@ key, and never recomputes provider history.
 
 The frozen v0.1 event-ledger, point-in-time classification, reaction-window,
 correction, coverage, and contamination contract is specified in
-`docs/earnings_cluster_observation_contract.md`. The dashboard remains a
-placeholder. The contract does not authorize ledger implementation, event
-backfills, automated classification, scoring, ranking, or strategy use.
+`docs/earnings_cluster_observation_contract.md`. The standalone ledger and
+collectors are implemented with a read-only chronological export in
+`reporting/earnings_observation_reader.py`; see
+`docs/earnings_observation_operations.md`. The dashboard remains a placeholder
+until a separate presentation PR. Automated classification, scoring, ranking,
+and strategy use remain deferred.
 
 ## Collection architecture
 
-The pre-open implementation follows these boundaries; future observation
-contracts must do the same:
+The pre-open implementation follows these boundaries. Earnings follows the
+same data/store/reader separation but uses a standalone bounded process for
+its irregular manual workflow, as its frozen contract specifies:
 
 1. acquire external market data through a focused module under `data/`;
 2. persist versioned, append-only observations through `reporting/` into a

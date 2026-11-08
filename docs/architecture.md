@@ -739,18 +739,25 @@ unrelated data loads.
 
 Market Observatory is an ownership boundary, not a strategy-input boundary.
 The pre-open collector fetches through `data/`, persists through `reporting/`,
-and exposes immutable observation-time provenance; future earnings-cluster
-collection must preserve the same boundary. Decision evidence operates
-prospectively and read-only; any retrospective seed remains separately labeled
+and exposes immutable observation-time provenance; earnings-cluster collection
+preserves the same boundary through a standalone process. Decision evidence
+operates prospectively and read-only; any retrospective seed remains separately labeled
 and cannot be promoted into prospective evidence. Wiring any observation into
 signal, risk, sizing, timing, or execution logic requires its own evidence and
 reviewed design. See `docs/dashboard_information_architecture.md`.
 
-The design-only earnings-cluster v0.1 contract is recorded in
-`docs/earnings_cluster_observation_contract.md`. It specifies a dedicated
-append-only event ledger, manual cited labels, and delayed-SIP reaction windows,
-but authorizes no implementation or dashboard calculation. Its future store is
-separate from both the trade ledger and the pre-open observation database.
+The earnings-cluster v0.1 contract is recorded in
+`docs/earnings_cluster_observation_contract.md`. The implementation adds
+`data/earnings_observation.py` for validated records and clocks,
+`data/earnings_provider.py` for official Alpaca/SEC reads,
+`reporting/earnings_observations.py` for the dedicated append-only store,
+`reporting/earnings_collector.py` for bounded standalone collection, and
+`reporting/earnings_observation_reader.py` for read-only chronological exports.
+The operator interface is `scripts/earnings_observations.py`. Collection
+defaults off and is not installed as a bot hook or recurring job. The store is
+separate from trade and pre-open databases; source labels and reaction returns
+have no strategy consumer. See `docs/earnings_observation_operations.md` for
+setup, retries, correction history, and the remaining prospective check.
 
 The April-era portfolio-wide `scripts/gonogo.py` checker was removed in 2026-09.
 It paired raw buys and sells with a FIFO long-only model, mixed all strategies,
