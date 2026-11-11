@@ -1232,7 +1232,7 @@ class AlpacaBroker:
         a real drawdown, not noise to filter out.
 
         Returns `[]` on any failure — a degraded report field must never
-        propagate an exception into the shutdown path that writes it.
+        propagate an exception into the completed-session report scheduler.
         """
         request = GetPortfolioHistoryRequest(
             start=start,

@@ -122,6 +122,18 @@ The corrected contract is two-part: attached OTO children wait for terminal
 standalone simple GTC stop is repriced through Alpaca's native replace endpoint
 and does not enter another cancel/recreate window.
 
+Follow-up incident, 2026-11-05: PANW exercised the corrected confirmation path,
+but Alpaca reported terminal cancellation 112 ms after the 10-second bounded
+wait expired. The broker layer correctly refused to submit a second SELL while
+the old child's state was unresolved, so there was no duplicate-order risk.
+The next ordinary cycle restored the GTC stop about 12.5 minutes later. The
+reviewed hardening raises the confirmation budget to 15 seconds and adds an
+exceptional post-fill reconciliation: only when a filled equity entry explicitly
+reports that no stop survived, the engine immediately refreshes Alpaca broker
+truth and invokes the existing stop-repair policy. It does not alter ordinary
+entry selection, stop pricing, or replacement behavior; cycle repair remains
+the final fallback.
+
 ## 3. SPY options reversion blocked before enough paper trades
 
 On June 22, 2026, `spy_options_reversion` produced valid entry signals but was

@@ -678,6 +678,18 @@ The MLEG limit-price sign convention was confirmed against the Alpaca paper API 
 
 Every trade is logged to SQLite for per-strategy graduation evidence. This layer also computes live performance metrics and sends alerts.
 
+Daily P&L finalization follows completed US-equity market sessions, not process
+lifetime. `DailyPnLReportScheduler` runs as a post-cycle hook, finalizes at most
+one missing session per cycle after a conservative post-close cutoff, and
+backfills after laptop sleep or restart. Broker portfolio history supplies the
+session equity path and drawdown. Current-session unrealized P&L uses the latest
+broker snapshot; historical catch-up reports display unavailable rather than
+inventing a zero. A final marker makes writes idempotent, and shutdown only
+invokes the same scheduler once more. Realized components sharing one
+`position_uid` are summed but count as one closed trade, so a whole-share stop
+plus fractional cleanup remains one economic lifecycle in daily and weekly
+statistics.
+
 **Trade logs (SQLite):**
 
 In addition to fills and lifecycle state, `entry_candidate_decisions` retains

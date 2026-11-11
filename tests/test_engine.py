@@ -3494,6 +3494,113 @@ class TestWatchlistStatuses:
     #   - tests/test_stream.py::TestLifecycleEventQueue
 
 
+class TestImmediateEntryProtectionRepair:
+    def test_noop_when_broker_reports_surviving_stop(self, engine_factory):
+        engine, broker = engine_factory()
+        result = replace(
+            _filled_result("AAPL", 10, 100.0),
+            stop_placement_reported=True,
+            placed_stop_price=95.0,
+        )
+
+        engine._repair_unprotected_entry_fill(result)
+
+        broker.sync_with_broker.assert_not_called()
+
+    def test_fresh_snapshot_repairs_stop_before_next_cycle(self, engine_factory):
+        snapshot = _snapshot(
+            positions={"AAPL": Position("AAPL", 10, 100.0, 1000.0)},
+            open_orders=[],
+        )
+        engine, broker = engine_factory(snapshot=snapshot)
+        engine._register_single_leg(
+            strategy_name="fake_strategy", symbol="AAPL",
+        )
+        broker.sync_with_broker.return_value = snapshot
+        engine._sync_managed_stop_legs = MagicMock()
+        stop = replace(_open_stop_order("AAPL", 95.0), qty=10)
+
+        def repair(snap, *, allow_residual_cleanup=True):
+            assert allow_residual_cleanup is False
+            snap.open_orders.append(stop)
+
+        engine._repair_missing_protective_stops = MagicMock(side_effect=repair)
+        engine.risk.record_broker_error = MagicMock()
+        engine.alerts.broker_error = MagicMock()
+        result = replace(
+            _filled_result("AAPL", 10, 100.0),
+            stop_placement_reported=True,
+            placed_stop_price=None,
+        )
+
+        engine._repair_unprotected_entry_fill(result)
+
+        broker.sync_with_broker.assert_called_once_with()
+        engine._sync_managed_stop_legs.assert_called_once_with(snapshot)
+        engine._repair_missing_protective_stops.assert_called_once_with(
+            snapshot, allow_residual_cleanup=False,
+        )
+        engine.risk.record_broker_error.assert_not_called()
+        engine.alerts.broker_error.assert_not_called()
+
+    def test_alerts_when_immediate_reconcile_still_has_no_stop(
+        self, engine_factory,
+    ):
+        snapshot = _snapshot(
+            positions={"AAPL": Position("AAPL", 10, 100.0, 1000.0)},
+            open_orders=[],
+        )
+        engine, broker = engine_factory(snapshot=snapshot)
+        engine._register_single_leg(
+            strategy_name="fake_strategy", symbol="AAPL",
+        )
+        broker.sync_with_broker.return_value = snapshot
+        engine._sync_managed_stop_legs = MagicMock()
+        engine._repair_missing_protective_stops = MagicMock()
+        engine.risk.record_broker_error = MagicMock()
+        engine.alerts.broker_error = MagicMock()
+        result = replace(
+            _filled_result("AAPL", 10, 100.0),
+            stop_placement_reported=True,
+            placed_stop_price=None,
+        )
+
+        engine._repair_unprotected_entry_fill(result)
+
+        engine.risk.record_broker_error.assert_called_once_with()
+        engine.alerts.broker_error.assert_called_once()
+
+    def test_pending_cancel_stop_is_not_claimed_as_durable_protection(
+        self, engine_factory,
+    ):
+        pending = replace(
+            _open_stop_order("AAPL", 95.0), status="pending_cancel",
+        )
+        snapshot = _snapshot(
+            positions={"AAPL": Position("AAPL", 10, 100.0, 1000.0)},
+            open_orders=[pending],
+        )
+        engine, broker = engine_factory(snapshot=snapshot)
+        engine._register_single_leg(
+            strategy_name="fake_strategy", symbol="AAPL",
+        )
+        broker.sync_with_broker.return_value = snapshot
+        engine._sync_managed_stop_legs = MagicMock()
+        engine._repair_missing_protective_stops = MagicMock()
+        engine.risk.record_broker_error = MagicMock()
+        engine.alerts.broker_error = MagicMock()
+        result = replace(
+            _filled_result("AAPL", 10, 100.0),
+            stop_placement_reported=True,
+            placed_stop_price=None,
+        )
+
+        engine._repair_unprotected_entry_fill(result)
+
+        engine.risk.record_broker_error.assert_called_once_with()
+        engine.alerts.broker_error.assert_called_once()
+
+
 class TestProtectionPolicyReconciliation:
     """Lifecycle policy, not ticker identity, controls stop recovery."""
 

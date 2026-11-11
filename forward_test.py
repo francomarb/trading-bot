@@ -6,9 +6,11 @@ multi-week forward test. Run with:
 
     python forward_test.py
 
-The bot runs continuously until SIGINT (Ctrl+C). On shutdown it writes
-a daily P&L report for the session. After the multi-week run, use
-`backtest/reconcile.py` to compare paper fills against backtest predictions.
+The bot runs continuously until SIGINT (Ctrl+C). A market-session scheduler
+finalizes daily P&L after the close and catches up missed sessions after sleep
+or restart; process shutdown is not treated as end-of-day. After the multi-week
+run, use `backtest/reconcile.py` to compare paper fills against backtest
+predictions.
 
 Reconcile from code holding the exact configured ``StrategySlot`` used by the
 engine. Do not construct a bare strategy: its filters and regime policy are
@@ -46,7 +48,8 @@ from regime.detector import MarketRegime, RegimeDetector
 from risk.allocator import SleeveAllocator
 from reporting.alerts import AlertDispatcher, LogFileBackend, TelegramAlertBackend, TelegramCommandListener
 from reporting.logger import TradeLogger, install_json_sink
-from reporting.pnl import PnLTracker, unrealized_pnl_from_positions
+from reporting.daily_scheduler import DailyPnLReportScheduler
+from reporting.pnl import PnLTracker
 from risk.manager import RiskManager
 from data.watchlists import StaticWatchlistSource
 from sector.gauge import SectorMomentumGauge
@@ -560,7 +563,16 @@ def main() -> None:
         pnl_tracker=pnl_tracker,
     )
 
-    post_cycle_hooks = [health_scheduler]
+    # A process shutdown is not end-of-day. Finalize only completed Alpaca
+    # sessions, and catch up after laptop sleep/restarts one session per cycle.
+    daily_pnl_scheduler = DailyPnLReportScheduler(
+        tracker=pnl_tracker,
+        broker=broker,
+        engine=engine,
+        dispatcher=alerts,
+    )
+
+    post_cycle_hooks = [daily_pnl_scheduler, health_scheduler]
     preopen_scheduler = _build_preopen_observation_scheduler()
     if preopen_scheduler is not None:
         post_cycle_hooks.append(preopen_scheduler)
@@ -574,49 +586,10 @@ def main() -> None:
             post_cycle_hook=post_cycle_hook,
         )
     finally:
-        # Write a daily summary on shutdown.
-        try:
-            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            snap = broker.sync_with_broker()
-            # Feed the final snapshot to the equity path before reading
-            # the drawdown off it. Without this the report reflects only
-            # equity as of the last completed cycle, so a decline between
-            # that cycle and shutdown is missing from the very report
-            # that summarises the session — peak $100k, cycle $100k,
-            # shutdown $95k would still print $0.00.
-            engine._observe_equity(snap.account.equity)
-            # Then fold in the broker's own 1-minute equity series for
-            # the day, which covers stretches when this process was not
-            # running at all — the one thing per-cycle sampling cannot
-            # see. Combined with `max`, so an API failure degrades to
-            # the locally observed figure rather than losing it.
-            engine.reconcile_intraday_drawdown_from_broker(today)
-            summary = pnl_tracker.generate_daily_summary(
-                day=today,
-                session_start_equity=engine._session_start_equity or snap.account.equity,
-                session_end_equity=snap.account.equity,
-                # Both of these were left at their 0.0 defaults until
-                # 2026-08-19, which is why every daily report written
-                # before then shows $0.00 unrealized and $0.00 drawdown
-                # even on days that ended with a dozen open positions.
-                unrealized_pnl=unrealized_pnl_from_positions(
-                    snap.account.open_positions.values()
-                ),
-                max_intraday_drawdown=engine.max_intraday_drawdown,
-            )
-            pnl_tracker.write_daily_report(summary)
-            # Fire EOD summary alert (Telegram + log).
-            total_trades = sum(s.trade_count for s in summary.strategies.values())
-            total_wins = sum(s.wins for s in summary.strategies.values())
-            overall_win_rate = total_wins / total_trades if total_trades > 0 else 0.0
-            alerts.eod_summary(
-                daily_pnl=summary.realized_pnl,
-                trade_count=total_trades,
-                win_rate=overall_win_rate,
-            )
-        except Exception as e:
-            logger.error(f"shutdown P&L report failed: {e}")
-
+        # One final scheduler pass is harmless and idempotent. Before market
+        # close it does nothing; after close it can finalize the session even
+        # when shutdown lands between normal engine cycles.
+        daily_pnl_scheduler()
         logger.info("forward test session ended")
 
 

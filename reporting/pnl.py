@@ -56,6 +56,7 @@ _OCC_SYMBOL_RE = re.compile(r"^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$")
 # both group by strategy, and strategies are single-instrument — which
 # is also why grouping is the right fix rather than a special case.
 INSTRUMENT_CLASSES: tuple[str, ...] = ("equity", "option")
+DAILY_FINAL_MARKER = "> Finalized after market close at "
 
 
 def _instrument_class(symbol: str | None) -> str:
@@ -154,6 +155,23 @@ def _stats_by_strategy(
             if pnl < s.largest_loss:
                 s.largest_loss = pnl
     return stats
+
+
+def _collapse_realized_components(
+    components: list[tuple[str, float, str]],
+) -> list[tuple[str, float]]:
+    """Aggregate realized rows into one outcome per position lifecycle."""
+    totals: dict[str, tuple[str, float]] = {}
+    for strategy_name, pnl, lifecycle_key in components:
+        existing = totals.get(lifecycle_key)
+        if existing is None:
+            totals[lifecycle_key] = (strategy_name, pnl)
+            continue
+        existing_strategy, existing_pnl = existing
+        # A position lifecycle has one owner. Preserve the first owner if a
+        # corrupt historical row disagrees rather than splitting one trade.
+        totals[lifecycle_key] = (existing_strategy, existing_pnl + pnl)
+    return list(totals.values())
 
 
 def _slippage_by_instrument(trades: list[dict]) -> dict[str, dict]:
@@ -275,7 +293,7 @@ class DailySummary:
     # Broker mark-to-market across open positions at session end. Not
     # derivable from the trade log (which only knows closed rows) — the
     # caller supplies it from the broker snapshot.
-    unrealized_pnl: float = 0.0
+    unrealized_pnl: float | None = 0.0
     largest_win: float = 0.0
     largest_loss: float = 0.0
     # Peak-to-trough of *account equity* over the day, in dollars —
@@ -283,9 +301,10 @@ class DailySummary:
     # definition was peak-to-trough of cumulative realized P&L, which
     # ignored the open book entirely and, because nothing in production
     # fed it, was always 0.00.
-    max_intraday_drawdown: float = 0.0
-    session_start_equity: float = 0.0
-    session_end_equity: float = 0.0
+    max_intraday_drawdown: float | None = 0.0
+    session_start_equity: float | None = 0.0
+    session_end_equity: float | None = 0.0
+    finalized_at: str | None = None
     strategies: dict[str, StrategyStats] = field(default_factory=dict)
     # PLAN 11.50 — per instrument class, e.g.
     # {"equity": {"count": 3, "mean_bps": 1.6, "max_bps": 4.9}}.
@@ -329,39 +348,40 @@ class PnLTracker:
         self,
         day: str | None = None,
         *,
-        session_start_equity: float = 0.0,
-        session_end_equity: float = 0.0,
-        unrealized_pnl: float = 0.0,
-        max_intraday_drawdown: float = 0.0,
+        session_start_equity: float | None = 0.0,
+        session_end_equity: float | None = 0.0,
+        unrealized_pnl: float | None = 0.0,
+        max_intraday_drawdown: float | None = 0.0,
+        finalized_at: str | None = None,
     ) -> DailySummary:
         """
         Build a DailySummary from the day's realized-P&L events on disk
         (the trade log is the source of truth) plus DB slippage stats.
 
-        Realized P&L comes from ``read_realized_pnl_events_for_day``,
-        which is restart-safe: a bot recycle mid-day does not wipe the
-        day's progress from the summary. This replaced an in-memory
-        accumulator that production never populated — the well-known
-        "P&L=$+0.00, trades=0" EOD bug.
+        Realized P&L comes from durable lifecycle-tagged close components.
+        Components for one ``position_uid`` are summed into one economic
+        outcome, while legacy rows without an identity remain distinct. A bot
+        recycle therefore cannot wipe progress or turn a whole-share stop plus
+        residual cleanup into two closed trades.
 
         ``unrealized_pnl`` and ``max_intraday_drawdown`` are supplied by
         the caller, because neither is derivable from the trade log:
         unrealized P&L is a broker mark-to-market of *open* positions,
         and the drawdown is an equity path sampled across the session.
-        The engine owns both (see ``TradingEngine.max_intraday_drawdown``
-        and ``unrealized_pnl_from_positions``). They previously defaulted
-        to a silent 0.0 that no caller ever overrode, so all 71 daily
-        reports written before this change show $0.00 in both fields
-        regardless of the actual book.
+        The completed-session scheduler supplies them from Alpaca portfolio
+        history and the latest broker snapshot. Historical catch-up reports
+        pass ``None`` for values that cannot be reconstructed rather than
+        presenting a fabricated zero.
         """
         day = day or datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
         # Sole source: every realized-P&L close row whose exit_timestamp
         # falls on ``day``. Includes single-leg + spread closes and
         # partial rows (their dollar contribution is honest).
-        events: list[tuple[str, float]] = list(
-            self._trade_logger.read_realized_pnl_events_for_day(day)
+        components = list(
+            self._trade_logger.read_realized_pnl_components_for_day(day)
         )
+        events = _collapse_realized_components(components)
 
         # Per-strategy breakdown.
         strats = _stats_by_strategy(events)
@@ -387,12 +407,24 @@ class PnLTracker:
             date=day,
             total_trades=total_trades,
             realized_pnl=round(realized, 2),
-            unrealized_pnl=round(unrealized_pnl, 2),
+            unrealized_pnl=(
+                round(unrealized_pnl, 2) if unrealized_pnl is not None else None
+            ),
             largest_win=round(largest_win, 2),
             largest_loss=round(largest_loss, 2),
-            max_intraday_drawdown=round(max_intraday_drawdown, 2),
-            session_start_equity=round(session_start_equity, 2),
-            session_end_equity=round(session_end_equity, 2),
+            max_intraday_drawdown=(
+                round(max_intraday_drawdown, 2)
+                if max_intraday_drawdown is not None else None
+            ),
+            session_start_equity=(
+                round(session_start_equity, 2)
+                if session_start_equity is not None else None
+            ),
+            session_end_equity=(
+                round(session_end_equity, 2)
+                if session_end_equity is not None else None
+            ),
+            finalized_at=finalized_at,
             strategies=strats,
             slippage_by_instrument=slip_by_instrument,
         )
@@ -402,18 +434,28 @@ class PnLTracker:
         os.makedirs(self._daily_dir, exist_ok=True)
         path = os.path.join(self._daily_dir, f"{summary.date}.md")
 
+        def money(value: float | None) -> str:
+            return "— (unavailable)" if value is None else f"${value:,.2f}"
+
         lines = [
             f"# Daily P&L — {summary.date}",
             "",
+        ]
+        if summary.finalized_at is not None:
+            lines += [
+                f"{DAILY_FINAL_MARKER}{summary.finalized_at}.",
+                "",
+            ]
+        lines += [
             "## Account",
             "",
             f"| Metric | Value |",
             f"|---|---|",
-            f"| Session start equity | ${summary.session_start_equity:,.2f} |",
-            f"| Session end equity | ${summary.session_end_equity:,.2f} |",
+            f"| Session start equity | {money(summary.session_start_equity)} |",
+            f"| Session end equity | {money(summary.session_end_equity)} |",
             f"| Realized P&L | ${summary.realized_pnl:,.2f} |",
-            f"| Unrealized P&L | ${summary.unrealized_pnl:,.2f} |",
-            f"| Max intraday drawdown | ${summary.max_intraday_drawdown:,.2f} |",
+            f"| Unrealized P&L | {money(summary.unrealized_pnl)} |",
+            f"| Max intraday drawdown | {money(summary.max_intraday_drawdown)} |",
             "",
             "## Trades",
             "",
@@ -465,6 +507,17 @@ class PnLTracker:
             f.write("\n".join(lines))
         logger.info(f"daily P&L report written: {path}")
         return path
+
+    def is_daily_report_final(self, day: str) -> bool:
+        """Whether ``day`` already has an after-close final report."""
+        path = os.path.join(self._daily_dir, f"{day}.md")
+        if not os.path.exists(path):
+            return False
+        try:
+            with open(path) as report:
+                return DAILY_FINAL_MARKER in report.read()
+        except OSError:
+            return False
 
     # ── Weekly summary ──────────────────────────────────────────────────
 
@@ -521,9 +574,10 @@ class PnLTracker:
         # "Weekly Report" whose summary contained no dollar figure at
         # all: the week of 2026-08-10 closed -$563.91 across two
         # Donchian exits and reported neither number.
-        events = self._trade_logger.read_realized_pnl_events_in_range(
+        components = self._trade_logger.read_realized_pnl_components_in_range(
             start.isoformat(), end.isoformat()
         )
+        events = _collapse_realized_components(components)
         weekly_strats = _stats_by_strategy(events)
         realized_pnl = sum(pnl for _, pnl in events)
 
