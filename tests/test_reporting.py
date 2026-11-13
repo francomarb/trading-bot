@@ -3433,7 +3433,16 @@ class TestExitBasisRefusalAndLifecycleRescue:
 # ── TestPnLTracker ──────────────────────────────────────────────────────────
 
 
-def _log_close(tl, *, day: str, symbol: str, strategy: str, pnl: float, seq: int = 1):
+def _log_close(
+    tl,
+    *,
+    day: str,
+    symbol: str,
+    strategy: str,
+    pnl: float,
+    seq: int = 1,
+    position_uid: str | None = None,
+):
     """Write one realized-P&L close row — what the engine logs on exit."""
     tl.log(TradeRecord(
         timestamp=f"{day}T15:{seq:02d}:00+00:00",
@@ -3448,6 +3457,7 @@ def _log_close(tl, *, day: str, symbol: str, strategy: str, pnl: float, seq: int
         entry_timestamp=f"{day}T13:00:00+00:00",
         exit_timestamp=f"{day}T15:{seq:02d}:00+00:00",
         position_type="single_leg",
+        position_uid=position_uid,
     ))
 
 
@@ -3545,6 +3555,32 @@ class TestUnrealizedPnLFromPositions:
 
 
 class TestPnLTracker:
+    def test_residual_components_sum_but_count_as_one_closed_trade(
+        self, tmp_csv, tmp_daily_dir,
+    ):
+        tl = TradeLogger(path=tmp_csv)
+        uid = "pos_" + "a" * 32
+        _log_close(
+            tl, day="2026-11-02", symbol="UNH",
+            strategy="sma_crossover", pnl=-492.80, seq=1,
+            position_uid=uid,
+        )
+        _log_close(
+            tl, day="2026-11-02", symbol="UNH",
+            strategy="sma_crossover", pnl=-7.49, seq=2,
+            position_uid=uid,
+        )
+
+        summary = PnLTracker(
+            trade_csv_path=tmp_csv, daily_pnl_dir=tmp_daily_dir,
+        ).generate_daily_summary(day="2026-11-02")
+
+        assert summary.realized_pnl == pytest.approx(-500.29)
+        assert summary.total_trades == 1
+        stats = summary.strategies["sma_crossover"]
+        assert stats.trade_count == 1
+        assert stats.largest_loss == pytest.approx(-500.29)
+
     def test_eod_summary_reads_trade_log_when_no_in_memory_events(
         self, tmp_csv, tmp_daily_dir,
     ):

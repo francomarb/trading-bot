@@ -1,195 +1,91 @@
-"""
-Guards on the EOD daily-report call site in `forward_test.py`.
-
-The defect these exist for: `generate_daily_summary` accepted
-`unrealized_pnl` (and later `max_intraday_drawdown`) as keyword
-arguments defaulting to 0.0, and the shutdown handler in
-`forward_test.main()` — the only production caller — never passed
-either. Nothing failed, nothing warned; all 71 daily reports written
-between 2026-04 and 2026-08-19 simply said
-
-    | Unrealized P&L        | $0.00 |
-    | Max intraday drawdown | $0.00 |
-
-on days that ended with a dozen open positions and a four-figure equity
-swing.
-
-Unit tests on `PnLTracker` cannot catch that class of bug: the module
-was correct in isolation and stayed correct the whole time. Only the
-caller was wrong, so the assertion has to be about the caller. These
-are AST checks against `forward_test.py` for the same reason the
-logger-sink guards in `test_allowed_regimes_parity.py` are — the
-shutdown block lives inside `main()`'s `finally`, behind a live broker
-connection, and cannot be invoked from a unit test.
-"""
+"""Guards on production wiring for market-session daily P&L reports."""
 
 from __future__ import annotations
 
 import ast
 from pathlib import Path
 
-import pytest
-
 from config import settings
 
 
 FORWARD_TEST = Path(settings.__file__).parent.parent / "forward_test.py"
 
-# Both fields are unavailable from the trade log — unrealized P&L is a
-# broker mark-to-market of open positions, and the drawdown is an equity
-# path sampled across the session — so each must be supplied explicitly
-# at the call site or it silently reverts to the 0.0 default.
-REQUIRED_KWARGS = ("unrealized_pnl", "max_intraday_drawdown")
-
-
-def _daily_summary_call() -> ast.Call:
-    """The single `generate_daily_summary(...)` call in forward_test.py."""
+def _main_function() -> ast.FunctionDef:
     tree = ast.parse(FORWARD_TEST.read_text())
-    calls = [
+    return next(
         node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "generate_daily_summary"
-    ]
-    assert len(calls) == 1, (
-        f"expected exactly one generate_daily_summary call in "
-        f"{FORWARD_TEST.name}, found {len(calls)}"
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "main"
     )
-    return calls[0]
 
 
-class TestDailySummaryCallSite:
-    @pytest.mark.parametrize("kwarg", REQUIRED_KWARGS)
-    def test_kwarg_is_passed(self, kwarg: str):
-        passed = {kw.arg for kw in _daily_summary_call().keywords}
-        assert kwarg in passed, (
-            f"forward_test.py calls generate_daily_summary() without "
-            f"{kwarg!r}, so it falls back to the 0.0 default and the daily "
-            f"report prints $0.00 for it regardless of the real book. This "
-            f"is the exact defect that made 71 consecutive reports wrong."
-        )
+class TestDailyReportSchedulerWiring:
+    """The report must follow the market session, not process lifetime."""
 
-    @pytest.mark.parametrize("kwarg", REQUIRED_KWARGS)
-    def test_kwarg_is_not_a_hardcoded_constant(self, kwarg: str):
-        """Passing a literal would satisfy the check above while still
-        reporting a fiction — it has to come from live state."""
-        value = next(
-            kw.value for kw in _daily_summary_call().keywords if kw.arg == kwarg
-        )
-        assert not isinstance(value, ast.Constant), (
-            f"forward_test.py passes a hardcoded {ast.dump(value)} for "
-            f"{kwarg!r}; it must be derived from the broker snapshot or the "
-            f"engine's equity path, not written into the source."
-        )
+    def test_forward_test_constructs_exactly_one_scheduler(self):
+        calls = [
+            node
+            for node in ast.walk(_main_function())
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "DailyPnLReportScheduler"
+        ]
+        assert len(calls) == 1
 
-    def test_unrealized_comes_from_the_broker_snapshot_positions(self):
-        value = next(
-            kw.value
-            for kw in _daily_summary_call().keywords
-            if kw.arg == "unrealized_pnl"
-        )
-        source = ast.unparse(value)
-        assert "unrealized_pnl_from_positions" in source, source
-        assert "open_positions" in source, source
+    def test_scheduler_is_installed_as_a_post_cycle_hook(self):
+        assignments = [
+            node
+            for node in ast.walk(_main_function())
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "post_cycle_hooks"
+                for target in node.targets
+            )
+        ]
+        assert len(assignments) == 1
+        value = assignments[0].value
+        assert isinstance(value, ast.List)
+        names = {
+            element.id
+            for element in value.elts
+            if isinstance(element, ast.Name)
+        }
+        assert "daily_pnl_scheduler" in names
 
-    def test_drawdown_comes_from_the_engine(self):
-        value = next(
-            kw.value
-            for kw in _daily_summary_call().keywords
-            if kw.arg == "max_intraday_drawdown"
-        )
-        assert ast.unparse(value) == "engine.max_intraday_drawdown"
-
-    def test_the_shutdown_snapshot_is_observed_before_it_is_reported(self):
-        """`engine.max_intraday_drawdown` is only as current as the last
-        equity observation. The shutdown handler takes a fresh snapshot
-        for `session_end_equity`; if that snapshot is not also fed to
-        the equity path, a decline between the final cycle and shutdown
-        is missing from the very report summarising the session — peak
-        $100k, last cycle $100k, shutdown $95k still prints $0.00.
-
-        Asserted on order of statements, because "it is called" is not
-        the property that matters — "it is called before the summary is
-        built" is.
-        """
-        tree = ast.parse(FORWARD_TEST.read_text())
-        main = next(
-            n for n in tree.body
-            if isinstance(n, ast.FunctionDef) and n.name == "main"
-        )
-
-        observe_lines = [
-            node.lineno
-            for node in ast.walk(main)
+    def test_forward_test_does_not_build_reports_directly(self):
+        forbidden = {
+            "generate_daily_summary",
+            "write_daily_report",
+            "eod_summary",
+        }
+        calls = {
+            node.func.attr
+            for node in ast.walk(_main_function())
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "_observe_equity"
-        ]
-        assert observe_lines, (
-            "forward_test.main() never feeds the shutdown snapshot to "
-            "engine._observe_equity, so the reported drawdown stops at the "
-            "last completed cycle."
+        }
+        assert calls.isdisjoint(forbidden), (
+            "forward_test.main() must delegate report timing and creation "
+            "to DailyPnLReportScheduler"
         )
 
-        summary_line = _daily_summary_call().lineno
-        sync_lines = [
-            node.lineno
+    def test_shutdown_only_invokes_the_idempotent_scheduler(self):
+        main = _main_function()
+        try_node = next(
+            node
             for node in ast.walk(main)
+            if isinstance(node, ast.Try) and node.finalbody
+        )
+        scheduler_calls = [
+            node
+            for statement in try_node.finalbody
+            for node in ast.walk(statement)
             if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "sync_with_broker"
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "daily_pnl_scheduler"
         ]
-        shutdown_sync = max(l for l in sync_lines if l < summary_line)
-
-        assert any(shutdown_sync < l < summary_line for l in observe_lines), (
-            f"_observe_equity (lines {observe_lines}) must be called between "
-            f"the shutdown sync_with_broker (line {shutdown_sync}) and the "
-            f"generate_daily_summary call (line {summary_line})."
-        )
-
-    def test_the_broker_equity_path_is_reconciled_before_reporting(self):
-        """Per-cycle sampling cannot see equity that moved while no
-        process was running, so the broker's own intraday series is
-        folded in before the report is built. Ordering again: after the
-        engine's own final observation, before the summary."""
-        tree = ast.parse(FORWARD_TEST.read_text())
-        main = next(
-            n for n in tree.body
-            if isinstance(n, ast.FunctionDef) and n.name == "main"
-        )
-
-        reconcile_lines = [
-            node.lineno
-            for node in ast.walk(main)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "reconcile_intraday_drawdown_from_broker"
-        ]
-        assert reconcile_lines, (
-            "forward_test.main() never calls "
-            "engine.reconcile_intraday_drawdown_from_broker, so a drawdown "
-            "reached entirely while the bot was down is missing from the "
-            "day's report."
-        )
-
-        observe_lines = [
-            node.lineno
-            for node in ast.walk(main)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "_observe_equity"
-        ]
-        summary_line = _daily_summary_call().lineno
-
-        assert any(
-            max(observe_lines) < l < summary_line for l in reconcile_lines
-        ), (
-            f"reconcile_intraday_drawdown_from_broker (lines "
-            f"{reconcile_lines}) must run after the final _observe_equity "
-            f"(lines {observe_lines}) and before generate_daily_summary "
-            f"(line {summary_line})."
-        )
+        assert len(scheduler_calls) == 1
 
 
 class TestRemovedInMemoryAccumulator:

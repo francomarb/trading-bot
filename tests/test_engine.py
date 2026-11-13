@@ -636,6 +636,87 @@ class TestDualAssetBarAlignment:
         assert decision.symbol == "SPXL"
         assert decision.protection_model is ProtectionModel.SIGNAL_EXIT_ONLY
 
+    def test_real_signal_exit_fill_does_not_run_stop_repair(
+        self, engine_factory, monkeypatch,
+    ):
+        execution = _bars(n=60, base=30.0)
+        signal = _bars(n=60, base=100.0)
+        rising = [100.0 + index for index in range(len(signal))]
+        signal["open"] = rising
+        signal["high"] = [value + 1.0 for value in rising]
+        signal["low"] = [value - 1.0 for value in rising]
+        signal["close"] = rising
+        frames = {"SPXL": execution, "SPY": signal}
+
+        def _fetch(symbol, start, end, timeframe="1Day", **kwargs):
+            return frames[symbol], SimpleNamespace(api_calls=0)
+
+        monkeypatch.setattr("engine.trader.fetch_symbol", _fetch)
+        engine, broker = engine_factory()
+        strategy = LeveragedTrend(
+            sma_length=2,
+            entry_days=2,
+            exit_days=2,
+            target_notional_pct=0.05,
+        )
+        engine.slots[0].strategy = strategy
+        engine.risk.record_broker_error = MagicMock()
+        engine.alerts.broker_error = MagicMock()
+
+        api = MagicMock()
+        submitted: dict[str, SimpleNamespace] = {}
+
+        def _submit(request):
+            order = SimpleNamespace(
+                id="stopless-entry",
+                status="filled",
+                filled_qty=str(request.qty),
+                filled_avg_price="33.00",
+                symbol="SPXL",
+                side="buy",
+                qty=str(request.qty),
+                type="market",
+                limit_price=None,
+                stop_price=None,
+                time_in_force="day",
+                submitted_at=T0,
+                filled_at=T0,
+            )
+            submitted["order"] = order
+            return order
+
+        api.submit_order.side_effect = _submit
+        api.get_order_by_id.side_effect = lambda *_args, **_kwargs: submitted[
+            "order"
+        ]
+        real_broker = AlpacaBroker(
+            client=api, max_attempts=1, base_delay=0.0,
+        )
+        captured: dict[str, OrderResult] = {}
+
+        def _place(decision, **kwargs):
+            result = real_broker.place_order(decision, **kwargs)
+            captured["result"] = result
+            return result
+
+        broker.place_order.side_effect = _place
+        snapshot = _snapshot()
+
+        engine._process_symbol(
+            "SPXL",
+            snapshot,
+            snapshot.account,
+            strategy,
+            engine.slots[0].timeframe,
+            signal_symbol="SPY",
+            data_feed="sip",
+        )
+
+        assert captured["result"].protection_status == "not_required"
+        broker.sync_with_broker.assert_not_called()
+        engine.risk.record_broker_error.assert_not_called()
+        engine.alerts.broker_error.assert_not_called()
+
     @pytest.mark.parametrize(
         "mismatch",
         ["missing-latest-signal", "missing-latest-execution", "internal-gap"],
@@ -3492,6 +3573,113 @@ class TestWatchlistStatuses:
     #   - tests/test_apply_order_event.py::TestCycleReconcileStoreQuery
     #   - tests/test_apply_order_event.py::TestSubstrateEntryFillDispatchSemantics
     #   - tests/test_stream.py::TestLifecycleEventQueue
+
+
+class TestImmediateEntryProtectionRepair:
+    def test_noop_when_broker_reports_surviving_stop(self, engine_factory):
+        engine, broker = engine_factory()
+        result = replace(
+            _filled_result("AAPL", 10, 100.0),
+            stop_placement_reported=True,
+            placed_stop_price=95.0,
+        )
+
+        engine._repair_unprotected_entry_fill(result)
+
+        broker.sync_with_broker.assert_not_called()
+
+    def test_fresh_snapshot_repairs_stop_before_next_cycle(self, engine_factory):
+        snapshot = _snapshot(
+            positions={"AAPL": Position("AAPL", 10, 100.0, 1000.0)},
+            open_orders=[],
+        )
+        engine, broker = engine_factory(snapshot=snapshot)
+        engine._register_single_leg(
+            strategy_name="fake_strategy", symbol="AAPL",
+        )
+        broker.sync_with_broker.return_value = snapshot
+        engine._sync_managed_stop_legs = MagicMock()
+        stop = replace(_open_stop_order("AAPL", 95.0), qty=10)
+
+        def repair(snap, *, allow_residual_cleanup=True):
+            assert allow_residual_cleanup is False
+            snap.open_orders.append(stop)
+
+        engine._repair_missing_protective_stops = MagicMock(side_effect=repair)
+        engine.risk.record_broker_error = MagicMock()
+        engine.alerts.broker_error = MagicMock()
+        result = replace(
+            _filled_result("AAPL", 10, 100.0),
+            stop_placement_reported=True,
+            placed_stop_price=None,
+        )
+
+        engine._repair_unprotected_entry_fill(result)
+
+        broker.sync_with_broker.assert_called_once_with()
+        engine._sync_managed_stop_legs.assert_called_once_with(snapshot)
+        engine._repair_missing_protective_stops.assert_called_once_with(
+            snapshot, allow_residual_cleanup=False,
+        )
+        engine.risk.record_broker_error.assert_not_called()
+        engine.alerts.broker_error.assert_not_called()
+
+    def test_alerts_when_immediate_reconcile_still_has_no_stop(
+        self, engine_factory,
+    ):
+        snapshot = _snapshot(
+            positions={"AAPL": Position("AAPL", 10, 100.0, 1000.0)},
+            open_orders=[],
+        )
+        engine, broker = engine_factory(snapshot=snapshot)
+        engine._register_single_leg(
+            strategy_name="fake_strategy", symbol="AAPL",
+        )
+        broker.sync_with_broker.return_value = snapshot
+        engine._sync_managed_stop_legs = MagicMock()
+        engine._repair_missing_protective_stops = MagicMock()
+        engine.risk.record_broker_error = MagicMock()
+        engine.alerts.broker_error = MagicMock()
+        result = replace(
+            _filled_result("AAPL", 10, 100.0),
+            stop_placement_reported=True,
+            placed_stop_price=None,
+        )
+
+        engine._repair_unprotected_entry_fill(result)
+
+        engine.risk.record_broker_error.assert_called_once_with()
+        engine.alerts.broker_error.assert_called_once()
+
+    def test_pending_cancel_stop_is_not_claimed_as_durable_protection(
+        self, engine_factory,
+    ):
+        pending = replace(
+            _open_stop_order("AAPL", 95.0), status="pending_cancel",
+        )
+        snapshot = _snapshot(
+            positions={"AAPL": Position("AAPL", 10, 100.0, 1000.0)},
+            open_orders=[pending],
+        )
+        engine, broker = engine_factory(snapshot=snapshot)
+        engine._register_single_leg(
+            strategy_name="fake_strategy", symbol="AAPL",
+        )
+        broker.sync_with_broker.return_value = snapshot
+        engine._sync_managed_stop_legs = MagicMock()
+        engine._repair_missing_protective_stops = MagicMock()
+        engine.risk.record_broker_error = MagicMock()
+        engine.alerts.broker_error = MagicMock()
+        result = replace(
+            _filled_result("AAPL", 10, 100.0),
+            stop_placement_reported=True,
+            placed_stop_price=None,
+        )
+
+        engine._repair_unprotected_entry_fill(result)
+
+        engine.risk.record_broker_error.assert_called_once_with()
+        engine.alerts.broker_error.assert_called_once()
 
 
 class TestProtectionPolicyReconciliation:

@@ -2783,6 +2783,50 @@ class TradeLogger:
             return []
         return self.read_realized_pnl_events_in_range(day, day)
 
+    def read_realized_pnl_components_for_day(
+        self, day: str,
+    ) -> list[tuple[str, float, str]]:
+        """Return realized components with a stable lifecycle identity.
+
+        A single position can produce multiple honest realized rows, such as
+        a whole-share protective-stop fill followed by fractional-residual
+        cleanup. Reports must sum every component while counting that position
+        once. Legacy rows without ``position_uid`` receive a row-local key so
+        unrelated historical closes are never collapsed together.
+        """
+        if not day:
+            return []
+        return self.read_realized_pnl_components_in_range(day, day)
+
+    def read_realized_pnl_components_in_range(
+        self, start: str, end: str,
+    ) -> list[tuple[str, float, str]]:
+        """Return ``(strategy, realized_pnl, lifecycle_key)`` components."""
+        if not start or not end or not os.path.exists(self._path):
+            return []
+        try:
+            conn = self._ensure_db()
+        except sqlite3.Error:
+            return []
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(
+            "SELECT id, strategy, realized_pnl, position_uid FROM trades "
+            "WHERE (side = 'sell' OR position_type = 'spread') "
+            "AND status IN ('filled', 'partial') "
+            "AND realized_pnl IS NOT NULL "
+            "AND substr(exit_timestamp, 1, 10) BETWEEN ? AND ? "
+            "ORDER BY id ASC",
+            (start, end),
+        )
+        return [
+            (
+                row["strategy"],
+                float(row["realized_pnl"]),
+                str(row["position_uid"] or f"legacy-row-{row['id']}"),
+            )
+            for row in cursor.fetchall()
+        ]
+
     def read_realized_pnl_events_in_range(
         self, start: str, end: str,
     ) -> list[tuple[str, float]]:

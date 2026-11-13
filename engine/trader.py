@@ -1788,9 +1788,8 @@ class TradingEngine:
         Largest peak-to-trough account-equity decline (dollars) observed
         today, across bot restarts within the same UTC day.
 
-        Read by the shutdown EOD report in `forward_test.py`, which
-        observes its own final snapshot before reading this so a decline
-        after the last cycle still counts.
+        The completed-session reporter combines this locally observed value
+        with Alpaca's finer broker equity path for the current session.
         """
         return self._max_intraday_drawdown
 
@@ -3637,6 +3636,7 @@ class TradingEngine:
                 fill_qty = float(result.filled_qty or decision.qty)
                 # Cache entry price for HWM P&L gate (used on close).
                 self._entry_prices[target_symbol] = fill_price
+                self._repair_unprotected_entry_fill(result)
                 self.alerts.trade_executed(
                     symbol=symbol,
                     strategy=strategy.name,
@@ -10021,6 +10021,66 @@ class TradingEngine:
                 logger.error(msg)
                 self.risk.record_broker_error()
                 self.alerts.broker_error(msg)
+
+    def _repair_unprotected_entry_fill(self, result: OrderResult) -> None:
+        """Immediately reconcile a filled equity whose stop rebuild failed.
+
+        This is an exceptional post-fill safety path, not a second entry or
+        stop-management policy. ``AlpacaBroker.place_order`` reports the exact
+        condition with ``stop_placement_reported=True`` and
+        ``placed_stop_price=None`` after it preserves the truthful fill. A
+        fresh broker snapshot often observes a cancellation that completed
+        just after the bounded confirmation wait; repair it now instead of
+        waiting for the next five-minute engine cycle.
+        """
+        if (
+            result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}
+            or not result.stop_placement_reported
+            or result.placed_stop_price is not None
+            or result.protection_status == "not_required"
+            or _OCC_PAT.match(result.symbol)
+        ):
+            return
+
+        logger.warning(
+            f"{result.symbol}: filled entry reported no surviving protective "
+            "stop; running immediate broker reconciliation"
+        )
+        try:
+            snapshot = self.broker.sync_with_broker()
+            self._sync_managed_stop_legs(snapshot)
+            self._repair_missing_protective_stops(
+                snapshot, allow_residual_cleanup=False,
+            )
+        except Exception as exc:
+            msg = (
+                f"{result.symbol}: immediate post-fill protective-stop "
+                f"reconciliation failed: {exc}"
+            )
+            logger.critical(msg)
+            self.risk.record_broker_error()
+            self.alerts.broker_error(msg)
+            return
+
+        confirmed = self._protective_stop_order(result.symbol, snapshot)
+        if (
+            confirmed is not None
+            and str(confirmed.status).lower() != "pending_cancel"
+        ):
+            logger.warning(
+                f"{result.symbol}: immediate post-fill reconciliation "
+                "confirmed broker-side protection"
+            )
+            return
+
+        msg = (
+            f"{result.symbol}: filled entry remains without confirmed "
+            "broker-side protection after immediate reconciliation; cycle "
+            "repair will retry"
+        )
+        logger.critical(msg)
+        self.risk.record_broker_error()
+        self.alerts.broker_error(msg)
 
     def _durable_fill_anchor_target(
         self, symbol: str
