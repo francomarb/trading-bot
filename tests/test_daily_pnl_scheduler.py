@@ -97,7 +97,7 @@ def test_after_close_finalizes_once_from_db_and_broker_history(
     assert scheduler.broker.get_intraday_equity_path.call_count == 1
     start, end = scheduler.broker.get_intraday_equity_path.call_args.args
     assert start == datetime(2026, 11, 11, 5, 0, tzinfo=timezone.utc)
-    assert end == datetime(2026, 11, 12, 5, 0, tzinfo=timezone.utc)
+    assert end == datetime(2026, 11, 11, 21, 5, tzinfo=timezone.utc)
     scheduler.dispatcher.eod_summary.assert_called_once_with(
         daily_pnl=125.0, trade_count=1, win_rate=1.0,
     )
@@ -136,6 +136,8 @@ def test_next_morning_backfill_does_not_claim_current_unrealized_mark(
 
     content = (tmp_path / "daily" / "2026-11-11.md").read_text()
     assert "| Unrealized P&L | — (unavailable) |" in content
+    _, end = scheduler.broker.get_intraday_equity_path.call_args.args
+    assert end == datetime(2026, 11, 11, 21, 5, tzinfo=timezone.utc)
 
 
 def test_stale_shutdown_report_is_replaced_by_final_report(

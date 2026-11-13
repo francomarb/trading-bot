@@ -636,6 +636,87 @@ class TestDualAssetBarAlignment:
         assert decision.symbol == "SPXL"
         assert decision.protection_model is ProtectionModel.SIGNAL_EXIT_ONLY
 
+    def test_real_signal_exit_fill_does_not_run_stop_repair(
+        self, engine_factory, monkeypatch,
+    ):
+        execution = _bars(n=60, base=30.0)
+        signal = _bars(n=60, base=100.0)
+        rising = [100.0 + index for index in range(len(signal))]
+        signal["open"] = rising
+        signal["high"] = [value + 1.0 for value in rising]
+        signal["low"] = [value - 1.0 for value in rising]
+        signal["close"] = rising
+        frames = {"SPXL": execution, "SPY": signal}
+
+        def _fetch(symbol, start, end, timeframe="1Day", **kwargs):
+            return frames[symbol], SimpleNamespace(api_calls=0)
+
+        monkeypatch.setattr("engine.trader.fetch_symbol", _fetch)
+        engine, broker = engine_factory()
+        strategy = LeveragedTrend(
+            sma_length=2,
+            entry_days=2,
+            exit_days=2,
+            target_notional_pct=0.05,
+        )
+        engine.slots[0].strategy = strategy
+        engine.risk.record_broker_error = MagicMock()
+        engine.alerts.broker_error = MagicMock()
+
+        api = MagicMock()
+        submitted: dict[str, SimpleNamespace] = {}
+
+        def _submit(request):
+            order = SimpleNamespace(
+                id="stopless-entry",
+                status="filled",
+                filled_qty=str(request.qty),
+                filled_avg_price="33.00",
+                symbol="SPXL",
+                side="buy",
+                qty=str(request.qty),
+                type="market",
+                limit_price=None,
+                stop_price=None,
+                time_in_force="day",
+                submitted_at=T0,
+                filled_at=T0,
+            )
+            submitted["order"] = order
+            return order
+
+        api.submit_order.side_effect = _submit
+        api.get_order_by_id.side_effect = lambda *_args, **_kwargs: submitted[
+            "order"
+        ]
+        real_broker = AlpacaBroker(
+            client=api, max_attempts=1, base_delay=0.0,
+        )
+        captured: dict[str, OrderResult] = {}
+
+        def _place(decision, **kwargs):
+            result = real_broker.place_order(decision, **kwargs)
+            captured["result"] = result
+            return result
+
+        broker.place_order.side_effect = _place
+        snapshot = _snapshot()
+
+        engine._process_symbol(
+            "SPXL",
+            snapshot,
+            snapshot.account,
+            strategy,
+            engine.slots[0].timeframe,
+            signal_symbol="SPY",
+            data_feed="sip",
+        )
+
+        assert captured["result"].protection_status == "not_required"
+        broker.sync_with_broker.assert_not_called()
+        engine.risk.record_broker_error.assert_not_called()
+        engine.alerts.broker_error.assert_not_called()
+
     @pytest.mark.parametrize(
         "mismatch",
         ["missing-latest-signal", "missing-latest-execution", "internal-gap"],

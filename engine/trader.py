@@ -10037,6 +10037,7 @@ class TradingEngine:
             result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}
             or not result.stop_placement_reported
             or result.placed_stop_price is not None
+            or result.protection_status == "not_required"
             or _OCC_PAT.match(result.symbol)
         ):
             return

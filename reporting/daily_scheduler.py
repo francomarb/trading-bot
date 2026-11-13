@@ -97,10 +97,14 @@ class DailyPnLReportScheduler:
         send_alert: bool,
     ) -> None:
         start_et = datetime.combine(session, time.min, tzinfo=_NEW_YORK)
-        end_et = start_et + timedelta(days=1)
+        # Keep same-evening and catch-up reports comparable. Alpaca clamps a
+        # future end to request time, so asking through the next midnight made
+        # a report's equity path depend on when the scheduler happened to run.
+        end_et = datetime.combine(session, _FINAL_REPORT_TIME, tzinfo=_NEW_YORK)
+        bounded_end = min(now, end_et.astimezone(timezone.utc))
         equity_path = self.broker.get_intraday_equity_path(
             start_et.astimezone(timezone.utc),
-            end_et.astimezone(timezone.utc),
+            bounded_end,
         )
         if not equity_path:
             raise RuntimeError(
