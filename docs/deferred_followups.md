@@ -134,6 +134,12 @@ truth and invokes the existing stop-repair policy. It does not alter ordinary
 entry selection, stop pricing, or replacement behavior; cycle repair remains
 the final fallback.
 
+Closure evidence, 2026-11-17: MRNA produced the next natural capped fill after
+PR #191. The attached DAY child reached terminal cancellation, the standalone
+GTC repair was submitted and working immediately afterward, and there was no
+duplicate SELL exposure or material unprotected interval. The PLAN watch is
+closed; reopen it only if a new broker event violates this contract.
+
 ## 3. SPY options reversion blocked before enough paper trades
 
 On June 22, 2026, `spy_options_reversion` produced valid entry signals but was
