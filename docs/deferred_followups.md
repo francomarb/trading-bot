@@ -141,11 +141,11 @@ stop to the actual fill. Each child reached terminal cancellation before one
 standalone GTC stop became active, with no duplicate SELL exposure or material
 unprotected interval. This is the same broker method used by the DAY-child
 rebuild. No Donchian DAY child has naturally exercised the post-PR #191 path;
-existing tests exercise DAY-child rebuilds when both durability and fill
-re-anchoring require replacement. A focused regression test remains for an
-exact-reference capped fill, where durability is the sole rebuild trigger. The
-PLAN watch is closed on the shared-path evidence and should reopen only if a
-new broker event violates this contract.
+the focused broker regression now isolates an exact-reference capped fill and
+proves that durability alone cancels the DAY child and establishes a standalone
+GTC stop even when no fill-price re-anchor is due. The PLAN watch is closed on
+the shared-path evidence and should reopen only if a new broker event violates
+this contract.
 
 ## 3. SPY options reversion blocked before enough paper trades
 
