@@ -1115,6 +1115,62 @@ class TestEntryMaxPriceCap:
         # stop 95.0 => 5.00 offset; fill 100.5 => 95.5.
         assert stop_req.stop_price == 95.5
 
+    def test_capped_fill_at_reference_still_rebuilds_day_stop_as_gtc(self):
+        """Durability alone rebuilds the DAY child when no re-anchor is due."""
+        api = MagicMock()
+        entry_order = _alpaca_order(
+            id="entry-1",
+            status="accepted",
+            legs=[SimpleNamespace(id="day-stop-1", type="stop", side="sell")],
+        )
+        gtc_stop = _alpaca_order(
+            id="gtc-stop-1",
+            status="accepted",
+            side="sell",
+            qty=10,
+            type="stop",
+            stop_price="95.0",
+            time_in_force="gtc",
+        )
+        api.submit_order.side_effect = [entry_order, gtc_stop]
+        api.get_order_by_id.side_effect = [
+            _alpaca_order(
+                id="entry-1",
+                status="filled",
+                filled_qty=10,
+                filled_avg_price=100.0,
+            ),
+            _alpaca_order(
+                id="day-stop-1",
+                status="canceled",
+                filled_qty=0,
+                filled_avg_price=None,
+            ),
+        ]
+        api.get_open_position.side_effect = [
+            SimpleNamespace(qty_available="0"),
+            SimpleNamespace(qty_available="10"),
+        ]
+        broker = _broker_with_mock(api)
+
+        result = broker.place_order(
+            _decision(
+                qty=10,
+                entry=100.0,
+                stop=95.0,
+                entry_max_price=105.0,
+            ),
+            poll_timeout=0.0,
+            poll_interval=0.0,
+        )
+
+        assert result.status is OrderStatus.FILLED
+        api.replace_order_by_id.assert_not_called()
+        api.cancel_order_by_id.assert_called_once_with("day-stop-1")
+        stop_req = api.submit_order.call_args_list[1].args[0]
+        assert stop_req.stop_price == 95.0
+        assert stop_req.time_in_force.value == "gtc"
+
     def test_rebuild_resolves_child_from_nested_parent_when_submit_omits_legs(self):
         api = MagicMock()
         entry_order = _alpaca_order(
