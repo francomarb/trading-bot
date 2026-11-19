@@ -151,8 +151,12 @@ New RSI, SMA, and Donchian candidate rows store this replay contract directly,
 including the effective entry time-in-force. Historical Git reconstruction is
 a legacy fallback for older rows, not the primary contract for new evidence.
 RSI v1.1 rows recorded before this repair did not store their v3 fill-anchored
-contract; their refused-candidate shadows remain provisional until the legacy
-resolver becomes version-aware and those disposable outcomes are regenerated.
+contract. These 17 refused candidates never became transactions, so they have
+no real fill or exit outcome to recover; evaluating them necessarily requires
+a counterfactual simulation. Their existing shadows remain provisional until
+the legacy resolver becomes version-aware and re-simulates them with the
+historical v1.1 fill-anchored contract. Only the disposable shadow outcomes are
+replaced; the original candidate observations and real trades remain unchanged.
 
 The resolver command only updates `entry_candidate_shadow_outcomes` when
 `--apply` is passed. It never changes a decision, lifecycle, allocator state,
