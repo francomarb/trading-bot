@@ -1,10 +1,11 @@
 # Credit Spread — Strategy Research & Deployment Guide
 
-**Status:** ✅ **PAPER ACTIVE** — wired in `forward_test.py` since PLAN 11.29.
-Running on **SPY + QQQ** in paper mode for several weeks as of this
-update; allocated 10% of equity in the isolated-options pool.
+**Status:** **PAPER DISABLED** — `CREDIT_SPREAD_PAPER_ENABLED=False` excludes
+the SPY/QQQ slots and their allocator sleeve. The former 10% share of
+deployable capital now belongs to SPY options reversion. Historical results
+and implementation remain available if the operator later re-enables it.
 
-**Last updated:** 2026-06-06
+**Last updated:** 2026-11-26
 
 **Strategy ID:** `credit_spread` (instances run per underlying:
 `credit_spread_spy`, `credit_spread_qqq`).
@@ -26,11 +27,11 @@ update; allocated 10% of equity in the isolated-options pool.
 
 | Parameter | Value | Source |
 |---|---|---|
-| Pool type | Isolated options (defined-risk, never stretches) | `settings.STRATEGY_ALLOCATIONS["credit_spread"]` |
-| Sleeve weight | 0.10 of equity (target) | same |
+| Pool type | Isolated options when enabled (defined-risk, never stretches) | `settings.STRATEGY_ALLOCATIONS` |
+| Sleeve weight | 0 while disabled; 0.10 of deployable capital when enabled | same |
 | Shared max concurrent positions | **2** across all underlyings — one per instrument (throttled 2026-08-09, PLAN 11.57; was 8, briefly 1) | `settings.MAX_TOTAL_CONCURRENT_CREDIT_SPREADS` |
 | Regime gate | `TRENDING`, `RANGING` only | `settings.STRATEGY_ALLOWED_REGIMES["credit_spread"]` |
-| Sleeve budget pct | 0.10 | `settings.CREDIT_SPREAD_SLEEVE_BUDGET_PCT` |
+| Sleeve budget pct | 0.10 configured for a future re-enable; unused while disabled | `settings.CREDIT_SPREAD_SLEEVE_BUDGET_PCT` |
 | Min trades for health verdict | 25 | `settings.STRATEGY_MIN_TRADES_FOR_VERDICT` |
 | Instruments | SPY, QQQ | `settings.CREDIT_SPREAD_INSTRUMENTS` |
 
@@ -424,7 +425,7 @@ Build a defined-risk premium-selling options strategy that:
 - Is **underlying-agnostic by design** — one strategy class, one set of logic, parameterized per instrument. SPY, QQQ, IWM, mega-cap single names, and (with care) leveraged ETFs all use the same class with different config blocks
 - Trades **multiple concurrent positions across multiple underlyings** so the absolute $ contribution to portfolio P&L is meaningful, not just the sleeve-return ratio
 - Lays cleaner plumbing for future spread-based strategies (iron condors, calendar spreads, multi-leg directional)
-- Runs alongside `spy_options_reversion` in paper. The completed 11.26 audit validated that strategy's contract picker; it did not retire either strategy or decide live graduation.
+- Previously ran alongside `spy_options_reversion` in paper. Credit spread is now disabled by operator choice; the completed 11.26 audit did not decide live graduation.
 
 The current SPY options strategy is, by acknowledgement, **plumbing first, edge second**. It proved the engine can route OCC symbols, manage async fill workers, normalize underlying-vs-contract symbol ambiguity, and apply the 100× P&L multiplier correctly. That groundwork transfers directly to this strategy. What changes is the trade structure (one-leg long premium → two-leg short premium), the underlying engine plumbing for multi-leg orders, and the operating mode (one underlying → N underlyings).
 
@@ -635,7 +636,7 @@ Honest math for SPY + QQQ + IWM running concurrently:
 
 Plus headroom for new entries while existing ones are open. **Recommend `CREDIT_SPREAD_SLEEVE_BUDGET = $11k–13k`, i.e. 10–12% of $108k equity.**
 
-Combined with the existing 5% `spy_options_reversion` sleeve, the current paper options allocation is 15% (10% credit spread + 5% single-leg). The completed 11.26 picker audit did not transfer capital between them; any future allocation change requires its own strategy-graduation decision.
+Historical design allocation was 10% credit spread and 5% SPY options. The current paper configuration disables credit spread and assigns the full 15% isolated-options pool to SPY options. The completed 11.26 picker audit did not motivate this change; it is a separate operator decision.
 
 ### Capital flow under defaults
 
@@ -905,7 +906,7 @@ SPY, QQQ, IWM are correlated — when one breaches its short strike, the others 
 Capture answers in the PLAN.md row before coding starts:
 
 1. **Alpaca account options level** — is it Level 3 (spreads on cash)? Verify before any code goes in.
-2. **Sleeve allocation — resolved:** keep the separate 10% credit-spread and 5% `spy_options_reversion` paper sleeves. The 11.26 picker audit does not decide strategy graduation or reallocation.
+2. **Sleeve allocation — superseded:** the original 10%/5% split applied while credit spread ran. Credit spread is now disabled and SPY options has the full 15% isolated pool in paper.
 3. **v1 underlyings** — SPY + QQQ + IWM as proposed? Or start with SPY only and add the others in a v1.1? My recommendation: launch with SPY + QQQ at v1, add IWM after 30 days of paper.
 4. **TQQQ in scope?** Strong recommendation: not v1, not v2 either. Possibly v3 only with explicit acknowledgement of the very different risk profile. See §15.
 5. **Single-name underlyings (AAPL, NVDA, MSFT) in scope?** Possible from v1 if the earnings blackout works correctly, but adds idiosyncratic gap risk. My recommendation: ETFs only at launch; single names as v2 after 60 days of clean paper.

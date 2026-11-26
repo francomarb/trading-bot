@@ -422,7 +422,7 @@ Win rate drops with the trailing stop because some quick +20% wins now exit at s
 **Watchlist:** `["SPY"]` (fixed, `config/settings.py`).
 
 **Why this strategy:**
-The equity strategies are all long-biased and rely on sustained price trends. SPY options provide a structurally different payoff profile: leveraged upside with defined downside (premium paid). The RSI oversold recovery signal on SPY specifically targets short-duration mean-reversion setups where implied volatility is elevated enough to make calls cheap relative to expected move. The 5% sleeve keeps total risk small while the strategy is being paper-validated.
+The equity strategies are all long-biased and rely on sustained price trends. SPY options provide leveraged upside with defined downside (premium paid). Its 15% sleeve is a paper-only sizing choice, not evidence of profitability or live readiness.
 
 ---
 
@@ -437,9 +437,9 @@ The equity strategies are all long-biased and rely on sustained price trends. SP
 | Type | Defined-risk short premium (bull put credit spread) |
 | Instruments | SPY + QQQ at v1 (IWM / single names / leveraged ETFs deferred — see [`docs/credit_spread_strategy.md`](credit_spread_strategy.md) §15) |
 | Order type | Atomic MLEG combo (`OrderClass.MLEG`) via `SpreadExecutionWorker` |
-| Status | **Paper Trading** |
-| Sleeve weight | 10% of gross capital (shared across SPY + QQQ instances) |
-| Max positions | 8 total (`MAX_TOTAL_CONCURRENT_CREDIT_SPREADS`), 3 per underlying |
+| Status | **Disabled for new paper entries** |
+| Sleeve weight | 0% while disabled; formerly 10% of deployable capital |
+| Max positions | 2 total (`MAX_TOTAL_CONCURRENT_CREDIT_SPREADS`), 1 per underlying when enabled |
 | Per-position max loss | ~$850 (SPY $10 width) – ~$1,300 (QQQ $15 width) |
 | Activated | 2026-05-15 |
 
@@ -605,31 +605,29 @@ STRATEGY_ALLOCATIONS = {
         "max_position_pct_of_sleeve": 0.25,
     },
     "spy_options_reversion": {
-        "target_pct": 0.05, "type": "isolated", "priority": 0,
+        "target_pct": 0.15, "type": "isolated", "priority": 0,
         "can_stretch": False, "hard_max_positions": 1,
         "max_position_pct_of_sleeve": 1.00,
     },
-    "credit_spread": {
-        "target_pct": 0.10, "type": "isolated", "priority": 4,
-        "can_stretch": False, "hard_max_positions": 2,
-        "max_position_pct_of_sleeve": 0.40,
-    },
 }
+# CREDIT_SPREAD_PAPER_ENABLED=False excludes spread slots and their sleeve.
+# Re-enable only after confirming spread positions and orders are flat;
+# SPY options then returns to 0.05 and credit spread gets 0.10.
 MAX_GROSS_EXPOSURE_PCT = 0.80
 ```
 
 At $100k paper equity:
 - Gross ceiling: $100k × 0.80 = $80,000
 - Equity pool: $80k × 0.85 = $68,000 shared by SMA / RSI / Donchian / Leveraged Trend
-- Options vault: $80k × 0.15 = $12,000 shared by SPY Options + Credit Spread (isolated, never stretches)
+- Options vault: $80k × 0.15 = $12,000 for SPY Options while Credit Spread is disabled (isolated, never stretches)
 - SMA target sleeve: $80k × 0.30 = $24,000, stretch cap $27,600, baseline max single position $9,600
 - RSI target sleeve: $80k × 0.15 = $12,000, stretch cap $13,800, baseline max single position $4,800
 - Donchian target sleeve: $80k × 0.15 = $12,000, stretch cap $13,800, baseline max single position $4,800
 - Leveraged Trend target sleeve: $80k × 0.25 = $20,000, no stretch, max single position $5,000
-- Options (single-leg) target sleeve: $80k × 0.05 = $4,000, isolated, no stretch
-- Credit Spread target sleeve: $80k × 0.10 = $8,000, isolated, no stretch — shared across SPY + QQQ instances, per-position max loss capped at $80k × 0.10 × 0.40 = $3,200
+- Options (single-leg) target sleeve: $80k × 0.15 = $12,000, isolated, no stretch
+- Credit Spread target sleeve: $0 while disabled
 
-These are the current paper allocations. The 11.30 review closed without further credit-spread tuning; future optimization is tracked separately under 11.63.
+These are the next paper allocations. The SPY-option ceiling is three times its prior value, but still allows only one open position. Credit-spread collection under 11.63 is paused.
 
 Elastic borrowing is equity-only: idle equity capital may be borrowed up to 115% of target while total deployable utilization remains below 80%. `hard_max_positions` is a safety ceiling, not the sizing formula.
 

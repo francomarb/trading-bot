@@ -771,6 +771,10 @@ CAPITAL_POOLS: dict[str, float] = {
     "isolated_options": 0.15,
 }
 
+# Paper strategy switch. Keep the isolated-options pool fully allocated when
+# credit spreads are off; the released 10% goes to SPY options reversion.
+CREDIT_SPREAD_PAPER_ENABLED: bool = False
+
 STRATEGY_ALLOCATIONS: dict[str, dict] = {
     # `risk_per_trade_pct` (11.48, accepted 2026-07-13): per-strategy
     # risk-to-stop target as a fraction of account equity. Derived so the
@@ -828,31 +832,25 @@ STRATEGY_ALLOCATIONS: dict[str, dict] = {
         "max_position_pct_of_sleeve": 0.25,
     },
     "spy_options_reversion": {
-        "target_pct": 0.05,
+        "target_pct": 0.05 if CREDIT_SPREAD_PAPER_ENABLED else 0.15,
         "type": "isolated",
         "priority": 0,
         "can_stretch": False,
         "hard_max_positions": 1,
         "max_position_pct_of_sleeve": 1.00,
     },
-    # Credit spread (11.29): shared sleeve across all CreditSpread instances
-    # (SPY + QQQ at v1). isolated pool — defined-risk, never stretches.
-    # hard_max_positions mirrors MAX_TOTAL_CONCURRENT_CREDIT_SPREADS; the
-    # per-instance caps live in CREDIT_SPREAD_INSTRUMENTS. 0.10 carved from
-    # SMA (0.45→0.40) and RSI (0.25→0.20); spy_options_reversion unchanged.
-    "credit_spread": {
+}
+
+if CREDIT_SPREAD_PAPER_ENABLED:
+    # Shared, defined-risk sleeve across SPY and QQQ; never stretches.
+    STRATEGY_ALLOCATIONS["credit_spread"] = {
         "target_pct": 0.10,
         "type": "isolated",
-        # SleeveAllocator enforces unique priorities; spy_options_reversion
-        # already holds 0. Priority rarely binds inside the isolated_options
-        # pool (it is 15% with the two sleeves summing to it cleanly), so
-        # credit_spread takes the next free slot.
         "priority": 4,
         "can_stretch": False,
-        "hard_max_positions": 2,            # 11.57 throttle: 1 per instrument (was 8)
+        "hard_max_positions": 2,  # 11.57: one per instrument
         "max_position_pct_of_sleeve": 0.40,
-    },
-}
+    }
 
 # ── Correlated-entry heat cap (PLAN 11.60) ──────────────────────────────────
 # "Heat" is total open risk carried at once: the sum, across a sleeve's open
@@ -1164,7 +1162,7 @@ MAX_TOTAL_CONCURRENT_CREDIT_SPREADS = 2
 # reads of the same intent; a silent divergence would let the allocator fund
 # spreads the strategy refuses to open (or the reverse). Documentation that
 # "these match" rots, so assert it at import.
-if (
+if CREDIT_SPREAD_PAPER_ENABLED and (
     STRATEGY_ALLOCATIONS["credit_spread"]["hard_max_positions"]
     != MAX_TOTAL_CONCURRENT_CREDIT_SPREADS
 ):
