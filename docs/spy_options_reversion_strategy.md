@@ -47,7 +47,7 @@ human discretion lacks (greed, holding winners past the target).
 | Delta floor | Exit if Black-Scholes Delta < 0.30 (uses VIX as implied vol, cached daily) |
 | Edge filter | `SPYOptionsEdgeFilter`: (1) SPY close > **100-day SMA** (always); (2) **VIX ≤-percentile ≥ 0.60** of its trailing-1y range — enforced **only in TRENDING** (`SPY_OPTIONS_MIN_VIX_PERCENTILE`) |
 | Regime gate | `TRENDING` or `RANGING` — blocked in BEAR and VOLATILE. In TRENDING the VIX gate above additionally requires elevated IV; RANGING trades on the SMA gate alone |
-| Sleeve weight | 0.05 of gross capital |
+| Sleeve weight | 0.15 of deployable capital while credit spread is disabled; 0.05 if re-enabled |
 | Max positions | 1 concurrent |
 
 The trailing HWM is durable across restarts and is shared by the strategy's
@@ -62,9 +62,9 @@ alerts and bootstraps conservatively from the higher of entry premium and the
 current Alpaca position premium.
 
 **Capital math at $100k equity:**
-- Sleeve budget = $100k × 0.80 × 0.05 = **$4,000**
+- Sleeve budget = $100k × 0.80 × 0.15 = **$12,000** while credit spread is disabled
 - SPY call premium ~$8–12 per contract × 100 multiplier = $800–$1,200
-- Typical position size at 5% sleeve: **3–4 contracts**
+- Historical position size under the 5% sleeve: **3–4 contracts**; the 15% sleeve permits more contracts, subject to pricing and other guards
 - Max loss per trade at −25% SL: ~$200–300 per contract
 
 ---

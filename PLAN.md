@@ -8,7 +8,7 @@
 
 ## Current Operating State
 
-The bot is running in Alpaca paper mode as a six-sleeve portfolio:
+The bot's next paper configuration has five active sleeves (credit spread is disabled):
 
 | Sleeve | Strategy | Instruments | Status | Notes |
 |---|---|---|---|---|
@@ -17,7 +17,7 @@ The bot is running in Alpaca paper mode as a six-sleeve portfolio:
 | Equity | Donchian Breakout | 100-name durable-liquidity pool | Paper active | Trend-continuation; TRENDING/RANGING/VOLATILE, BEAR blocked |
 | Equity | Leveraged Trend | SPXL, TQQQ, TECL, SOXL | Paper active | Four slots; signal exits |
 | Isolated options | SPY Options Reversion | SPY calls | Paper active | Single-leg options; lifecycle-UID ownership |
-| Isolated options | Credit Spread | SPY + QQQ bull put spreads | Paper active | MLEG combos; UUID-keyed positions; SPY/QQQ share one sleeve |
+| Isolated options | Credit Spread | SPY + QQQ bull put spreads | Disabled | Historical evidence retained; no new entries |
 
 Runtime posture:
 
@@ -36,7 +36,11 @@ Current allocation model:
 | Pool | Share of deployable capital | Sleeves |
 |---|---:|---|
 | `equity` | 85% | SMA 30%, RSI 15%, Donchian 15%, Leveraged Trend 25% |
-| `isolated_options` | 15% | SPY Options 5%, Credit Spread 10% |
+| `isolated_options` | 15% | SPY Options 15%; Credit Spread 0% while disabled |
+
+This reallocation is a new SPY-options configuration cohort, not evidence that
+the strategy is profitable or ready for live capital. Re-enable credit spread
+only after checking broker positions and open MLEG orders.
 
 ---
 
@@ -89,7 +93,7 @@ from proceeding.
 | 2 | `11.61a` entry-candidate observation | Current reports resolve RSI, Donchian, and SMA contention groups under one framework. New rows store the exact replay contract, but 17 pre-fix RSI v1.1 refused shadows were replayed with the older reference-anchored stop and remain provisional | Make the legacy RSI fallback version-aware and regenerate only those disposable counterfactual outcomes. This is a report-correctness repair, not missing observation data or a production-trading change |
 | 3 | Strategy graduation evidence | Current exact-version evidence remains insufficient or unfavorable across the active strategies. Leveraged trend was enabled by the operator mid-cycle and the bot made its designed cold-start entries, so the cohort does not test fresh signal-transition entry selection. The funds subsequently rose before their signal exits realized losses, making the large peak-to-exit giveback valid evidence about exit behavior and drawdown | Continue exact-configuration, regime-specific paper collection. Wait for fresh signal-driven leveraged cycles before judging entry selection, while reviewing the observed drawdowns, concentration, and exit giveback now |
 | 4 | `11.60` / `11.62` heat limits | The historical watch still has only two would-block cases; 25 newer durable Donchian candidate observations were all below the proposed cap | Keep observing. There is no basis to enforce a strategy or portfolio heat ceiling yet |
-| 5 | `11.63` credit-spread bounded entry walk | No new attempt has extended the ten-attempt sample (two fills, eight cancels), still short of the roughly 20-attempt review target | Keep collecting only while credit spread remains enabled; do not retune the credit floor from this sample |
+| 5 | `11.63` credit-spread bounded entry walk | Paused at ten attempts (two fills, eight cancels) because credit spread is disabled | No further collection or tuning unless the operator deliberately re-enables the strategy |
 | 6 | MLEG walk cancel acknowledgement | **Deferred, very low priority.** The shared MLEG workers would benefit any future spread strategy, but credit spread is the only current consumer and may be disabled for weak profitability and high complexity | Reopen before retaining, expanding, or adding an MLEG strategy; then require terminal canceled/fill/reject truth before another rung |
 
 Evidence snapshot as of the **2026-11-17 close**: the initial slippage checkpoint is complete at **11 qualifying SELL exits / 3.72 bps average adverse slippage** and the paper drift guard remains intentionally off. RSI v1.1 has **24 completed, 12 wins / 12 losses, about -$685 after modeled costs, with 1 active**; RANGING accounts for 22 exits (10 wins, about -$780) while VOLATILE has only two completed winners (about +$96), far too few for a regime conclusion. Credit-spread bounded entry walk remains **10/~20 attempts, 2 fills / 8 cancels**. Donchian heat observation has **2 historical would-block events and 25 newer below-cap observations**. Donchian's current hash has **2 completed losses / about -$151 with 3 active**; its earlier `61b45d9939a5` cohort has **10 completed losses / about -$344 with 5 active**. SMA's current hash has **1 completed loss / about -$174 with no active position**; `9d03f1d0d22d` has **1 completed loss / about -$501 with 1 active**. Current SPY options has **13 completed / about -$2,183 after costs**. Leveraged trend has three closed positions totaling about **-$4,940** and one active. The operator enabled it mid-cycle and the bot entered through its cold-start policy, so the cohort does not test a fresh entry transition; however, each closed fund rose materially after entry and then exited after a much larger decline, making the peak-to-exit giveback clean evidence about the exit rule and accepted drawdown. `11.61a` continues to compare selected and refused candidates by strategy and regime; its 17 pre-fix RSI v1.1 refused outcomes remain provisional because only their disposable replay used the older reference-anchored stop. No strategy is ready for graduation review; VPS and live-flip tasks remain deferred.
@@ -132,7 +136,7 @@ Evidence snapshot as of the **2026-11-17 close**: the initial slippage checkpoin
 | ~~`11.34` Credit-spread exit paper-watch~~ | ✅ **CLOSED — exit reliability accepted.** Fourteen cycles closed successfully. Older typed reasons are unavailable after normal log rotation. | Keep the current exit behavior; do not fabricate missing reasons or duplicate them into `trades.reason`. |
 | ~~`11.41` Credit-spread close execution tuning~~ | ✅ **CLOSED — current limit walk retained.** Every observed close resolved on a limit rung and no market fallback fired. | Reopen only on a concrete close failure or a market-fallback event. |
 | `11.41a` Arrival-midpoint capture for MLEG market-fallback closes | ⏸ **0 market fallbacks observed.** There is no evidence set to analyze. | Decide separately whether to add best-effort, non-gating midpoint capture before the first event; do not pool future market fills with limit-fill calibration. |
-| `11.63` Credit-spread entry bounded walk | 🔄 **10 post-change attempts: 2 fills, 8 cancels.** The October 7 attempt filled on the second rung; the target remains about 20 attempts and the pre-change baseline was 13 fills in 49 attempts (27%). | Keep collecting clamp and fill evidence. Ten mixed-condition attempts are still too few to retune the credit floor. |
+| `11.63` Credit-spread entry bounded walk | ⏸ **Paused at 10 post-change attempts: 2 fills, 8 cancels.** Credit spread is disabled for weak profitability; the planned ~20-attempt review will not complete in this configuration. | Do not retune the credit floor from this sample. Reopen only if the operator re-enables the strategy. |
 | ~~`11.46b` SPY options VIX-percentile gate~~ | ✅ **PAPER-VALIDATED.** Logs show 672 low-VIX TRENDING blocks, 6 elevated-VIX TRENDING allows, and 2 RANGING-path fills. The gate behaves as designed. | Keep the 0.60 threshold unchanged. Future outcome evidence belongs to strategy graduation; no separate gate work remains. |
 | `11.46c` Credit-spread IV-Rank follow-up | **NOT YET COLLECTING IV-Rank evidence.** Candidate rows record VIX/VXN proxy levels, not historical IV Rank. | Low priority while entry fills and profitability remain weak. If promoted, add observation-only IV-Rank capture before considering a gate. |
 | ~~`11.48` Allocator risk-target reconciliation~~ ✅ **VERIFIED 2026-08-28** | Per-strategy stop-risk targets now size normal equity entries; exposure caps only reduce quantity. | Five unclipped paper entries matched their targets within broker quantity granularity. PWR and KBE were valid sleeve-cap clips, and ARM was ordinary whole-share rounding followed by a favourable fill. Decision budget, approved risk, binding cap, and launch multiplier now persist through late fills. Fill-time risk is separate; no allocation-lottery or sleeve-starvation regression was found. |
@@ -205,7 +209,7 @@ Evidence snapshot as of the **2026-11-17 close**: the initial slippage checkpoin
 | Reporting | SQLite trade log; lifecycle-aware daily/weekly P&L (completed-session scheduler, broker equity path, and no shutdown-as-EOD); alerts; five-page read-only operator dashboard; Strategy Health & Edge reports |
 | Allocator | 85/15 pool model, per-strategy sleeves, stretch borrowing for equity only, HWM drawdown gate (paper observation-only by default; live protected) |
 | Regime and sector context | BEAR/VOLATILE/TRENDING/RANGING detector with ATR% floor; sector resolver/gauge and strategy-specific policies |
-| Active strategy set | SMA, RSI, Donchian, Leveraged Trend, SPY Options, Credit Spread SPY/QQQ |
+| Active strategy set | SMA, RSI, Donchian, Leveraged Trend, SPY Options; Credit Spread disabled |
 | Position abstraction | Lifecycle-first single-leg startup ownership; UUID-keyed spreads remain trade-ledger reconstructed; exact-OCC conflict guard |
 
 ---

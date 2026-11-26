@@ -435,29 +435,30 @@ def main() -> None:
     # (PLAN 11.46), and one OPRA quote lookup. Daily bars — the trend gate
     # is a 50-day SMA and DTE is measured in days. Never in BEAR/VOLATILE
     # (a vol spike is exactly when short premium hits max loss).
-    _cs_quote_lookup = build_opra_quote_lookup()
-    for _cs_symbol in settings.STRATEGY_WATCHLISTS["credit_spread"]:
-        _cs_config = CreditSpreadConfig.from_dict(
-            _cs_symbol, settings.CREDIT_SPREAD_INSTRUMENTS[_cs_symbol]
-        )
-        slots.append(StrategySlot(
-            strategy=CreditSpread(
-                _cs_config,
-                edge_filter=CreditSpreadEdgeFilter(
-                    iv_proxy_source=_cs_config.iv_proxy_source,
-                    min_iv_proxy=_cs_config.min_iv_proxy,
-                    trend_sma_buffer_pct=_cs_config.trend_sma_buffer_pct,
-                    earnings_blackout_days=_cs_config.earnings_blackout_days,
+    if settings.CREDIT_SPREAD_PAPER_ENABLED:
+        _cs_quote_lookup = build_opra_quote_lookup()
+        for _cs_symbol in settings.STRATEGY_WATCHLISTS["credit_spread"]:
+            _cs_config = CreditSpreadConfig.from_dict(
+                _cs_symbol, settings.CREDIT_SPREAD_INSTRUMENTS[_cs_symbol]
+            )
+            slots.append(StrategySlot(
+                strategy=CreditSpread(
+                    _cs_config,
+                    edge_filter=CreditSpreadEdgeFilter(
+                        iv_proxy_source=_cs_config.iv_proxy_source,
+                        min_iv_proxy=_cs_config.min_iv_proxy,
+                        trend_sma_buffer_pct=_cs_config.trend_sma_buffer_pct,
+                        earnings_blackout_days=_cs_config.earnings_blackout_days,
+                        iv_resolver=_iv_resolver,
+                    ),
                     iv_resolver=_iv_resolver,
+                    quote_lookup=_cs_quote_lookup,
                 ),
-                iv_resolver=_iv_resolver,
-                quote_lookup=_cs_quote_lookup,
-            ),
-            watchlist_source=StaticWatchlistSource(
-                [_cs_symbol], name=f"credit_spread_{_cs_symbol.lower()}"
-            ),
-            allowed_regimes=_allowed_regimes("credit_spread"),
-        ))
+                watchlist_source=StaticWatchlistSource(
+                    [_cs_symbol], name=f"credit_spread_{_cs_symbol.lower()}"
+                ),
+                allowed_regimes=_allowed_regimes("credit_spread"),
+            ))
 
     # Risk manager with production settings (shared across all slots).
     risk = RiskManager()

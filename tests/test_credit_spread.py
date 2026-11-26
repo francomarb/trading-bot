@@ -727,6 +727,13 @@ class TestConcurrencyCapParity:
     def test_global_cap_matches_allocator_hard_max(self):
         from config import settings
 
+        if not settings.CREDIT_SPREAD_PAPER_ENABLED:
+            assert "credit_spread" not in settings.STRATEGY_ALLOCATIONS
+            assert settings.STRATEGY_ALLOCATIONS["spy_options_reversion"]["target_pct"] == 0.15
+            assert sum(
+                cfg["target_pct"] for cfg in settings.STRATEGY_ALLOCATIONS.values()
+            ) == pytest.approx(1.0)
+            return
         assert (
             settings.STRATEGY_ALLOCATIONS["credit_spread"]["hard_max_positions"]
             == settings.MAX_TOTAL_CONCURRENT_CREDIT_SPREADS

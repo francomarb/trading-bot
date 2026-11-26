@@ -462,8 +462,8 @@ instead of aborting the whole report; see
 | RSI Reversion | `rsi_reversion.py` | **Paper Trading** | LIMIT | All (`allowed_regimes=None`) | 15% (equity) |
 | Donchian Breakout | `donchian_breakout.py` | **Paper Trading** | STOP_LIMIT | TRENDING, RANGING, VOLATILE | 15% (equity) |
 | Leveraged Trend (SPXL/TQQQ/TECL/SOXL) | `leveraged_trend.py` | **Paper Trading** | MARKET | All | 25% (equity, no stretch) |
-| SPY Options RSI Reversion | `spy_options_reversion.py` | **Paper Trading** | DAY LIMIT (async) | TRENDING, RANGING | 5% (isolated) |
-| Credit Spread (SPY + QQQ) | `credit_spread.py` | **Paper Trading** | MLEG combo (async) | TRENDING, RANGING | 10% (isolated, shared across underlyings) |
+| SPY Options RSI Reversion | `spy_options_reversion.py` | **Paper Trading** | DAY LIMIT (async) | TRENDING, RANGING | 15% (isolated) |
+| Credit Spread (SPY + QQQ) | `credit_spread.py` | **Disabled** | MLEG combo (async) | TRENDING, RANGING when enabled | 0% while disabled |
 
 ### 5. Risk Manager + Sleeve Allocator
 
