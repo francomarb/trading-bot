@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -21,6 +22,7 @@ from reporting.candidate_shadows import (
     resolve_rsi_shadow,
     resolve_sma_shadow,
 )
+from scripts.resolve_candidate_shadows import _load_work
 
 
 OBSERVED = datetime(2026, 9, 9, 13, 43, 21, tzinfo=timezone.utc)
@@ -63,6 +65,7 @@ def _candidate(**overrides: object) -> dict[str, object]:
         "reference_price": 100.0,
         "atr": 5.0,
         "bot_git_commit": "a" * 40,
+        "strategy_version": "1.0",
         "peer_entry_time_in_force": "gtc",
         "strategy_features_json": json.dumps(
             {
@@ -200,6 +203,8 @@ ATR_STOP_MULTIPLIER = 2.0
 
         def fake_run(command, **kwargs):
             calls.append(command)
+            if command[-1].endswith("strategies/rsi_reversion.py"):
+                return SimpleNamespace(stdout="class RSIReversion(BaseStrategy): pass")
             return SimpleNamespace(stdout=source)
 
         monkeypatch.setattr(candidate_shadows.subprocess, "run", fake_run)
@@ -209,10 +214,93 @@ ATR_STOP_MULTIPLIER = 2.0
         )
 
         assert contract.period == 3
+        assert contract.stop_anchor == "reference"
         assert source_label == "historical_commit:aaaaaaaaaa"
         assert calls == [
-            ["git", "show", f"{'a' * 40}:config/settings.py"]
+            ["git", "show", f"{'a' * 40}:config/settings.py"],
+            ["git", "show", f"{'a' * 40}:strategies/rsi_reversion.py"],
         ]
+
+    def test_legacy_rsi_v11_uses_historical_fill_anchor(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        settings_source = """
+SLIPPAGE_MODEL_MARKET_BPS = 5.0
+STALE_LIMIT_MAX_AGE_SECONDS = int(os.getenv("STALE_LIMIT_MAX_AGE_SECONDS", 86400))
+RSI_REVERSION_PARAMS = {
+    "period": 3, "oversold": 15.0, "overbought": 70.0,
+    "entry_mode": "level_below", "exit_sma_window": None,
+    "quick_exit_rsi": 55.0,
+}
+ATR_STOP_MULTIPLIER = 2.0
+"""
+        strategy_source = """
+class RSIReversion(BaseStrategy):
+    stop_anchor_policy = StopAnchor.FILL
+"""
+
+        def fake_run(command, **_kwargs):
+            source = (
+                strategy_source if command[-1].endswith("strategies/rsi_reversion.py")
+                else settings_source
+            )
+            return SimpleNamespace(stdout=source)
+
+        monkeypatch.setattr(candidate_shadows.subprocess, "run", fake_run)
+        contract, _ = replay_contract_for_candidate(
+            _candidate(strategy_version="1.1"), repo_root=tmp_path
+        )
+        assert contract.contract_version == 3
+        assert contract.stop_anchor == "fill"
+
+        with pytest.raises(ValueError, match="version and stop policy disagree"):
+            replay_contract_for_candidate(
+                _candidate(strategy_version="1.0"), repo_root=tmp_path
+            )
+
+
+class TestLegacyRefreshSelection:
+    def test_only_old_rsi_v11_reference_shadows_are_selected(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript("""
+            CREATE TABLE entry_candidate_decisions (
+                candidate_uid TEXT, cycle_uid TEXT, strategy TEXT,
+                signal_at TEXT, selected INTEGER, capacity_contended INTEGER,
+                disposition TEXT, strategy_version TEXT, common_context_json TEXT,
+                observed_at TEXT, evaluation_ordinal INTEGER, position_uid TEXT
+            );
+            CREATE TABLE entry_candidate_shadow_outcomes (
+                candidate_uid TEXT, status TEXT, outcome_basis TEXT,
+                metadata_json TEXT
+            );
+            CREATE TABLE position_lifecycle_orders (
+                position_uid TEXT, role TEXT, time_in_force TEXT
+            );
+        """)
+        cases = [
+            ("old-resolved", "1.1", "{}", "resolved", "reference"),
+            ("old-review", "1.1", "{}", "needs_review", "reference"),
+            ("v10", "1.0", "{}", "resolved", "reference"),
+            ("new-v11", "1.1", '{"shadow_replay_contract":{}}', "resolved", "reference"),
+            ("already-fixed", "1.1", "{}", "resolved", "fill"),
+            ("still-open", "1.1", "{}", "open", "reference"),
+        ]
+        for uid, version, common, status, anchor in cases:
+            conn.execute(
+                "INSERT INTO entry_candidate_decisions VALUES (?, 'cycle', 'rsi_reversion', '2026-10-01', 0, 1, 'sleeve_full', ?, ?, '2026-10-01', 1, NULL)",
+                (uid, version, common),
+            )
+            conn.execute(
+                "INSERT INTO entry_candidate_shadow_outcomes VALUES (?, ?, 'rsi', ?)",
+                (uid, status, json.dumps({"stop_anchor": anchor})),
+            )
+
+        work = _load_work(
+            conn, None, "rsi_reversion", refresh_legacy_rsi_v11=True
+        )
+        assert {row["candidate_uid"] for row in work} == {
+            "old-resolved", "old-review"
+        }
 
 
 class TestRSIShadowReplay:

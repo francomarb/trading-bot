@@ -367,23 +367,21 @@ def _literal_assignments(source: str) -> dict[str, Any]:
 
 
 def historical_contract_from_settings_source(
-    source: str, *, entry_time_in_force: str
+    source: str, *, entry_time_in_force: str, stop_anchor: str = "reference"
 ) -> RSIReplayContract:
     """Build the legacy RSI replay contract from historical settings source."""
     values = _literal_assignments(source)
     params = dict(values["RSI_REVERSION_PARAMS"])
     return RSIReplayContract.from_mapping(
         {
-            "contract_version": 2,
+            "contract_version": 3 if stop_anchor == "fill" else 2,
             "strategy": "rsi_reversion",
             "timeframe": "1Day",
             **params,
             "entry_order_type": "limit",
             "entry_time_in_force": entry_time_in_force,
             "max_entry_age_seconds": values["STALE_LIMIT_MAX_AGE_SECONDS"],
-            # Legacy/current ordinary RSI GTC OTO stops were submitted from
-            # the reference and were not rebuilt after a gap-down fill.
-            "stop_anchor": "reference",
+            "stop_anchor": stop_anchor,
             "atr_stop_multiplier": values["ATR_STOP_MULTIPLIER"],
             "exit_order_type": "market",
             "modeled_exit_slippage_bps": values[
@@ -391,6 +389,43 @@ def historical_contract_from_settings_source(
             ],
         }
     )
+
+
+def _historical_rsi_stop_anchor(source: str, strategy_version: str) -> str:
+    """Verify the RSI stop policy against its immutable strategy source."""
+    expected = {"1.0": "reference", "1.1": "fill"}.get(strategy_version)
+    if expected is None:
+        raise ValueError(f"unsupported historical RSI version {strategy_version!r}")
+    strategy_class = next(
+        (
+            node for node in ast.parse(source).body
+            if isinstance(node, ast.ClassDef) and node.name == "RSIReversion"
+        ),
+        None,
+    )
+    if strategy_class is None:
+        raise ValueError("historical RSI strategy class is missing")
+    anchor = "reference"  # RSI v1.0 inherited BaseStrategy's reference default.
+    for node in strategy_class.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "stop_anchor_policy"
+        ):
+            value = node.value
+            if not (
+                isinstance(value, ast.Attribute)
+                and isinstance(value.value, ast.Name)
+                and value.value.id == "StopAnchor"
+                and value.attr in {"REFERENCE", "FILL"}
+            ):
+                raise ValueError("historical RSI stop anchor is not a known literal")
+            anchor = value.attr.lower()
+            break
+    if anchor != expected:
+        raise ValueError("historical RSI version and stop policy disagree")
+    return anchor
 
 
 def _rsi_replay_contract_for_candidate(
@@ -439,12 +474,16 @@ def _rsi_replay_contract_for_candidate(
     commit = str(candidate.get("bot_git_commit") or "")
     if commit.startswith("uncommitted:") or not _COMMIT_RE.fullmatch(commit):
         raise ValueError("candidate has no stored contract or immutable bot commit")
-    result = subprocess.run(
-        ["git", "show", f"{commit}:config/settings.py"],
+    settings_source, _ = _historical_source(candidate, repo_root)
+    strategy_source = subprocess.run(
+        ["git", "show", f"{commit}:strategies/rsi_reversion.py"],
         cwd=Path(repo_root),
         check=True,
         capture_output=True,
         text=True,
+    ).stdout
+    stop_anchor = _historical_rsi_stop_anchor(
+        strategy_source, str(candidate.get("strategy_version") or "")
     )
     peer_tif = str(candidate.get("peer_entry_time_in_force") or "").lower()
     if peer_tif not in {"day", "gtc"}:
@@ -452,7 +491,7 @@ def _rsi_replay_contract_for_candidate(
             "legacy candidate has no exact selected-peer entry time in force"
         )
     contract = historical_contract_from_settings_source(
-        result.stdout, entry_time_in_force=peer_tif
+        settings_source, entry_time_in_force=peer_tif, stop_anchor=stop_anchor
     )
 
     features = _decoded(candidate.get("strategy_features_json"))
