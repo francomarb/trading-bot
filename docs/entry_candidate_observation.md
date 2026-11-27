@@ -104,6 +104,10 @@ The resolvers are explicit offline commands:
 ./venv/bin/python scripts/resolve_candidate_shadows.py --strategy sma_crossover
 ./venv/bin/python scripts/resolve_candidate_shadows.py --strategy donchian_breakout --apply
 
+# One-time historical RSI v1.1 repair; after the 2026-11-27 refresh this
+# correctly reports no remaining rows. It never touches real trades.
+./venv/bin/python scripts/resolve_candidate_shadows.py --strategy rsi_reversion --refresh-legacy-rsi-v11
+
 # Render the read-only selected-versus-refused report.
 ./venv/bin/python scripts/candidate_comparison_report.py
 ./venv/bin/python scripts/candidate_comparison_report.py --strategy rsi_reversion --output /tmp/rsi-candidates.md
@@ -151,12 +155,14 @@ New RSI, SMA, and Donchian candidate rows store this replay contract directly,
 including the effective entry time-in-force. Historical Git reconstruction is
 a legacy fallback for older rows, not the primary contract for new evidence.
 RSI v1.1 rows recorded before this repair did not store their v3 fill-anchored
-contract. These 17 refused candidates never became transactions, so they have
-no real fill or exit outcome to recover; evaluating them necessarily requires
-a counterfactual simulation. Their existing shadows remain provisional until
-the legacy resolver becomes version-aware and re-simulates them with the
-historical v1.1 fill-anchored contract. Only the disposable shadow outcomes are
-replaced; the original candidate observations and real trades remain unchanged.
+contract. On 2026-11-27 the resolver verified their historical strategy source,
+replayed all 17 refused candidates with the fill-anchored stop, and replaced
+only their disposable shadow outcomes. It fetched uncached raw bars for this
+one-time refresh: a later SNDK split had left adjusted and pre-split bars mixed
+in the old cache. All 17 now resolve; the RANGING RSI comparison has 10/10
+actual selected and 19/19 simulated refused outcomes. Real trades and original
+candidate observations were unchanged. These remain counterfactual estimates,
+not evidence of actual fills or realized P&L.
 
 The resolver command only updates `entry_candidate_shadow_outcomes` when
 `--apply` is passed. It never changes a decision, lifecycle, allocator state,

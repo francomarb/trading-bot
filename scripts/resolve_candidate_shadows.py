@@ -53,9 +53,12 @@ def _load_work(
     conn: sqlite3.Connection,
     candidate_uid: str | None,
     strategy: str,
+    *,
+    refresh_legacy_rsi_v11: bool = False,
 ) -> list[dict[str, object]]:
     conn.row_factory = sqlite3.Row
-    placeholders = ",".join("?" for _ in _REFRESHABLE)
+    statuses = ("resolved", "needs_review") if refresh_legacy_rsi_v11 else _REFRESHABLE
+    placeholders = ",".join("?" for _ in statuses)
     candidate_dispositions = sorted(
         {*_CAPACITY_DISPOSITIONS, RejectionCode.POSITION_TOO_SMALL.value}
     )
@@ -84,7 +87,14 @@ def _load_work(
           AND d.disposition IN ({disposition_placeholders})
           AND s.status IN ({placeholders})
     """
-    params: list[object] = [*candidate_dispositions, *_REFRESHABLE]
+    params: list[object] = [*candidate_dispositions, *statuses]
+    if refresh_legacy_rsi_v11:
+        sql += """
+          AND d.strategy = 'rsi_reversion'
+          AND d.strategy_version = '1.1'
+          AND json_type(d.common_context_json, '$.shadow_replay_contract') IS NULL
+          AND json_extract(s.metadata_json, '$.stop_anchor') = 'reference'
+        """
     if strategy != "all":
         sql += " AND d.strategy = ?"
         params.append(strategy)
@@ -148,7 +158,14 @@ def main() -> int:
         action="store_true",
         help="persist results to the disposable shadow table",
     )
+    parser.add_argument(
+        "--refresh-legacy-rsi-v11",
+        action="store_true",
+        help="replay only older RSI v1.1 reference-anchored shadows with their historical fill anchor",
+    )
     args = parser.parse_args()
+    if args.refresh_legacy_rsi_v11 and args.strategy != "rsi_reversion":
+        parser.error("--refresh-legacy-rsi-v11 requires --strategy rsi_reversion")
 
     db_path = Path(args.db)
     if not db_path.exists():
@@ -157,7 +174,12 @@ def main() -> int:
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA foreign_keys = ON")
     store = CandidateObservationStore(conn)
-    work = _load_work(conn, args.candidate, args.strategy)
+    work = _load_work(
+        conn,
+        args.candidate,
+        args.strategy,
+        refresh_legacy_rsi_v11=args.refresh_legacy_rsi_v11,
+    )
     if not work:
         print("No refreshable supported shadow candidates.")
         return 0
@@ -191,16 +213,18 @@ def main() -> int:
                 minute_start,
                 minute_end,
                 timeframe="1Min",
-                adjustment="all",
+                adjustment="raw" if args.refresh_legacy_rsi_v11 else "all",
                 feed=str(candidate["data_feed"]),
+                use_cache=not args.refresh_legacy_rsi_v11,
             )
             daily_bars, _ = fetch_symbol(
                 symbol,
                 signal_at - timedelta(days=contract.warmup_calendar_days),
                 as_of + timedelta(days=1),
                 timeframe="1Day",
-                adjustment="all",
+                adjustment="raw" if args.refresh_legacy_rsi_v11 else "all",
                 feed=str(candidate["data_feed"]),
+                use_cache=not args.refresh_legacy_rsi_v11,
             )
             entry_complete = as_of >= minute_end
             resolution = _resolve(
